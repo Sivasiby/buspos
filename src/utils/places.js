@@ -1,0 +1,98 @@
+export const places = [
+  {
+    key: 'cbe',
+    label: 'Coimbatore-018-கோவை',
+    lat: 11.0173723202076,
+    lon: 76.96709232530368,
+  },
+  {
+    key: 'athi_pal_pir',
+    label: 'Athipalayam-017-அத்திப்பாளையம்',
+    lat: 11.045296084658961,
+    lon: 76.98568891194894,
+  },
+  {
+    key: 'saravanampatty',
+    label: 'Saravanampatty-016-சரவணம்பட்டி',
+    lat: 11.079092584994507,
+    lon: 77.00380718161502,
+  },
+  {
+    key: 'kurumba_pal',
+    label: 'Kurumbapalayam-015-குரும்பபாளையம்',
+    lat: 11.112792915122723,
+    lon: 77.02913909908001,
+  },
+  {
+    key: 'kovil_pal',
+    label: 'Kovilpalayam-014-கோவில்பாளையம்',
+    lat: 11.135528848279082,
+    lon: 77.03473772707072,
+  },
+  {
+    key: 'kunnathur',
+    label: 'Kunnathur-013-குன்னத்தூர்',
+    lat: 11.153923295437394,
+    lon: 77.04941745918006,
+  },
+  {
+    key: 'ellappalayam',
+    label: 'Ellappalayam-012-எள்ளப்பாளையம்',
+    lat: 11.190812058856071,
+    lon: 77.06429749511,
+  },
+  {
+    key: 'annur_bs',
+    label: 'Annur-011-அன்னூர்',
+    lat: 11.233815105590635,
+    lon: 77.10259043606237,
+  },
+  {
+    key: 'annur_mettu_pal',
+    label: 'Annur Mettupalayam-10-அன்னூர் மேட்டுப்பாளையம்',
+    lat: 11.232709359016178,
+    lon: 77.1021368496934,
+  },
+  {
+    key: 'pongalur',
+    label: 'Pongalur-009-பொங்கலூர்',
+    lat: 11.32707525053712,
+    lon: 77.14959415587603,
+  },
+  {
+    key: 'sellappam_pal',
+    label: 'sellappampalayam-008-செல்லப்பம்பாளையம்',
+    lat: 11.317822103855006,
+    lon: 77.14629133408847,
+  },
+  {
+    key: 'pul_patty',
+    label: 'Puliyampatty B.S-007-புளியம்பட்டி',
+    lat: 11.349886859335472,
+    lon: 77.16693936570996,
+  },
+  {
+    key: 'nallur',
+    label: 'Nallur-006-நல்லூர்',
+    lat: 11.382387959526902,
+    lon: 77.1732309119554,
+  },
+  {
+    key: 'pungam_pal',
+    label: 'Pungampalli-005-புங்கம்பள்ளி',
+    lat: 11.404175632924973,
+    lon: 77.19160016007,
+  },
+  {
+    key: 'sengpaga_pudur',
+    label: 'Senbagapudur-004-செண்பகபுதூர்',
+    lat: 11.464349626621658,
+    lon: 77.20673934745314,
+  },
+  {
+    key: 'sathy_bs',
+    label: 'Sathy BS-003-சத்தி',
+    lat: 11.498568104789845,
+    lon: 77.24548772000219,
+  },
+];
