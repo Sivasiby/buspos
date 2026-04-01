@@ -1,61 +1,72 @@
-import React from 'react';
-import { NavigationContainer } from '@react-navigation/native';
-import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { Home, Ticket, Settings, LucideIcon } from 'lucide-react-native';
+/**
+ * App.tsx — root entry point
+ *
+ * Flow:  splash → (check AsyncStorage) → LoginScreen or POSScreen
+ *
+ * No react-navigation needed — we just swap components via state.
+ */
 
-// Import Screens
-import HomeScreen from './src/screens/HomeScreen';
-import TicketScreen from './src/screens/TicketScreen';
-import ManageScreen from './src/screens/ManageScreen';
+import React, {useState, useEffect} from 'react';
+import {ActivityIndicator, View, StyleSheet} from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const Tab = createBottomTabNavigator();
+import LoginScreen from './src/screens/LoginScreen';
+import POSScreen   from './src/screens/Posscreen';
 
-const COLORS = {
-  bg: '#0F0F0F',
-  surface: '#1A1A1A',
-  border: '#2A2A2A',
-  primary: '#FFFFFF',
-  secondary: '#888888',
-  accent: '#FFFFFF',
-};
+// ─── Adjust the import paths above if your folder layout differs ──────────────
+//   e.g. if App.tsx sits inside src/, use:
+//     import LoginScreen from './screens/LoginScreen';
+//     import POSScreen   from './screens/POSScreen';
 
-const getTabBarIcon = (routeName: string, focused: boolean, color: string, size: number) => {
-  let Icon: LucideIcon = Home;
-
-  if (routeName === 'Home') {
-    Icon = Home;
-  } else if (routeName === 'Tickets') {
-    Icon = Ticket;
-  } else if (routeName === 'Manage') {
-    Icon = Settings;
-  }
-
-  return <Icon size={size} color={color} strokeWidth={focused ? 2 : 1.5} />;
-};
+const STORAGE_KEY = 'conductor_user';
 
 export default function App() {
-  return (
-    <NavigationContainer>
-      <Tab.Navigator
-        screenOptions={({ route }) => ({
-          headerShown: false,
-          tabBarStyle: {
-            backgroundColor: COLORS.surface,
-            borderTopColor: COLORS.border,
-            borderTopWidth: 1,
-            paddingBottom: 5,
-            paddingTop: 5,
-            height: 60,
-          },
-          tabBarActiveTintColor: COLORS.primary,
-          tabBarInactiveTintColor: COLORS.secondary,
-          tabBarIcon: ({ focused, color, size }) => getTabBarIcon(route.name, focused, color, size),
-        })}
-      >
-        <Tab.Screen name="Home" component={HomeScreen} />
-        <Tab.Screen name="Tickets" component={TicketScreen} />
-        <Tab.Screen name="Manage" component={ManageScreen} />
-      </Tab.Navigator>
-    </NavigationContainer>
-  );
+  const [user, setUser]         = useState<any>(null);
+  const [checking, setChecking] = useState(true);
+
+  // Restore saved session on launch
+  useEffect(() => {
+    AsyncStorage.getItem(STORAGE_KEY)
+      .then(raw => { if (raw) setUser(JSON.parse(raw)); })
+      .catch(() => {})
+      .finally(() => setChecking(false));
+  }, []);
+
+  const handleLoginSuccess = async (userData: any) => {
+    try {
+      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(userData));
+    } catch {}
+    setUser(userData);
+  };
+
+  const handleLogout = async () => {
+    try {
+      await AsyncStorage.removeItem(STORAGE_KEY);
+    } catch {}
+    setUser(null);
+  };
+
+  // Splash / checking state
+  if (checking) {
+    return (
+      <View style={styles.splash}>
+        <ActivityIndicator size="large" color="#00b7f3" />
+      </View>
+    );
+  }
+
+  if (!user) {
+    return <LoginScreen onLoginSuccess={handleLoginSuccess} />;
+  }
+
+  return <POSScreen user={user} onLogout={handleLogout} />;
 }
+
+const styles = StyleSheet.create({
+  splash: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#0d1b2e',
+  },
+});
