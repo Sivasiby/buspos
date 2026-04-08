@@ -56,6 +56,7 @@ export interface POSTicket {
   fare:         number;              // total = unit_fare × ticket_count
   unit_fare:    number;
   ticket_type:  'full' | 'half';    // NEW — full adult / half child
+  luggage_amount?: number;
   ticket_number: number | null;
   bus_number:   string;
   direction:    string;              // 'up' | 'dn'
@@ -111,7 +112,7 @@ async function insertToSupabase(ticket: POSTicket): Promise<boolean> {
       resolveStopId(ticket.to_stop),
     ]);
 
-    const {error} = await supabase.from('tickets').insert({
+    const payload = {
       trip_id:        ticket.trip_id ?? null,
       // from_stop / to_stop are UUID FK columns — MUST be uuid or null
       from_stop:      fromStopId ?? null,
@@ -122,15 +123,27 @@ async function insertToSupabase(ticket: POSTicket): Promise<boolean> {
       total_fare:     ticket.fare,
       // Ticket type for full/half breakdown
       ticket_type:    ticket.ticket_type,
+      luggage_amount: Number(ticket.luggage_amount ?? 0),
       // Meta
       ticket_number:  ticket.ticket_number,
       payment_method: 'pos',
       booking_status: 'booked',
       is_verified:    true,
       created_at:     ticket.issued_at,
-    });
+    };
+    const {error} = await supabase.from('tickets').insert(payload);
 
     if (error) {
+      // Backward compatibility: if DB does not yet have `luggage_amount`, retry without it.
+      if ((error.message || '').toLowerCase().includes('luggage_amount')) {
+        const { luggage_amount: _luggage, ...payloadWithoutLuggage } = payload as any;
+        const { error: retryError } = await supabase.from('tickets').insert({
+          ...payloadWithoutLuggage,
+        });
+        if (!retryError) return true;
+        console.warn('[POS] Supabase insert retry error:', retryError.message);
+        return false;
+      }
       console.warn('[POS] Supabase insert error:', error.message);
       return false;
     }
@@ -164,6 +177,7 @@ export function usePOSTickets() {
           parsed = oldParsed.map((t: any) => ({
             ...t,
             ticket_type: t.ticket_type ?? 'full',
+            luggage_amount: Number(t.luggage_amount ?? 0),
             synced: t.synced ?? true,
           }));
           console.log(`[POS] Migrated ${parsed.length} tickets from v1 to v2`);
@@ -318,16 +332,17 @@ export function usePOSTickets() {
     const today    = todayTickets();
     const trips    = new Set(today.map(t => t.trip_id).filter(Boolean)).size;
     const rows     = today.length;
+    const luggage  = today.reduce((s, t) => s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0), 0);
     const full     = today
       .filter(t => (t.ticket_type ?? 'full') === 'full')
-      .reduce((s, t) => s + t.ticket_count, 0);
+      .reduce((s, t) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
     const half     = today
       .filter(t => t.ticket_type === 'half')
-      .reduce((s, t) => s + t.ticket_count, 0);
-    const count    = full + half;
+      .reduce((s, t) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
+    const count    = full + half + luggage;
     const total    = today.reduce((s, t) => s + t.fare, 0);
     const unsynced = today.filter(t => !t.synced).length;
-    return {trips, rows, count, full, half, total, unsynced};
+    return {trips, rows, count, full, half, luggage, total, unsynced};
   }, [todayTickets]);
 
   /**
@@ -335,17 +350,19 @@ export function usePOSTickets() {
    */
   const tripSummary = useCallback((tripId: string) => {
     const list  = tickets.filter(t => t.trip_id === tripId);
+    const luggage = list.reduce((s, t) => s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0), 0);
     const full  = list
       .filter(t => (t.ticket_type ?? 'full') === 'full')
-      .reduce((s, t) => s + t.ticket_count, 0);
+      .reduce((s, t) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
     const half  = list
       .filter(t => t.ticket_type === 'half')
-      .reduce((s, t) => s + t.ticket_count, 0);
+      .reduce((s, t) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
     return {
       rows:  list.length,
-      count: full + half,
+      count: full + half + luggage,
       full,
       half,
+      luggage,
       total: list.reduce((s, t) => s + t.fare, 0),
     };
   }, [tickets]);

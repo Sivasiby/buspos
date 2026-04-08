@@ -2,7 +2,7 @@ import React, {useState, useCallback, useEffect, useRef} from 'react';
 import {
   StyleSheet, Text, TouchableOpacity, View, ScrollView,
   Platform, Modal, Alert, ActivityIndicator, ToastAndroid,
-  Animated, FlatList,
+  Animated, FlatList, TextInput,
 } from 'react-native';
 import {SafeAreaView}            from 'react-native-safe-area-context';
 import AsyncStorage              from '@react-native-async-storage/async-storage';
@@ -37,16 +37,28 @@ const formatDuration = (start: string, end?: string | null) => {
   const mins = Math.round((((end ? new Date(end) : new Date()).getTime()) - new Date(start).getTime()) / 60000);
   return mins < 60 ? `${mins}m` : `${Math.floor(mins/60)}h ${mins%60}m`;
 };
-// Safely display a POS stop name — handles UUIDs stored by old code
-// A UUID like "9941f9ec-f5c5-4d36-..." is not a useful display name
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const posStopLabel = (s: string): string => {
   if (!s || s.trim() === '') return '?';
-  if (UUID_RE.test(s.trim())) return '?';   // old UUID-stored stop
+  if (UUID_RE.test(s.trim())) return '?';
   return englishStop(s);
 };
 const shortStop   = (n: string) => { if (!n||n==='Unknown') return '?'; const p=n.split('-'); return p.length>=3?p.slice(2).join('-').trim():p[p.length-1].trim()||p[0].trim(); };
 const englishStop = (n: string) => (!n||n==='Unknown') ? '?' : n.split('-')[0].trim();
+const normalizeDirection = (direction?: string) => (direction ?? '').toString().trim().toLowerCase();
+const isDownDirection = (direction?: string) => ['dn', 'down', 'return'].includes(normalizeDirection(direction));
+const parseAmount = (value: string) => {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return n;
+};
+const routeNameForDirection = (routeName?: string, direction?: string) => {
+  if (!routeName) return '';
+  if (!isDownDirection(direction)) return routeName;
+  const parts = routeName.split(/\s*(?:->|→|-)\s*/).map(p => p.trim()).filter(Boolean);
+  if (parts.length < 2) return routeName;
+  return [...parts].reverse().join(' - ');
+};
 const fareStr     = (n: number) => n%1===0 ? `${n}.00` : n.toFixed(2);
 const genId       = () => `pos_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
 
@@ -64,7 +76,6 @@ const getNextTicketNumber = async (busId: string | null): Promise<number | null>
   }
 };
 
-// DB writes are handled entirely by usePOSTickets hook (insertToSupabase)
 // ─────────────────────────────────────────────────────────────────────────────
 // Printer
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,7 +129,7 @@ const PendingVerifyRow = ({item,onVerify,verifying}:{item:any;onVerify:(id:strin
 // ─────────────────────────────────────────────────────────────────────────────
 // Start Trip Modal
 // ─────────────────────────────────────────────────────────────────────────────
-const StartTripModal = ({visible,onClose,onStarted}:{visible:boolean;onClose:()=>void;onStarted:()=>void}) => {
+const StartTripModal = ({visible,onClose,onStarted}:{visible:boolean;onClose:()=>void;onStarted:(payload?:{direction:string;route_name?:string;start_time:string})=>void}) => {
   const [routes,setRoutes]=useState<any[]>([]);
   const [sel,setSel]=useState<any>(null);
   const [dir,setDir]=useState('up');
@@ -128,7 +139,15 @@ const StartTripModal = ({visible,onClose,onStarted}:{visible:boolean;onClose:()=
   const start=async()=>{
     if(!sel){Alert.alert('Select Route','Please select a route first.');return;}
     setLoading(true);
-    try{const r=await api.post('/conductor/trip/start',{route_id:sel,direction:dir});if(r.data?.success){showToast('Trip started!');onStarted();onClose();}}
+    try{
+      const r=await api.post('/conductor/trip/start',{route_id:sel,direction:dir});
+      if(r.data?.success){
+        showToast('Trip started!');
+        const selectedRoute = routes.find((x:any)=>x.id===sel);
+        onStarted({direction:dir, route_name:selectedRoute?.name, start_time:new Date().toISOString()});
+        onClose();
+      }
+    }
     catch(e:any){Alert.alert('Error',e?.response?.data?.error||'Failed to start trip.');}
     finally{setLoading(false);}
   };
@@ -165,7 +184,7 @@ const StartTripModal = ({visible,onClose,onStarted}:{visible:boolean;onClose:()=
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Trip Report Modal — merged App + POS, printable
+// Trip Report Modal
 // ─────────────────────────────────────────────────────────────────────────────
 const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripId:any;onClose:()=>void;posHook?:ReturnType<typeof usePOSTickets>}) => {
   const [report,setReport]=useState<any>(null);
@@ -184,7 +203,7 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
         try{
           const {data:rows, error} = await supabase
             .from('tickets')
-            .select('ticket_type,payment_method,ticket_count,total_fare,fare,from_stop_id,to_stop_id')
+            .select('ticket_type,payment_method,ticket_count,total_fare,fare,from_stop_id,to_stop_id,luggage_amount')
             .eq('trip_id', tripId)
             .neq('payment_method', 'pos');
 
@@ -211,12 +230,16 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
             total_fare:number;
           }> = {};
 
-          let full = 0, half = 0, free = 0, tickets = 0, collection = 0;
+          let full = 0, half = 0, free = 0, tickets = 0, collection = 0, luggage = 0, luggageCount = 0;
 
           for(const r of appRows){
             const cnt = Number(r.ticket_count ?? 1);
             const pm  = String(r.payment_method ?? '').toLowerCase();
             const tt  = (r.ticket_type ?? 'full') as string;
+            const hasLuggage = Number(r.luggage_amount ?? 0) > 0;
+            const passengerCnt = Math.max(0, cnt - (hasLuggage ? 1 : 0));
+            luggage += Number(r.luggage_amount ?? 0);
+            if (hasLuggage) luggageCount += 1;
 
             const unit = Number(r.fare ?? 0);
             const total = r.total_fare != null ? Number(r.total_fare) : unit * cnt;
@@ -228,11 +251,11 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
 
             const isFree = pm === 'fr';
             if(isFree){
-              map[k].free_count += cnt; free += cnt;
+              map[k].free_count += passengerCnt; free += passengerCnt;
             } else if(tt === 'half'){
-              map[k].half_count += cnt; half += cnt;
+              map[k].half_count += passengerCnt; half += passengerCnt;
             } else {
-              map[k].full_count += cnt; full += cnt;
+              map[k].full_count += passengerCnt; full += passengerCnt;
             }
 
             map[k].total_fare += total;
@@ -241,50 +264,48 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
           }
 
           const breakdown = Object.values(map).sort((a,b)=>b.total_fare - a.total_fare);
-          setAppTrip({tickets, collection, full, half, free, breakdown});
+          setAppTrip({tickets, collection, full, half, free, breakdown, luggage, luggageCount});
         }catch(e){
-          setAppTrip({tickets:0, collection:0, full:0, half:0, free:0, breakdown:[]});
+          setAppTrip({tickets:0, collection:0, full:0, half:0, free:0, breakdown:[], luggage:0, luggageCount:0});
         }
         finally{setLoading(false);}
       })();
     }
   },[visible,tripId]);
 
-  // ── POS data for this trip ──────────────────────────────────────────────
   const tripPOSTix = (posHook?.tickets||[]).filter((t:any)=>t.trip_id===tripId);
   const posCnt     = tripPOSTix.reduce((s:number,t:any)=>s+t.ticket_count,0);
   const posAmt     = tripPOSTix.reduce((s:number,t:any)=>s+t.fare,0);
 
-  // ── POS breakdown from local hook (authoritative for type split) ─────────
   const posFullCnt = tripPOSTix
     .filter((t:any)=>(t.ticket_type??'full')==='full')
-    .reduce((s:number,t:any)=>s+t.ticket_count,0);
+    .reduce((s:number,t:any)=>s+Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)),0);
   const posHalfCnt = tripPOSTix
     .filter((t:any)=>t.ticket_type==='half')
-    .reduce((s:number,t:any)=>s+t.ticket_count,0);
+    .reduce((s:number,t:any)=>s+Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)),0);
+  const posLuggageCnt = tripPOSTix.reduce((s:number,t:any)=>s+(Number(t.luggage_amount ?? 0)>0?1:0),0);
 
-  // ── App-only counts (Supabase non-pos) ─────────────────────────────────
   const appSummary = appTrip || {};
   const appCollection  = Number(appSummary.collection ?? 0);
+  const appLuggage     = Number(appSummary.luggage ?? 0);
+  const appLuggageCnt  = Number(appSummary.luggageCount ?? 0);
   const appFullCnt     = Number(appSummary.full ?? 0);
   const appHalfCnt     = Number(appSummary.half ?? 0);
   const appFreeCnt     = Number(appSummary.free ?? 0);
   const appPassengers  = Number(appSummary.tickets ?? 0);
 
-  // ── Grand totals — computed locally so they're always accurate ───────────
   const grandCollection = appCollection + posAmt;
-  const grandFull       = appFullCnt  + posFullCnt;   // app full  + POS full
-  const grandHalf       = appHalfCnt  + posHalfCnt;   // app half  + POS half
+  const grandFull       = appFullCnt  + posFullCnt;
+  const grandHalf       = appHalfCnt  + posHalfCnt;
   const grandFree       = appFreeCnt;
-  const grandPassengers = grandFull + grandHalf + grandFree;
+  const grandLuggageCnt = appLuggageCnt + posLuggageCnt;
+  const grandPassengers = grandFull + grandHalf + grandFree + grandLuggageCnt;
 
-  // ── Clean app breakdown (strip unknown stops) ─────────────────────────────
   const cleanBreakdown = (appSummary.breakdown||[]).filter((rb:any)=>{
     const f=englishStop(rb.from), t=englishStop(rb.to);
     return (f && f!=='?' && f.trim()!=='') || (t && t!=='?' && t.trim()!=='');
   });
 
-  // ── POS breakdown grouped by from → to — full/half split ───────────────
   const posMap:Record<string,{from:string;to:string;fullCount:number;halfCount:number;count:number;fare:number}> = {};
   for(const t of tripPOSTix){
     const f=posStopLabel(t.from_stop), to=posStopLabel(t.to_stop);
@@ -299,8 +320,9 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
     posMap[k].fare +=t.fare;
   }
   const posBreakdownRows=Object.values(posMap);
+  const posLuggage = tripPOSTix.reduce((s:number,t:any)=>s+Number(t.luggage_amount ?? 0),0);
+  const totalLuggage = appLuggage + posLuggage;
 
-  // ── Print ───────────────────────────────────────────────────────────────
   const handlePrint=async()=>{
     if(Platform.OS!=='android'||!NyxPrinter){Alert.alert('Notice','Printer only on Android.');return;}
     setPrinting(true);
@@ -318,35 +340,31 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
       await NyxPrinter.printText(`${report?.route_name||''}`,{textSize:22,align:PrintAlign.CENTER});
       await NyxPrinter.printText(`Date : ${today}  Bus : ${busNum}`,{textSize:18});
       await NyxPrinter.printText(`Dir  : ${dir}  Status : ${(report?.status||'').toUpperCase()}`,{textSize:18});
-      await NyxPrinter.printText(`Time : ${formatTime(report?.start_time)}${report?.end_time?` - ${formatTime(report.end_time)}`:' - ongoing'}`,{textSize:18});
+      await NyxPrinter.printText(`Time : ${formatTime(report?.start_time)}${report?.end_time?` - ${formatTime(report.end_time)}`:'- ongoing'}`,{textSize:18});
       await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`App Full : ${appFullCnt}   Half : ${appHalfCnt}   Free : ${appFreeCnt}`,{textSize:18});
+      await NyxPrinter.printText(`App Full : ${appFullCnt}   Half : ${appHalfCnt}   Free : ${appFreeCnt}   Lugg : ${appLuggageCnt}`,{textSize:18});
       if(posCnt>0){
-        await NyxPrinter.printText(`POS Full : ${posFullCnt}   Half : ${posHalfCnt}   Rs.${fmt(posAmt)}`,{textSize:18});
+        await NyxPrinter.printText(`POS Full : ${posFullCnt}   Half : ${posHalfCnt}   Lugg : ${posLuggageCnt}   Rs.${fmt(posAmt)}`,{textSize:18});
       }
       await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
       await NyxPrinter.printText(`Total Tickets : ${grandPassengers}`,{textSize:20});
       await NyxPrinter.printText(`Rs. ${fmt(grandCollection)}`,{textSize:36,align:PrintAlign.CENTER});
       await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      // App stage rows
       if(cleanBreakdown.length>0){
         await NyxPrinter.printText('App Stage-wise:',{textSize:18});
         for(const rb of cleanBreakdown){
           await NyxPrinter.printText(
-            `${englishStop(rb.from)} -> ${englishStop(rb.to)}
-  F:${rb.full_count||0} H:${rb.half_count||0} FR:${rb.free_count||0}  Rs.${fmt(Number(rb.total_fare??rb.revenue??0))}`,
+            `${englishStop(rb.from)} -> ${englishStop(rb.to)}\n  F:${rb.full_count||0} H:${rb.half_count||0} FR:${rb.free_count||0}  Rs.${fmt(Number(rb.total_fare??rb.revenue??0))}`,
             {textSize:17}
           );
           await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});
         }
       }
-      // POS stage rows
       if(posBreakdownRows.length>0){
         await NyxPrinter.printText('POS Stage-wise:',{textSize:18});
         for(const rb of posBreakdownRows){
           await NyxPrinter.printText(
-            `${rb.from} -> ${rb.to}
-  Tickets:${rb.count}  Rs.${fmt(rb.fare)}`,
+            `${rb.from} -> ${rb.to}\n  Tickets:${rb.count}  Rs.${fmt(rb.fare)}`,
             {textSize:17}
           );
           await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});
@@ -388,7 +406,6 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
             : report
             ? (
               <ScrollView showsVerticalScrollIndicator={false}>
-                {/* Route + status */}
                 <Text style={sh.reportRoute}>{report.route_name}</Text>
                 <View style={{flexDirection:'row',alignItems:'center',gap:8,marginBottom:12,flexWrap:'wrap'}}>
                   <StatusBadge status={report.status}/>
@@ -401,12 +418,12 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
                     <Text style={{fontSize:12,color:'#888'}}>🚌 {report.bus_number??tripPOSTix[0]?.bus_number}</Text>}
                 </View>
 
-                {/* Summary cards */}
                 <View style={sh.summaryRow}>
                   {[
                     {label:'Full',    val:grandFull,                        color:'#1a2332'},
                     {label:'Half',    val:grandHalf,                        color:'#FF9800'},
                     {label:'Free',    val:grandFree,                        color:'#4CAF50'},
+                    {label:'Lugg',    val:grandLuggageCnt,                  color:'#6A1B9A'},
                     {label:'POS',     val:`${posCnt} · ₹${posAmt.toFixed(0)}`, color:'#7B1FA2'},
                     {label:'Total',   val:`₹${grandCollection.toFixed(0)}`, color:'#00b7f3'},
                   ].map(i=>(
@@ -417,25 +434,30 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
                   ))}
                 </View>
 
-                {/* Source legend */}
                 {posCnt>0&&(
                   <View style={{flexDirection:'row',gap:8,marginBottom:12,flexWrap:'wrap'}}>
                     <View style={tr.legendChip}>
                       <Users size={10} color="#00b7f3"/>
                       <Text style={[tr.legendText,{color:'#00b7f3'}]}>
-                        App: {appPassengers} ({appFullCnt}F{appHalfCnt>0?` · ${appHalfCnt}H`:''}){appFreeCnt>0?` · ${appFreeCnt}FR`:''} · ₹{appCollection.toFixed(0)}
+                        App: {appPassengers} ({appFullCnt}F{appHalfCnt>0?` · ${appHalfCnt}H`:''}{appLuggageCnt>0?` · ${appLuggageCnt}L`:''}){appFreeCnt>0?` · ${appFreeCnt}FR`:''} · ₹{appCollection.toFixed(0)}
                       </Text>
                     </View>
                     <View style={[tr.legendChip,{backgroundColor:'#EDE7F6',borderColor:'#CE93D8'}]}>
                       <Printer size={10} color="#7B1FA2"/>
                       <Text style={[tr.legendText,{color:'#7B1FA2'}]}>
-                        POS: {posCnt} ({posFullCnt}F{posHalfCnt>0?` · ${posHalfCnt}H`:''}) · ₹{posAmt.toFixed(0)}
+                        POS: {posCnt} ({posFullCnt}F{posHalfCnt>0?` · ${posHalfCnt}H`:''}{posLuggageCnt>0?` · ${posLuggageCnt}L`:''}) · ₹{posAmt.toFixed(0)}
                       </Text>
                     </View>
                   </View>
                 )}
+                {totalLuggage>0&&(
+                  <View style={{flexDirection:'row',gap:8,marginBottom:12,flexWrap:'wrap'}}>
+                    <View style={tr.legendChip}>
+                      <Text style={[tr.legendText,{color:'#6A1B9A'}]}>Luggage: ₹{totalLuggage.toFixed(0)}</Text>
+                    </View>
+                  </View>
+                )}
 
-                {/* App stage breakdown */}
                 {cleanBreakdown.length>0&&(
                   <View style={{marginTop:4}}>
                     <View style={tr.secHeader}>
@@ -462,7 +484,6 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
                   </View>
                 )}
 
-                {/* POS stage breakdown */}
                 {posBreakdownRows.length>0&&(
                   <View style={{marginTop:12}}>
                     <View style={tr.secHeader}>
@@ -488,7 +509,6 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
                   </View>
                 )}
 
-                {/* Grand total footer */}
                 <View style={tr.grandTotal}>
                   <Text style={tr.grandTotalLabel}>
                     Grand Total — {grandPassengers} tickets
@@ -534,8 +554,6 @@ const StageFilter = ({tripId,baseTickets,baseCollection,posTix,direction,onPrint
   useEffect(()=>{if(open&&tripId&&stops.length===0){(async()=>{setLoading(true);try{const r=await api.get(`/conductor/trip/${tripId}/stages`);setStops(r.data?.stops||[]);}catch{}finally{setLoading(false);}})();}}, [open,tripId]);
   useEffect(()=>{setStops([]);setFrom(null);setTo(null);setFiltered(null);setOpen(false);},[tripId]);
   const apply = async(f:any,t:any) => {
-    // App (non-POS) stages come from Supabase tickets; POS stages come from local AsyncStorage.
-    // This replaces the old backend `/stage-collection` which mixed POS + app.
     if(!f && !t){ setFiltered(null); return; }
     setFiltering(true);
 
@@ -609,18 +627,10 @@ const StageFilter = ({tripId,baseTickets,baseCollection,posTix,direction,onPrint
   const selT=(s:any)=>{setTo(s);setPTo(false);apply(fromStop,s);};
   const clear=()=>{setFrom(null);setTo(null);setFiltered(null);};
   const isFilt=!!(fromStop||toStop);
-  const isDN = direction==='dn'||direction==='return';
+  const isDN = isDownDirection(direction);
 
-  // ── Direction-aware stop list ─────────────────────────────────────────
-  // DN trips run STY→CBE so the stops list is reversed
   const orderedStops = isDN ? [...stops].reverse() : stops;
 
-  // ── POS matching for the current stage filter selection ───────────────
-  // Match POS tickets by from_key/to_key against selected stop names.
-  // A POS ticket matches if:
-  //   • fromStop selected  → ticket's from_stop name contains the stop name
-  //   • toStop selected    → ticket's to_stop name contains the stop name
-  //   • no stop selected   → all POS tickets count (base stats)
   const posTixArr = posTix||[];
   const matchedPOS = isFilt
     ? posTixArr.filter((t:any)=>{
@@ -637,11 +647,9 @@ const StageFilter = ({tripId,baseTickets,baseCollection,posTix,direction,onPrint
   const posStageCnt = matchedPOS.reduce((s:number,t:any)=>s+t.ticket_count,0);
   const posStageAmt = matchedPOS.reduce((s:number,t:any)=>s+t.fare,0);
 
-  // ── Totals: App (Supabase non-pos) + matched POS (local) ──────────────
   const appTix = isFilt ? (filtered?.tickets ?? 0) : baseTickets;
   const appCol = isFilt ? (filtered?.collection ?? 0) : baseCollection;
 
-  // POS full/half split for combined F/H header (free is always 0 for POS)
   const posFullTotal = matchedPOS.reduce((s:number,t:any)=> {
     return ((t.ticket_type ?? 'full') === 'half') ? s : s + t.ticket_count;
   }, 0);
@@ -656,13 +664,11 @@ const StageFilter = ({tripId,baseTickets,baseCollection,posTix,direction,onPrint
   const dH  = isFilt ? ((filtered?.half ?? 0) + posHalfTotal) : null;
   const dFr = isFilt ? (filtered?.free ?? 0) : null;
 
-  // App breakdown rows (already non-POS) — still filter unknown stops
   const cleanBreakdown = (filtered?.breakdown||[]).filter((rb:any)=>{
     const f=englishStop(rb.from), t=englishStop(rb.to);
     return (f && f!=='?' && f.trim()!=='') || (t && t!=='?' && t.trim()!=='');
   });
 
-  // ── POS stage rows grouped by from→to — full/half split ──────────────
   const posBreakdownMap: Record<string,{from:string;to:string;fullCount:number;halfCount:number;count:number;fare:number}> = {};
   for(const t of matchedPOS){
     const f=posStopLabel(t.from_stop)||'POS', to=posStopLabel(t.to_stop)||'POS';
@@ -678,7 +684,6 @@ const StageFilter = ({tripId,baseTickets,baseCollection,posTix,direction,onPrint
   }
   const posBreakdownRows = Object.values(posBreakdownMap);
 
-  // Combined print breakdown = clean app rows + POS rows
   const printBreakdown = [
     ...cleanBreakdown,
     ...posBreakdownRows.map(r=>({from:r.from,to:r.to,full_count:r.fullCount,half_count:r.halfCount,free_count:0,total_fare:r.fare})),
@@ -692,7 +697,6 @@ const StageFilter = ({tripId,baseTickets,baseCollection,posTix,direction,onPrint
       </TouchableOpacity>
       {open&&(
         <View style={sf.panel}>
-          {/* Direction badge */}
           <View style={{flexDirection:'row',alignItems:'center',gap:6,marginBottom:8}}>
             <View style={[sf.dirBadge,{backgroundColor:isDN?'#EDE7F6':'#E3F2FD'}]}>
               <Text style={[sf.dirBadgeText,{color:isDN?'#7B1FA2':'#1565C0'}]}>{isDN?'↓ DN  STY → CBE':'↑ UP  CBE → STY'}</Text>
@@ -732,7 +736,6 @@ const StageFilter = ({tripId,baseTickets,baseCollection,posTix,direction,onPrint
               {isFilt&&!filtering&&(cleanBreakdown.length>0||posBreakdownRows.length>0)&&(
                 <View style={sf.table}>
                   <View style={sf.tableHeader}>{['SS','ES','F','H','FR','AMT'].map((h,i)=><Text key={i} style={[sf.th,h==='AMT'&&{flex:1.8,textAlign:'right'}]}>{h}</Text>)}</View>
-                  {/* App ticket rows */}
                   {cleanBreakdown.map((rb:any,i:number)=>(
                     <View key={`app-${i}`} style={[sf.tableRow,i%2===0&&{backgroundColor:'#F7FAFC'}]}>
                       <Text style={sf.td} numberOfLines={1}>{englishStop(rb.from)}</Text><Text style={sf.td} numberOfLines={1}>{englishStop(rb.to)}</Text>
@@ -740,7 +743,6 @@ const StageFilter = ({tripId,baseTickets,baseCollection,posTix,direction,onPrint
                       <Text style={[sf.td,{flex:1.8,textAlign:'right',color:'#00b7f3',fontWeight:'700'}]}>₹{Number(rb.total_fare??rb.revenue??0).toFixed(2)}</Text>
                     </View>
                   ))}
-                  {/* POS ticket rows — purple tint with full/half split */}
                   {posBreakdownRows.map((rb,i)=>(
                     <View key={`pos-${i}`} style={[sf.tableRow,{backgroundColor:'#F3E5F5'}]}>
                       <Text style={[sf.td,{color:'#4A148C'}]} numberOfLines={1}>{rb.from}</Text>
@@ -775,16 +777,14 @@ const sf = StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TAB 1 — Ticket  (Full + Half support)
+// TAB 1 — Ticket
 // ─────────────────────────────────────────────────────────────────────────────
-// Ticket type toggle: 'full' | 'half'
-// Half fare = ceil(fullFare / 2)  — standard bus half-ticket rule
 const halfFare = (full: number): number => Math.ceil(full / 2);
 
 const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{activeTrip:any;user:any;busNumber:string;onTicketIssued:(t:POSTicket)=>void;tripNumber:number}) => {
   const tripDirection: string = activeTrip?.direction ?? 'up';
-  const getPlaces = useCallback(()=> (tripDirection==='dn'||tripDirection==='return') ? [...(places as any[])].reverse() : places as any[], [tripDirection]);
-  const getBanner = ()=> (tripDirection==='dn'||tripDirection==='return') ? 'STY → CBE | சத்தி → கோவை' : 'CBE → STY | கோவை → சத்தி';
+  const getPlaces = useCallback(()=> isDownDirection(tripDirection) ? [...(places as any[])].reverse() : places as any[], [tripDirection]);
+  const getBanner = ()=> isDownDirection(tripDirection) ? 'STY → CBE | சத்தி → கோவை' : 'CBE → STY | கோவை → சத்தி';
 
   const [selStart,setSelStart]   = useState<any>(null);
   const [selDest,setSelDest]     = useState<any>(null);
@@ -792,8 +792,8 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
   const [dirErr,setDirErr]       = useState<string|null>(null);
   const [showConfirm,setShowConfirm] = useState(false);
   const [issuing,setIssuing]     = useState(false);
+  const [luggageInput,setLuggageInput] = useState('0');
 
-  // ── Ticket type & counts ──────────────────────────────────────────────
   const [ticketType,setTicketType] = useState<'full'|'half'>('full');
   const [fullCount,setFullCount]   = useState(1);
   const [halfCount,setHalfCount]   = useState(0);
@@ -801,30 +801,36 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
   useEffect(()=>{
     setSelStart(null);setSelDest(null);setDirErr(null);setActiveDrop('start');
     setTicketType('full');setFullCount(1);setHalfCount(0);
+    setLuggageInput('0');
   },[tripDirection]);
 
   const getFare = useCallback((sk:string,ek:string):number=>(fareMatrix as any)?.[sk]?.[ek]??0,[]);
 
-  // ── Fare calculation ──────────────────────────────────────────────────
   const baseFullFare  = (selStart?.key&&selDest?.key) ? getFare(selStart.key,selDest.key) : 0;
   const baseHalfFare  = halfFare(baseFullFare);
   const fullTotal     = baseFullFare * fullCount;
   const halfTotal     = baseHalfFare * halfCount;
-  const grandTotal    = fullTotal + halfTotal;
-  const totalTickets  = fullCount + halfCount;
+  const luggageAmount = parseAmount(luggageInput);
+  const hasPassengerTickets = fullCount > 0 || halfCount > 0;
+  const isLuggageOnlyTicket = luggageAmount > 0 && !hasPassengerTickets;
+  const grandTotal    = fullTotal + halfTotal + luggageAmount;
+  const totalTickets  = fullCount + halfCount + (luggageAmount > 0 ? 1 : 0);
 
-  // ── Direction validation ──────────────────────────────────────────────
   useEffect(()=>{
     setDirErr(null);
     if(!selStart?.key||!selDest?.key) return;
     const ss=Number(selStart.label.split('-')[1]), ds=Number(selDest.label.split('-')[1]);
     if(tripDirection==='up'&&ss<ds){setDirErr('Wrong direction — swap stops for UP trip (CBE → STY)');return;}
-    if((tripDirection==='dn'||tripDirection==='return')&&ss>ds){setDirErr('Wrong direction — swap stops for DN trip (STY → CBE)');return;}
+    if(isDownDirection(tripDirection)&&ss>ds){setDirErr('Wrong direction — swap stops for DN trip (STY → CBE)');return;}
   },[selStart,selDest,tripDirection]);
 
-  const isReady = selStart && selDest && !dirErr && baseFullFare > 0 && (fullCount > 0 || halfCount > 0);
+  const isReady = !!(
+    selStart &&
+    selDest &&
+    !dirErr &&
+    (luggageAmount > 0 || (hasPassengerTickets && baseFullFare > 0))
+  );
 
-  // ── Print ─────────────────────────────────────────────────────────────
   const handlePrint = async () => {
     if (Platform.OS !== 'android') {
       Alert.alert('Notice', 'Printer only on Android.');
@@ -846,28 +852,26 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
       const tn = selDest?.label?.split('-')[2] ?? selDest?.label ?? '';
       const fnum = selStart?.label?.split('-')[1] ?? '';
       const tnum = selDest?.label?.split('-')[1] ?? '';
-  
-      // ── Fetch ticket numbers before printing ───────────────────────────────
+
       const busId = activeTrip?.bus_id ?? null;
-      
-      // We need one number for full, one for half (if mixed)
-      // Get the starting number — subsequent ones increment from it
+
       const firstTicketNum = await getNextTicketNumber(busId);
       let fullTicketNum: number | null = firstTicketNum;
       let halfTicketNum: number | null = null;
-      
+
       if (halfCount > 0 && fullCount > 0) {
-        // Both types — get a second number for the half ticket record
         halfTicketNum = await getNextTicketNumber(busId);
       } else if (halfCount > 0 && fullCount === 0) {
-        // Only half tickets
         halfTicketNum = firstTicketNum;
         fullTicketNum = null;
       }
-  
+      const luggageOnFull = (fullCount > 0 || isLuggageOnlyTicket) ? luggageAmount : 0;
+      const luggageOnHalf = fullCount === 0 && halfCount > 0 ? luggageAmount : 0;
+      const luggageTicketOnFull = luggageOnFull > 0 ? 1 : 0;
+      const luggageTicketOnHalf = luggageOnHalf > 0 ? 1 : 0;
+
       await NyxPrinter.printText('SPS - ZYRAP', { textSize: 28, align: PrintAlign.CENTER });
       await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      // ── Ticket number line ─────────────────────────────────────────────────
       const numLine = [
         fullTicketNum  ? `#${fullTicketNum}`  : null,
         halfTicketNum  ? `#${halfTicketNum}`  : null,
@@ -877,6 +881,7 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
       }
       await NyxPrinter.printText(`${dp}   ${tp}`, { textSize: 22, align: PrintAlign.CENTER });
       await NyxPrinter.printText(`Bus: ${busNumber}          CASH`, { textSize: 22 });
+      if (luggageAmount > 0) await NyxPrinter.printText(`Luggage: Rs ${fareStr(luggageAmount)}`, { textSize: 20 });
       await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
       await NyxPrinter.printText(`${fnum}-${fn}`, { textSize: 24 });
       await NyxPrinter.printText(`${tnum}-${tn}`, { textSize: 24 });
@@ -891,13 +896,15 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
           `CHILD(S): ${halfCount} * ${fareStr(baseHalfFare)} = ${fareStr(halfTotal)}`,
           { textSize: 22 },
         );
+      if (luggageAmount > 0) {
+        await NyxPrinter.printText(`LUGGAGE : Rs ${fareStr(luggageAmount)}`, { textSize: 22 });
+      }
       await NyxPrinter.printText(`Rs : ${fareStr(grandTotal)}`, { textSize: 36, align: PrintAlign.CENTER });
       await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
       await NyxPrinter.printText(fortune, { textSize: 18, align: PrintAlign.CENTER });
       await NyxPrinter.printEndAutoOut();
-  
-      // ── Save full tickets with ticket_number ───────────────────────────────
-      if (fullCount > 0) {
+
+      if (fullCount > 0 || isLuggageOnlyTicket) {
         const t: POSTicket = {
           id: genId(),
           trip_id: activeTrip?.trip_id ?? null,
@@ -905,11 +912,12 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
           to_stop: selDest.label,
           from_key: selStart.key,
           to_key: selDest.key,
-          ticket_count: fullCount,
-          fare: fullTotal,
+          ticket_count: fullCount + luggageTicketOnFull,
+          fare: fullTotal + luggageOnFull,
           unit_fare: baseFullFare,
           ticket_type: 'full',
-          ticket_number: fullTicketNum,   // ← NEW
+          luggage_amount: luggageOnFull,
+          ticket_number: fullTicketNum,
           bus_number: busNumber,
           direction: tripDirection,
           issued_at: now.toISOString(),
@@ -917,8 +925,7 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
         } as any;
         onTicketIssued(t);
       }
-  
-      // ── Save half tickets with ticket_number ───────────────────────────────
+
       if (halfCount > 0) {
         const halfTime = new Date(now.getTime() + 1);
         const t: POSTicket = {
@@ -928,11 +935,12 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
           to_stop: selDest.label,
           from_key: selStart.key,
           to_key: selDest.key,
-          ticket_count: halfCount,
-          fare: halfTotal,
+          ticket_count: halfCount + luggageTicketOnHalf,
+          fare: halfTotal + luggageOnHalf,
           unit_fare: baseHalfFare,
           ticket_type: 'half',
-          ticket_number: halfTicketNum,   // ← NEW
+          luggage_amount: luggageOnHalf,
+          ticket_number: halfTicketNum,
           bus_number: busNumber,
           direction: tripDirection,
           issued_at: halfTime.toISOString(),
@@ -940,15 +948,14 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
         } as any;
         onTicketIssued(t);
       }
-  
+
       showToast(`Ticket printed · ₹${grandTotal}`);
       setShowConfirm(false);
-      setSelStart(null);
-      setSelDest(null);
       setFullCount(1);
       setHalfCount(0);
       setTicketType('full');
-      setActiveDrop('start');
+      setLuggageInput('0');
+      setActiveDrop(null);
     } catch (e: any) {
       Alert.alert('Print Error', e.message || 'Unknown');
     } finally {
@@ -962,7 +969,7 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
         {activeTrip?(
           <View style={tk.activePill}><Bus size={13} color="#2E7D32"/>
             <Text style={tk.activePillText}>
-              {activeTrip.route_name} · {formatDuration(activeTrip.start_time,null)}
+              {routeNameForDirection(activeTrip.route_name, activeTrip?.direction)} · {formatDuration(activeTrip.start_time,null)}
               {tripNumber>0?`  ·  Trip #${tripNumber}`:''}
             </Text>
             <StatusBadge status={activeTrip.status}/>
@@ -973,128 +980,112 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
         {activeTrip&&<View style={tk.routeBanner}><ArrowUpDown size={14} color="#00b7f3"/><Text style={tk.routeBannerText}>{getBanner()}</Text></View>}
         {busNumber!=='N/A'&&<View style={tk.busPill}><Bus size={13} color="#1565C0"/><Text style={tk.busPillText}>🚌 {busNumber}</Text></View>}
 
-        <View style={tk.section}>
-          <Text style={tk.sectionTitle}>Journey Details</Text>
-          <Text style={tk.sectionSub}>Select start and destination</Text>
-          {dirErr&&<View style={tk.dirErr}><AlertCircle size={14} color="#C62828"/><Text style={tk.dirErrText}>{dirErr}</Text></View>}
-          <View style={tk.placesWrap}>
-            {/* Start stop */}
-            <TouchableOpacity style={[tk.selHeader,activeDrop==='start'&&tk.selHeaderActive]} onPress={()=>setActiveDrop(p=>p==='start'?null:'start')} activeOpacity={.7}>
-              <Text style={tk.selLabel}>Starting Place</Text>
-              <Text style={[tk.selValue,!selStart&&tk.selPlaceholder]}>{selStart?selStart.label.split('-')[0]:'Select starting place'}</Text>
-            </TouchableOpacity>
-            {activeDrop==='start'&&(
-              <View style={tk.placesGrid}>
-                {getPlaces().map((p:any)=>{const dis=selDest?.key===p.key,sel=selStart?.key===p.key;return(<TouchableOpacity key={`s-${p.key}`} style={[tk.chip,sel&&tk.chipSel,dis&&tk.chipDis]} disabled={dis} onPress={()=>{setSelStart(p);setActiveDrop('destination');}}><Text style={[tk.chipText,sel&&tk.chipTextSel,dis&&tk.chipTextDis]}>{p.label.split('-')[1]} {p.label.split('-')[2]}</Text></TouchableOpacity>);})}
+        <View style={tk.ticketCard}>
+          {!activeTrip ? (
+            <View style={tk.startTripPrompt}>
+              <AlertCircle size={18} color="#F57F17"/>
+              <Text style={tk.startTripPromptTitle}>No Active Trip</Text>
+              <Text style={tk.startTripPromptText}>Please start a trip from the Trip tab to issue tickets.</Text>
+            </View>
+          ) : (
+            <>
+              {dirErr&&<View style={tk.dirErr}><AlertCircle size={14} color="#C62828"/><Text style={tk.dirErrText}>{dirErr}</Text></View>}
+
+          <View style={tk.tripSelectorBar}>
+            <TouchableOpacity style={tk.tripSide} onPress={()=>setActiveDrop(p=>p==='start'?null:'start')}>
+              <Navigation size={15} color="#666"/>
+              <View style={tk.tripSideCol}>
+                <Text style={tk.tripSideHint}>Leaving From</Text>
+                <Text style={tk.tripSideText} numberOfLines={1} ellipsizeMode="tail">
+                  {selStart ? selStart.label.split('-').slice(2).join(' ') || selStart.label.split('-').slice(1).join(' ') : 'Select start'}
+                </Text>
               </View>
-            )}
-            {/* Destination stop */}
-            <TouchableOpacity style={[tk.selHeader,activeDrop==='destination'&&tk.selHeaderActive]} onPress={()=>setActiveDrop(p=>p==='destination'?null:'destination')} activeOpacity={.7}>
-              <Text style={tk.selLabel}>Destination Place</Text>
-              <Text style={[tk.selValue,!selDest&&tk.selPlaceholder]}>{selDest?selDest.label.split('-')[0]:'Select destination place'}</Text>
             </TouchableOpacity>
-            {activeDrop==='destination'&&(
-              <View style={tk.placesGrid}>
-                {getPlaces().filter((_:any,idx:number)=>{if(!selStart)return true;const si=getPlaces().findIndex((p:any)=>p.key===selStart.key);return idx>si;}).map((p:any)=>{const dis=selStart?.key===p.key,sel=selDest?.key===p.key;return(<TouchableOpacity key={`d-${p.key}`} style={[tk.chip,sel&&tk.chipSel,dis&&tk.chipDis]} disabled={dis} onPress={()=>{setSelDest(p);setActiveDrop(null);}}><Text style={[tk.chipText,sel&&tk.chipTextSel,dis&&tk.chipTextDis]}>{p.label.split('-')[1]} {p.label.split('-')[2]}</Text></TouchableOpacity>);})}
+            <TouchableOpacity
+              style={[tk.swapBtn,(!selStart||!selDest)&&{opacity:.4}]}
+              onPress={()=>{if(selStart&&selDest){const t=selStart;setSelStart(selDest);setSelDest(t);}}}
+              disabled={!selStart||!selDest}
+            >
+              <ArrowUpDown size={15} color="#4B5563"/>
+            </TouchableOpacity>
+            <TouchableOpacity style={tk.tripSide} onPress={()=>setActiveDrop(p=>p==='destination'?null:'destination')}>
+              <Navigation size={15} color="#666"/>
+              <View style={tk.tripSideCol}>
+                <Text style={tk.tripSideHint}>Going To</Text>
+                <Text style={tk.tripSideText} numberOfLines={1} ellipsizeMode="tail">
+                  {selDest ? selDest.label.split('-').slice(2).join(' ') || selDest.label.split('-').slice(1).join(' ') : 'Select destination'}
+                </Text>
               </View>
-            )}
-            {(selStart||selDest)&&(
-              <TouchableOpacity style={[tk.revBtn,(!selStart||!selDest)&&tk.revBtnDis]} onPress={()=>{if(selStart&&selDest){const t=selStart;setSelStart(selDest);setSelDest(t);}}} disabled={!selStart||!selDest}>
-                <ArrowUpDown size={24} color={!selStart||!selDest?'#ccc':'#00b7f3'}/>
-              </TouchableOpacity>
-            )}
+            </TouchableOpacity>
           </View>
-
-          {/* ── Ticket type + counts ──────────────────────────────────── */}
-          {selStart&&selDest&&!dirErr&&baseFullFare>0&&(
-            <View style={tk.ticketTypeWrap}>
-
-              {/* Full tickets row */}
-              <View style={tk.ticketTypeRow}>
-                <View style={tk.ticketTypeLabelWrap}>
-                  <View style={[tk.typeBadge,{backgroundColor:'#E3F2FD'}]}>
-                    <Text style={[tk.typeBadgeText,{color:'#1565C0'}]}>FULL</Text>
-                  </View>
-                  <View>
-                    <Text style={tk.typeLabel}>Adult Ticket</Text>
-                    <Text style={tk.typePrice}>₹{fareStr(baseFullFare)} each</Text>
-                  </View>
-                </View>
-                <View style={tk.countCtrl}>
-                  <TouchableOpacity style={[tk.countBtn,fullCount<=0&&tk.countBtnDis]} onPress={()=>setFullCount(p=>Math.max(0,p-1))} disabled={fullCount<=0}>
-                    <Minus color={fullCount<=0?'#ccc':'#00b7f3'} size={20}/>
+          {activeDrop==='start'&&(
+            <View style={tk.placesGrid}>
+              {getPlaces().map((p:any)=>{
+                const dis=selDest?.key===p.key,sel=selStart?.key===p.key;
+                return(
+                  <TouchableOpacity key={`s-${p.key}`} style={[tk.chip,sel&&tk.chipSel,dis&&tk.chipDis]} disabled={dis} onPress={()=>{setSelStart(p);setActiveDrop('destination');}}>
+                    <Text style={[tk.chipText,sel&&tk.chipTextSel,dis&&tk.chipTextDis]}>{p.label.split('-')[1]} {p.label.split('-')[2]}</Text>
                   </TouchableOpacity>
-                  <Text style={tk.countNum}>{fullCount}</Text>
-                  <TouchableOpacity style={tk.countBtn} onPress={()=>setFullCount(p=>p+1)}>
-                    <Plus color="#00b7f3" size={20}/>
-                  </TouchableOpacity>
-                </View>
-              </View>
-
-              {/* Half tickets row */}
-              <View style={[tk.ticketTypeRow,{borderTopWidth:1,borderTopColor:'#f0f0f0',marginTop:8,paddingTop:12}]}>
-                <View style={tk.ticketTypeLabelWrap}>
-                  <View style={[tk.typeBadge,{backgroundColor:'#FFF3E0'}]}>
-                    <Text style={[tk.typeBadgeText,{color:'#E65100'}]}>HALF</Text>
-                  </View>
-                  <View>
-                    <Text style={tk.typeLabel}>Child Ticket</Text>
-                    <Text style={tk.typePrice}>₹{fareStr(baseHalfFare)} each</Text>
-                  </View>
-                </View>
-                <View style={tk.countCtrl}>
-                  <TouchableOpacity style={[tk.countBtn,halfCount<=0&&tk.countBtnDis]} onPress={()=>setHalfCount(p=>Math.max(0,p-1))} disabled={halfCount<=0}>
-                    <Minus color={halfCount<=0?'#ccc':'#FF9800'} size={20}/>
-                  </TouchableOpacity>
-                  <Text style={[tk.countNum,halfCount>0&&{color:'#FF9800'}]}>{halfCount}</Text>
-                  <TouchableOpacity style={tk.countBtn} onPress={()=>setHalfCount(p=>p+1)}>
-                    <Plus color="#FF9800" size={20}/>
-                  </TouchableOpacity>
-                </View>
-              </View>
-
+                );
+              })}
             </View>
           )}
-        </View>
 
-        {/* ── Fare breakdown card ───────────────────────────────────────── */}
-        {isReady&&(
-          <View style={tk.section}>
-            <View style={tk.fareCard}>
-              <View style={tk.fareHdr}><Receipt size={22} color="#00b7f3"/><Text style={tk.fareTitle}>Fare Breakdown</Text></View>
-              {fullCount>0&&(
-                <View style={tk.fareRow}>
-                  <Text style={tk.fareLabel}>Adult × {fullCount}</Text>
-                  <Text style={tk.fareVal}>₹{fareStr(fullTotal)}</Text>
-                </View>
-              )}
-              {halfCount>0&&(
-                <View style={tk.fareRow}>
-                  <Text style={[tk.fareLabel,{color:'#FF9800'}]}>Child × {halfCount}</Text>
-                  <Text style={[tk.fareVal,{color:'#FF9800'}]}>₹{fareStr(halfTotal)}</Text>
-                </View>
-              )}
-              <View style={tk.fareDivider}/>
-              <View style={tk.fareRow}>
-                <Text style={tk.fareTotalLabel}>Total  ({totalTickets} ticket{totalTickets!==1?'s':''})</Text>
-                <Text style={tk.fareTotalVal}>₹{fareStr(grandTotal)}</Text>
-              </View>
+          {activeDrop==='destination'&&(
+            <View style={tk.placesGrid}>
+              {getPlaces().filter((_:any,idx:number)=>{if(!selStart)return true;const si=getPlaces().findIndex((p:any)=>p.key===selStart.key);return idx>si;}).map((p:any)=>{
+                const dis=selStart?.key===p.key,sel=selDest?.key===p.key;
+                return(
+                  <TouchableOpacity key={`d-${p.key}`} style={[tk.chip,sel&&tk.chipSel,dis&&tk.chipDis]} disabled={dis} onPress={()=>{setSelDest(p);setActiveDrop(null);}}>
+                    <Text style={[tk.chipText,sel&&tk.chipTextSel,dis&&tk.chipTextDis]}>{p.label.split('-')[1]} {p.label.split('-')[2]}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          )}
+
+          <View style={tk.countHeaderRow}>
+            <Text style={tk.countHead}>Full</Text>
+            <Text style={tk.countHead}>Half</Text>
+          </View>
+          <View style={tk.countInputRow}>
+            <View style={tk.countCell}>
+              <TouchableOpacity style={[tk.stepBtn,fullCount<=0&&tk.stepBtnDisabled]} onPress={()=>setFullCount(v=>Math.max(0,v-1))} disabled={fullCount<=0}>
+                <Minus size={16} color={fullCount<=0?'#b9c4cf':'#fff'}/>
+              </TouchableOpacity>
+              <TextInput style={tk.countInput} keyboardType="numeric" value={String(fullCount)} onChangeText={(v)=>setFullCount(Math.max(0, Number(v.replace(/[^0-9]/g,''))||0))}/>
+              <TouchableOpacity style={tk.stepBtn} onPress={()=>setFullCount(v=>v+1)}>
+                <Plus size={18} color="#fff"/>
+              </TouchableOpacity>
+            </View>
+            <View style={tk.countCell}>
+              <TouchableOpacity style={[tk.stepBtn,halfCount<=0&&tk.stepBtnDisabled]} onPress={()=>setHalfCount(v=>Math.max(0,v-1))} disabled={halfCount<=0}>
+                <Minus size={16} color={halfCount<=0?'#b9c4cf':'#fff'}/>
+              </TouchableOpacity>
+              <TextInput style={tk.countInput} keyboardType="numeric" value={String(halfCount)} onChangeText={(v)=>setHalfCount(Math.max(0, Number(v.replace(/[^0-9]/g,''))||0))}/>
+              <TouchableOpacity style={tk.stepBtn} onPress={()=>setHalfCount(v=>v+1)}>
+                <Plus size={18} color="#fff"/>
+              </TouchableOpacity>
             </View>
           </View>
-        )}
+
+          <Text style={tk.fieldLabel}>Luggage Charge</Text>
+          <TextInput style={tk.fieldInput} keyboardType="numeric" value={luggageInput} onChangeText={setLuggageInput} placeholder="0" placeholderTextColor="#9AA7B5"/>
+
+          <View style={tk.payWrap}>
+            <Text style={tk.payLabel}>Pay</Text>
+            <Text style={tk.payValue}>₹{fareStr(grandTotal)}</Text>
+            <Text style={tk.payMeta}>Total Tickets : {totalTickets}</Text>
+          </View>
+
+              <TouchableOpacity style={[tk.ticketPrintBtn,!isReady&&{opacity:.5}]} onPress={()=>setShowConfirm(true)} disabled={!isReady}>
+                <Text style={tk.ticketPrintText}>PRINT TICKET</Text>
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
       </ScrollView>
 
-      {isReady&&(
-        <View style={tk.printBar}>
-          <TouchableOpacity style={tk.printBtn} onPress={()=>setShowConfirm(true)}>
-            <Printer color="#fff" size={22} style={{marginBottom:4}}/>
-            <Text style={tk.printBtnText}>Print Ticket</Text>
-            <Text style={tk.printBtnAmt}>₹{grandTotal}</Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      {/* ── Confirm modal ─────────────────────────────────────────────── */}
       <Modal animationType="slide" transparent visible={showConfirm} onRequestClose={()=>setShowConfirm(false)}>
         <View style={sh.modalOverlay}><View style={sh.bottomSheet}>
           <View style={sh.sheetHandle}/>
@@ -1102,6 +1093,7 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
           <View style={tk.detailRow}><Text style={tk.detailLabel}>Bus</Text><Text style={tk.detailVal}>{busNumber}</Text></View>
           <View style={tk.detailRow}><Text style={tk.detailLabel}>From</Text><Text style={tk.detailVal}>{selStart?.label?.split('-')[0]}</Text></View>
           <View style={tk.detailRow}><Text style={tk.detailLabel}>To</Text><Text style={tk.detailVal}>{selDest?.label?.split('-')[0]}</Text></View>
+          {luggageAmount>0&&<View style={tk.detailRow}><Text style={tk.detailLabel}>Luggage</Text><Text style={tk.detailVal}>₹{fareStr(luggageAmount)}</Text></View>}
           {fullCount>0&&<View style={tk.detailRow}><Text style={tk.detailLabel}>Adult</Text><Text style={tk.detailVal}>{fullCount} × ₹{fareStr(baseFullFare)} = ₹{fareStr(fullTotal)}</Text></View>}
           {halfCount>0&&<View style={tk.detailRow}><Text style={[tk.detailLabel,{color:'#FF9800'}]}>Child</Text><Text style={[tk.detailVal,{color:'#FF9800'}]}>{halfCount} × ₹{fareStr(baseHalfFare)} = ₹{fareStr(halfTotal)}</Text></View>}
           <View style={tk.fareDivider}/>
@@ -1121,15 +1113,14 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
 // ─────────────────────────────────────────────────────────────────────────────
 // TAB 2 — Trip
 // ─────────────────────────────────────────────────────────────────────────────
-const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTicket,tripNumber,posHook}:{dashboard:any;onRefresh:()=>void;pendingRequests:any[];verifyingTicket:string|null;onVerifyTicket:(id:string)=>void;tripNumber:number;posHook:ReturnType<typeof usePOSTickets>}) => {
+const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTicket,tripNumber,posHook}:{dashboard:any;onRefresh:(payload?:{direction:string;route_name?:string;start_time:string})=>void|Promise<void>;pendingRequests:any[];verifyingTicket:string|null;onVerifyTicket:(id:string)=>void;tripNumber:number;posHook:ReturnType<typeof usePOSTickets>}) => {
   const [changing,setChanging]=useState(false);
   const [startModal,setStartModal]=useState(false);
   const [reportTrip,setReportTrip]=useState<any>(null);
   const at=dashboard?.active_trip;
 
-  // ── RULE: POS = AsyncStorage (local hook), App = Supabase (non-pos only) ─
   const activePOSTix   = posHook.tickets.filter((t:any)=>t.trip_id===at?.trip_id);
-  const activePOSCount = activePOSTix.reduce((s:number,t:any)=>s+t.ticket_count,0);  // passengers
+  const activePOSCount = activePOSTix.reduce((s:number,t:any)=>s+t.ticket_count,0);
   const activePOSFare  = activePOSTix.reduce((s:number,t:any)=>s+t.fare,0);
 
   const [appOnlyTickets,setAppOnlyTickets] = useState(0);
@@ -1173,7 +1164,7 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
     return () => { cancelled = true; };
   }, [at?.trip_id]);
 
-  const displayPOSCount = activePOSCount; // always from local hook
+  const displayPOSCount = activePOSCount;
   const totalFareCombined = appOnlyFare + activePOSFare;
 
   const changeStatus=async(s:string)=>{
@@ -1230,7 +1221,7 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
                 <Text style={{fontSize:10,color:'#888',fontWeight:'700',letterSpacing:1.5,marginBottom:2}}>
                   ACTIVE TRIP{tripNumber>0 ? ` · #${tripNumber}` : ''}
                 </Text>
-                <Text style={{fontSize:20,fontWeight:'700',color:'#1a2332'}}>{at.route_name}</Text>
+                <Text style={{fontSize:20,fontWeight:'700',color:'#1a2332'}}>{routeNameForDirection(at.route_name, at?.direction)}</Text>
               </View>
               <StatusBadge status={at.status}/>
             </View>
@@ -1279,7 +1270,7 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
           <Text style={sh.sectionTitle}>Recent Trips</Text>
           {dashboard.recent_trips.slice(0,5).map((trip:any,i:number)=>(
             <TouchableOpacity key={i} style={sh.recentTripRow} onPress={()=>setReportTrip(trip.trip_id)}>
-              <View style={{flex:1}}><Text style={sh.recentTripRoute}>{trip.route_name}</Text><Text style={{fontSize:11,color:'#888',marginTop:2}}>{formatDate(trip.start_time)} · {trip.direction}</Text><View style={{flexDirection:'row',gap:8,marginTop:4}}><Text style={{fontSize:12,color:'#666'}}>🎟 {trip.tickets_sold}</Text><Text style={{fontSize:12,color:'#4CAF50'}}>₹{trip.collection}</Text></View></View>
+              <View style={{flex:1}}><Text style={sh.recentTripRoute}>{routeNameForDirection(trip.route_name, trip?.direction)}</Text><Text style={{fontSize:11,color:'#888',marginTop:2}}>{formatDate(trip.start_time)} · {trip.direction}</Text><View style={{flexDirection:'row',gap:8,marginTop:4}}><Text style={{fontSize:12,color:'#666'}}>🎟 {trip.tickets_sold}</Text><Text style={{fontSize:12,color:'#4CAF50'}}>₹{trip.collection}</Text></View></View>
               <View style={{alignItems:'flex-end',gap:6}}><StatusBadge status={trip.status}/><ChevronRight size={18} color="#ccc"/></View>
             </TouchableOpacity>
           ))}
@@ -1293,7 +1284,6 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TAB 3 — Riders
-// FIX 2: Filter out POS tickets (payment_method === 'pos') from App Tickets
 // ─────────────────────────────────────────────────────────────────────────────
 const RidersTab = ({activeTrip,pendingRequests,onVerifyTicket,verifyingTicket,posTickets}:{activeTrip:any;pendingRequests:any[];onVerifyTicket:(id:string)=>void;verifyingTicket:string|null;posTickets:POSTicket[]}) => {
   const [data,setData]=useState<any>(null);
@@ -1303,31 +1293,20 @@ const RidersTab = ({activeTrip,pendingRequests,onVerifyTicket,verifyingTicket,po
   const pendingIds=new Set((pendingRequests||[]).map((p:any)=>p.ticket_id));
   const tripPOS=posTickets.filter(t=>t.trip_id===activeTrip?.trip_id);
 
-  // ── FIX 2: Exclude POS tickets from the App Tickets list ─────────────────
-  // POS tickets inserted via Supabase (Fix 1) have no user_id and no
-  // from_stop/to_stop text — the backend returns them with empty/null stops.
-  // We guard with THREE signals so no POS row ever bleeds through:
-  //   1. payment_method === 'pos'  (explicit field if backend returns it)
-  //   2. user_id is null/empty     (POS tickets have no app user)
-  //   3. both from AND to are empty/null (POS DB rows have no stop text)
   const allPassengers: any[] = data?.passengers ?? [];
   const appOnlyPassengers = allPassengers.filter((p: any) => {
-    // Signal 1: explicit payment_method
     if ((p.payment_method ?? '').toLowerCase() === 'pos') return false;
-    // Signal 2: no user_id means it was inserted by the POS device, not the app
     if (!p.user_id && !p.passenger_id) return false;
-    // Signal 3: both stops are missing — POS DB rows have empty from_stop/to_stop
     const hasFrom = p.from && p.from !== 'Unknown' && p.from.trim() !== '';
     const hasTo   = p.to   && p.to   !== 'Unknown' && p.to.trim()   !== '';
     if (!hasFrom && !hasTo) return false;
     return true;
   });
-   
+
   const sorted = [...appOnlyPassengers].sort(
     (a: any, b: any) =>
       (pendingIds.has(a.ticket_id) ? 0 : 1) - (pendingIds.has(b.ticket_id) ? 0 : 1)
   );
-  console.log("sorted",sorted)
   const posPassengerCount=tripPOS.reduce((s,t)=>s+t.ticket_count,0);
 
   if(!activeTrip)return(
@@ -1352,8 +1331,6 @@ const RidersTab = ({activeTrip,pendingRequests,onVerifyTicket,verifyingTicket,po
       </View>
       {loading?<ActivityIndicator size="large" color="#00b7f3" style={{marginTop:60}}/>:(
         <ScrollView contentContainerStyle={{paddingHorizontal:16,paddingBottom:20}}>
-
-          {/* ── POS Tickets ─────────────────────────────────────────────── */}
           {tripPOS.length>0&&(
             <View style={{marginBottom:12}}>
               <View style={rr.secHeader}><Printer size={13} color="#7B1FA2"/><Text style={rr.secLabel}>POS TICKETS · {posPassengerCount} passengers</Text></View>
@@ -1394,7 +1371,6 @@ const RidersTab = ({activeTrip,pendingRequests,onVerifyTicket,verifyingTicket,po
             </View>
           )}
 
-          {/* ── App Tickets (non-POS only) ───────────────────────────────── */}
           {sorted.length===0&&tripPOS.length===0?(
             <View style={{alignItems:'center',paddingVertical:40}}><Users size={48} color="#ccc"/><Text style={{fontSize:15,color:'#bbb',marginTop:10}}>No passengers yet</Text></View>
           ):sorted.length>0&&(
@@ -1446,19 +1422,16 @@ const rr=StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TAB 4 — Report
-// FIX 3: appTickets from backend already excludes POS because the backend
-//        /trip/report endpoint groups by stage — but bt.tickets_sold from
-//        the dashboard DOES include POS (since Fix 1 writes them to DB).
-//        We correct the "App" counts by subtracting POS counts.
+// TAB 4 — Report  (with Status Report per trip)
 // ─────────────────────────────────────────────────────────────────────────────
 const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:ReturnType<typeof usePOSTickets>}) => {
   const [collection,setCollection]   = useState<any>(null);
   const [collLoading,setCollLoading] = useState(false);
   const [period,setPeriod]           = useState('today');
   const [expandedTrip,setExpandedTrip] = useState<string|null>(null);
-  const [appTickets,setAppTickets]   = useState<Record<string,any>>({});  // stores full report per tripId
+  const [appTickets,setAppTickets]   = useState<Record<string,any>>({});
   const [appLoading,setAppLoading]   = useState<Record<string,boolean>>({});
+  const [printingStatus,setPrintingStatus] = useState<string|null>(null);
 
   useEffect(()=>{fetchCol('today');},[]);
   const fetchCol=async(p:string)=>{
@@ -1472,7 +1445,6 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
     setAppLoading(p=>({...p,[tripId]:true}));
     try{
       const r=await api.get(`/conductor/trip/${tripId}/report`);
-      // Store full report so we can use summary.total_collection accurately
       setAppTickets(p=>({...p,[tripId]:r.data||{}}));
     }catch{
       setAppTickets(p=>({...p,[tripId]:{}}));
@@ -1503,7 +1475,6 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
     const appBreakdown = appTickets[tripId]?.route_breakdown||[];
     const map:Record<string,{from:string;to:string;count:number;fare:number;posCount:number;appCount:number}> = {};
 
-    // Add POS stages from local hook
     for(const s of posStages){
       const k=`${s.from}|||${s.to}`;
       if(!map[k]) map[k]={from:s.from,to:s.to,count:0,fare:0,posCount:0,appCount:0};
@@ -1511,14 +1482,11 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
       map[k].fare     += s.fare;
       map[k].posCount += s.count;
     }
-    // Add App breakdown from backend — skip POS rows to avoid double-count.
-    // POS tickets in DB have null stop IDs so backend returns them with
-    // empty/null from+to strings. Skip any row where both stops are blank.
     for(const rb of appBreakdown){
       const f=englishStop(rb.from), t=englishStop(rb.to);
       const validFrom = f && f !== '?' && f.trim() !== '';
       const validTo   = t && t !== '?' && t.trim() !== '';
-      if(!validFrom && !validTo) continue; // POS row — already counted above
+      if(!validFrom && !validTo) continue;
       const k=`${f}|||${t}`;
       if(!map[k]) map[k]={from:f,to:t,count:0,fare:0,posCount:0,appCount:0};
       const appCnt = (rb.full_count||0)+(rb.half_count||0)+(rb.free_count||0);
@@ -1528,6 +1496,127 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
       map[k].appCount += appCnt;
     }
     return Object.values(map).sort((a,b)=>b.fare-a.fare);
+  };
+
+  // ── Status Report printer (matches the physical receipt format) ─────────────
+  const printStatusReport = async (tripId: string, idx: number) => {
+    if (Platform.OS !== 'android' || !NyxPrinter) {
+      Alert.alert('Notice', 'Printer only on Android.');
+      return;
+    }
+    setPrintingStatus(tripId);
+    try {
+      const ret = await NyxPrinter.getPrinterStatus();
+      if (ret !== PrinterStatus.SDK_OK) {
+        Alert.alert('Printer Error', PrinterStatus.msg(ret));
+        return;
+      }
+
+      const bt         = backendTrip(tripId);
+      const posTix     = posByTrip[tripId] || [];
+      const reportData = appTickets[tripId] || {};
+      const summary    = reportData?.summary;
+
+      const busNum  = posTix[0]?.bus_number ?? bt?.bus_number ?? 'N/A';
+      const wayBill = bt?.way_bill_number ?? bt?.waybill ?? bt?.way_bill ?? '—';
+      const tripNum = bt?.trip_number ?? (idx + 1);
+      const firstT  = posTix[0]?.issued_at ?? bt?.start_time;
+      const dt      = firstT ? new Date(firstT) : new Date();
+      const dateStr = dt.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: '2-digit' }).replace(/\//g, '/');
+      const timeStr = dt.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
+
+      const posTotal   = posTix.reduce((s: number, t: any) => s + t.fare, 0);
+      const posCnt     = posTix.reduce((s: number, t: any) => s + t.ticket_count, 0);
+      const posLuggCnt = posTix.reduce((s:number,t:any)=>s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0),0);
+      const posFullCnt = posTix.filter((t: any) => (t.ticket_type ?? 'full') !== 'half').reduce((s: number, t: any) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
+      const posHalfCnt = posTix.filter((t: any) => t.ticket_type === 'half').reduce((s: number, t: any) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
+
+      const rawBackendTotal = Number(summary?.total_collection ?? bt?.collection ?? 0);
+      const rawBackendFull  = Number(summary?.total_full ?? 0);
+      const rawBackendHalf  = Number(summary?.total_half ?? 0);
+      const rawBackendFree  = Number(summary?.total_free ?? 0);
+      const appTotal        = Math.max(0, rawBackendTotal - posTotal);
+      const appFullCnt      = rawBackendFull;
+      const appHalfCnt      = rawBackendHalf;
+      const appFreeCnt      = rawBackendFree;
+
+      const grandFull  = appFullCnt + posFullCnt;
+      const grandHalf  = appHalfCnt + posHalfCnt;
+      const grandFree  = appFreeCnt;
+      const grandTotal = appTotal + posTotal;
+
+      // cumulative collection: sum all trips up to and including this one (today)
+      const tripsSoFar = allTripIds.slice(0, idx + 1);
+      const totColl = tripsSoFar.reduce((sum, tid) => {
+        const b   = backendTrip(tid);
+        const pTix = posByTrip[tid] || [];
+        const pAmt = pTix.reduce((s: number, t: any) => s + t.fare, 0);
+        const rSummary = appTickets[tid]?.summary;
+        const rTotal   = Number(rSummary?.total_collection ?? b?.collection ?? 0);
+        // app portion = rTotal - pAmt (if backend already includes POS, adjust)
+        const appAmt = Math.max(0, rTotal - pAmt);
+        return sum + appAmt + pAmt;
+      }, 0);
+
+      // Build stage rows: SS ES F H L P AMT
+      // L = luggage tickets
+      // P = pass/free
+      const stages = mergedStages(tripId);
+
+      const fmt = (n: number) => n % 1 === 0 ? `${n}.00` : n.toFixed(2);
+      const col1 = 7, col2 = 7, col3 = 3, col4 = 3, col5 = 3, col6 = 3;
+      const pad = (s: string, w: number) => s.length >= w ? s.slice(0, w) : s + ' '.repeat(w - s.length);
+      const rpad = (s: string, w: number) => s.length >= w ? s.slice(0, w) : ' '.repeat(w - s.length) + s;
+
+      await NyxPrinter.printText('SPS - ZYRAP', { textSize: 22, align: PrintAlign.CENTER });
+      await NyxPrinter.printText('STATUS REPORT', { textSize: 26, align: PrintAlign.CENTER });
+      await NyxPrinter.printText(`BUS No:${busNum} WAY BILL No: ${wayBill}`, { textSize: 18 });
+      await NyxPrinter.printText(`${dateStr}  ${timeStr}`, { textSize: 18, align: PrintAlign.CENTER });
+      await NyxPrinter.printText(`TRIP No. : ${tripNum}`, { textSize: 22, align: PrintAlign.CENTER });
+      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+      // Header row
+      await NyxPrinter.printText(
+        `${pad('SS', col1)} ${pad('ES', col2)} ${pad('F', col3)} ${pad('H', col4)} ${pad('L', col5)} ${pad('P', col6)}  AMT`,
+        { textSize: 18 }
+      );
+      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+
+      // Stage rows
+      for (const s of stages) {
+        const ssLabel = (s.from ?? '').slice(0, col1);
+        const esLabel = (s.to ?? '').slice(0, col2);
+        // F = full tickets for this stage (app full + pos full approximated by ratio)
+        // For simplicity we show combined count in F, 0 in H/L/P
+        // If you track per-stage type you can enhance this
+        const stageF = s.count;
+        const stageH = 0;
+        const stageL = 0;
+        const stageP = 0;
+        const line = `${pad(ssLabel, col1)} ${pad(esLabel, col2)} ${pad(String(stageF), col3)} ${pad(String(stageH), col4)} ${pad(String(stageL), col5)} ${pad(String(stageP), col6)}  ${fmt(s.fare)}`;
+        await NyxPrinter.printText(line, { textSize: 17 });
+      }
+
+      if (stages.length === 0) {
+        await NyxPrinter.printText('  (no stage data)', { textSize: 17 });
+      }
+
+      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(`FULL : ${grandFull}`, { textSize: 20 });
+      if (grandHalf > 0) await NyxPrinter.printText(`HALF : ${grandHalf}`, { textSize: 20 });
+      if (grandFree > 0) await NyxPrinter.printText(`FREE : ${grandFree}`, { textSize: 20 });
+      await NyxPrinter.printText(`LUGG : ${posLuggCnt}`, { textSize: 20 });
+      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(`TRIP.COLL Rs.:   ${fmt(grandTotal)}`, { textSize: 20 });
+      await NyxPrinter.printText(`TOT.COLL  Rs.:   ${fmt(totColl)}`, { textSize: 20 });
+      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+      await NyxPrinter.printText('** Safe Journey **', { align: PrintAlign.CENTER });
+      await NyxPrinter.printEndAutoOut();
+      showToast('Status report printed!');
+    } catch (e: any) {
+      Alert.alert('Print Error', e.message || 'Unknown');
+    } finally {
+      setPrintingStatus(null);
+    }
   };
 
   const printDailyReport=async(tripId:string)=>{
@@ -1542,20 +1631,18 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
 
       const posTotal = posTix.reduce((s,t)=>s+t.fare,0);
       const posCnt   = posTix.reduce((s,t)=>s+t.ticket_count,0);
+      const posLuggCnt = posTix.reduce((s:number,t:any)=>s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0),0);
 
-      // Use the fetched report summary if available (more accurate — backend computed),
-      // otherwise fall back to dashboard bt values. Either way subtract local POS totals.
-      // POS = local hook (posTix), App = backend DB minus local POS
       const reportSummary = appTickets[tripId]?.summary;
       const rawBackendTotal = Number(reportSummary?.total_collection ?? bt?.collection ?? 0);
       const rawBackendRows  = Number(reportSummary
         ? ((reportSummary.total_full||0)+(reportSummary.total_half||0)+(reportSummary.total_free||0))
         : (bt?.tickets_sold || 0));
       const appTotal = Math.max(0, rawBackendTotal - posTotal);
-      const appCnt   = Math.max(0, rawBackendRows  - posTix.length);  // backend rows - POS rows
+      const appCnt   = Math.max(0, rawBackendRows  - posTix.length);
 
-      const grandTotal = posTotal + appTotal;   // POS(local) + App(DB)
-      const grandCnt   = posCnt   + appCnt;     // POS passengers + App rows
+      const grandTotal = posTotal + appTotal;
+      const grandCnt   = posCnt   + appCnt;
 
       const busNum = posTix[0]?.bus_number ?? bt?.bus_number ?? 'N/A';
       const dir    = posTix[0]?.direction  ?? bt?.direction  ?? '';
@@ -1568,7 +1655,7 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
       await NyxPrinter.printText(`Date : ${today}\nBus  : ${busNum}\nDir  : ${dir.toUpperCase()}`,{textSize:20});
       await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
       await NyxPrinter.printText(`App Tickets : ${appCnt}   Rs.${fmt(appTotal)}`,{textSize:18});
-      await NyxPrinter.printText(`POS Tickets : ${posCnt}   Rs.${fmt(posTotal)}`,{textSize:18});
+      await NyxPrinter.printText(`POS Tickets : ${posCnt} (L:${posLuggCnt})   Rs.${fmt(posTotal)}`,{textSize:18});
       await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
       await NyxPrinter.printText(`Total : ${grandCnt} tickets`,{textSize:20});
       await NyxPrinter.printText(`Rs. ${fmt(grandTotal)}`,{textSize:32,align:PrintAlign.CENTER});
@@ -1589,18 +1676,14 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
     }catch(e:any){Alert.alert('Print Error',e.message||'Unknown');}
   };
 
-  // ── RULE: POS = AsyncStorage (local hook), App = backend DB ───────────────
-  // posSummary comes from local hook (AsyncStorage) — authoritative for POS
-  // stats.* comes from backend DB — includes POS rows, so subtract local POS
   const appOnlyCollection = Math.max(0, (stats.total_collection||0) - posSummary.total);
-  const appOnlyTickets    = Math.max(0, (stats.tickets_sold||0)    - posSummary.rows);  // rows not passengers
-  const grandTodayTotal   = appOnlyCollection + posSummary.total;   // app(DB) + POS(local)
-  const grandTodayTickets = appOnlyTickets    + posSummary.count;   // app rows + POS passengers
+  const appOnlyTickets    = Math.max(0, (stats.tickets_sold||0)    - posSummary.rows);
+  const grandTodayTotal   = appOnlyCollection + posSummary.total;
+  const grandTodayTickets = appOnlyTickets    + posSummary.count;
 
   return (
     <ScrollView style={{flex:1}} contentContainerStyle={{padding:16,paddingBottom:40}} showsVerticalScrollIndicator={false}>
 
-      {/* Conductor card */}
       {user&&(
         <View style={sh.conductorCard}>
           <View style={sh.conductorAvatar}><BadgeCheck size={26} color="#00b7f3"/></View>
@@ -1611,7 +1694,6 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
         </View>
       )}
 
-      {/* ── Today's Stats — app + POS combined (de-duped) ───────────────────── */}
       <Text style={sh.sectionTitle}>Today's Stats</Text>
       <View style={sh.statsGrid}>
         {[
@@ -1628,13 +1710,12 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
         ))}
       </View>
 
-      {/* POS + App summary pill */}
       {posSummary.count > 0 && (
         <View style={rp.posSummaryRow}>
           <View style={rp.posSummaryChip}>
             <Printer size={11} color="#7B1FA2"/>
             <Text style={rp.posSummaryText}>
-              POS: {posSummary.count} ({posSummary.full}F{posSummary.half>0?` · ${posSummary.half}H`:''}) · ₹{posSummary.total.toFixed(0)}
+              POS: {posSummary.count} ({posSummary.full}F{posSummary.half>0?` · ${posSummary.half}H`:''}{(posSummary as any).luggage>0?` · ${(posSummary as any).luggage}L`:''}) · ₹{posSummary.total.toFixed(0)}
             </Text>
           </View>
           <View style={rp.appSummaryChip}>
@@ -1644,7 +1725,6 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
         </View>
       )}
 
-      {/* ── Daily Trip Report — merged app + POS ────────────────────────────── */}
       {allTripIds.length > 0 && (
         <View style={{marginTop:20}}>
           <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
@@ -1654,24 +1734,22 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
             </View>
           </View>
 
-          {allTripIds.map((tripId,idx)=>{
+          {allTripIds.map((tripId, idx) => {
             const bt       = backendTrip(tripId);
             const posTix   = posByTrip[tripId]||[];
             const posTotal = posTix.reduce((s,t)=>s+t.fare,0);
             const posCnt   = posTix.reduce((s,t)=>s+t.ticket_count,0);
 
-            // POS = local hook (posTix), App = backend DB minus local POS
             const reportSummary = appTickets[tripId]?.summary;
             const rawBackendTotal = Number(reportSummary?.total_collection ?? bt?.collection ?? 0);
             const rawBackendRows  = Number(reportSummary
               ? ((reportSummary.total_full||0)+(reportSummary.total_half||0)+(reportSummary.total_free||0))
               : (bt?.tickets_sold || 0));
-            // Subtract local POS from backend totals to get app-only values
             const appTotal = Math.max(0, rawBackendTotal - posTotal);
-            const appCnt   = Math.max(0, rawBackendRows  - posTix.length);  // rows not passengers
+            const appCnt   = Math.max(0, rawBackendRows  - posTix.length);
 
-            const grandTotal = posTotal + appTotal;   // POS(local) + App(DB)
-            const grandCnt   = posCnt   + appCnt;     // POS passengers + App rows
+            const grandTotal = posTotal + appTotal;
+            const grandCnt   = posCnt   + appCnt;
             const busNum   = posTix[0]?.bus_number??bt?.bus_number??'N/A';
             const dir      = posTix[0]?.direction??bt?.direction??'';
             const firstT   = posTix[0]?.issued_at??bt?.start_time;
@@ -1679,9 +1757,36 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
             const stages   = isOpen ? mergedStages(tripId) : [];
             const isLoadingApp = appLoading[tripId];
 
+            // per-trip grand full/half for status report display
+            const reportData  = appTickets[tripId] || {};
+            const summary     = reportData?.summary;
+            const appFullCnt  = Number(summary?.total_full ?? 0);
+            const appHalfCnt  = Number(summary?.total_half ?? 0);
+            const appFreeCnt  = Number(summary?.total_free ?? 0);
+            const posLuggCnt  = posTix.reduce((s:number,t:any)=>s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0),0);
+            const posFullCnt  = posTix.filter((t:any)=>(t.ticket_type??'full')!=='half').reduce((s:number,t:any)=>s+Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)),0);
+            const posHalfCnt  = posTix.filter((t:any)=>t.ticket_type==='half').reduce((s:number,t:any)=>s+Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)),0);
+            const posLuggage = posTix.reduce((s:number,t:any)=>s+Number(t.luggage_amount ?? 0),0);
+            const grandFull   = appFullCnt + posFullCnt;
+            const grandHalf   = appHalfCnt + posHalfCnt;
+            const grandFree   = appFreeCnt;
+            const tripNum     = bt?.trip_number ?? (idx + 1);
+            const wayBill     = bt?.way_bill_number ?? bt?.waybill ?? bt?.way_bill ?? '—';
+
+            // cumulative collection up to this trip
+            const tripsSoFar  = allTripIds.slice(0, idx + 1);
+            const totColl     = tripsSoFar.reduce((sum, tid) => {
+              const b    = backendTrip(tid);
+              const pTix = posByTrip[tid] || [];
+              const pAmt = pTix.reduce((s: number, t: any) => s + t.fare, 0);
+              const rSum = appTickets[tid]?.summary;
+              const rTot = Number(rSum?.total_collection ?? b?.collection ?? 0);
+              return sum + Math.max(0, rTot - pAmt) + pAmt;
+            }, 0);
+
             return (
               <View key={tripId} style={rp.tripCard}>
-                {/* Header */}
+                {/* ── Trip header (tap to expand) ── */}
                 <TouchableOpacity style={rp.tripHeader} onPress={()=>{
                   const next=isOpen?null:tripId;
                   setExpandedTrip(next);
@@ -1697,6 +1802,7 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
                         {firstT?formatTime(firstT):''} · {grandCnt} ticket{grandCnt!==1?'s':''}
                         {posCnt>0?`  (${posCnt} POS + ${appCnt} App)`:''}
                       </Text>
+                      {posLuggage>0&&<Text style={[rp.tripMeta,{marginTop:2,color:'#6A1B9A'}]}>Luggage: ₹{posLuggage.toFixed(0)}</Text>}
                     </View>
                   </View>
                   <View style={{alignItems:'flex-end',gap:4}}>
@@ -1705,16 +1811,15 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
                   </View>
                 </TouchableOpacity>
 
-                {/* Expanded: stage breakdown */}
                 {isOpen&&(
                   <View style={rp.stageWrap}>
-
-                    {/* Source legend */}
+                    {/* ── Legend chips ── */}
                     <View style={{flexDirection:'row',gap:8,marginBottom:8}}>
                       {appCnt>0&&<View style={rp.legendChip}><Users size={10} color="#00b7f3"/><Text style={[rp.legendText,{color:'#00b7f3'}]}>App: {appCnt} · ₹{appTotal.toFixed(0)}</Text></View>}
-                      {posCnt>0&&<View style={[rp.legendChip,{backgroundColor:'#EDE7F6',borderColor:'#CE93D8'}]}><Printer size={10} color="#7B1FA2"/><Text style={[rp.legendText,{color:'#7B1FA2'}]}>POS: {posCnt} · ₹{posTotal.toFixed(0)}</Text></View>}
+                      {posCnt>0&&<View style={[rp.legendChip,{backgroundColor:'#EDE7F6',borderColor:'#CE93D8'}]}><Printer size={10} color="#7B1FA2"/><Text style={[rp.legendText,{color:'#7B1FA2'}]}>POS: {posCnt} ({posLuggCnt>0?`L:${posLuggCnt}`:'L:0'}) · ₹{posTotal.toFixed(0)}</Text></View>}
                     </View>
 
+                    {/* ── Stage table ── */}
                     {isLoadingApp?(
                       <ActivityIndicator size="small" color="#00b7f3" style={{marginVertical:8}}/>
                     ):(
@@ -1734,16 +1839,126 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
                       </>
                     )}
 
-                    {/* Grand total row */}
                     <View style={rp.stageTotalRow}>
                       <Text style={rp.stageTotalLabel}>Grand Total — {grandCnt} tickets</Text>
                       <Text style={rp.stageTotalAmt}>₹{grandTotal.toFixed(0)}</Text>
                     </View>
 
-                    {/* Print button */}
+                    {/* ── Status Report card (mirrors physical receipt) ── */}
+                    <View style={rp.statusReportCard}>
+                      <View style={rp.statusReportHeader}>
+                        <BarChart3 size={14} color="#1a2332"/>
+                        <Text style={rp.statusReportTitle}>STATUS REPORT</Text>
+                        <View style={rp.wayBillBadge}>
+                          <Text style={rp.wayBillText}>WB: {wayBill}</Text>
+                        </View>
+                      </View>
+
+                      {/* Meta row */}
+                      <View style={rp.statusMetaRow}>
+                        <View style={rp.statusMetaItem}>
+                          <Text style={rp.statusMetaLabel}>BUS</Text>
+                          <Text style={rp.statusMetaVal}>{busNum}</Text>
+                        </View>
+                        <View style={rp.statusMetaItem}>
+                          <Text style={rp.statusMetaLabel}>TRIP No.</Text>
+                          <Text style={[rp.statusMetaVal,{color:'#1565C0'}]}>#{tripNum}</Text>
+                        </View>
+                        <View style={rp.statusMetaItem}>
+                          <Text style={rp.statusMetaLabel}>TIME</Text>
+                          <Text style={rp.statusMetaVal}>{firstT?formatTime(firstT):'—'}</Text>
+                        </View>
+                        <View style={rp.statusMetaItem}>
+                          <Text style={rp.statusMetaLabel}>DIR</Text>
+                          <Text style={[rp.statusMetaVal,{color:'#7B1FA2'}]}>{dir.toUpperCase()||'—'}</Text>
+                        </View>
+                      </View>
+
+                      {/* Stage table — SS ES F H L P AMT */}
+                      {isLoadingApp?(
+                        <ActivityIndicator size="small" color="#1a2332" style={{marginVertical:8}}/>
+                      ):(
+                        <>
+                          <View style={rp.srTableHdr}>
+                            {['SS','ES','F','H','L','P','AMT'].map((h,i)=>(
+                              <Text key={i} style={[rp.srTh, i===6&&{flex:2,textAlign:'right'}]}>{h}</Text>
+                            ))}
+                          </View>
+                          {stages.map((s,i)=>(
+                            <View key={i} style={[rp.srTr,i%2===0&&{backgroundColor:'#F0F4F8'}]}>
+                              <Text style={rp.srTd} numberOfLines={1}>{s.from}</Text>
+                              <Text style={rp.srTd} numberOfLines={1}>{s.to}</Text>
+                              <Text style={rp.srTd}>{s.count}</Text>
+                              <Text style={rp.srTd}>0</Text>
+                              <Text style={rp.srTd}>0</Text>
+                              <Text style={rp.srTd}>0</Text>
+                              <Text style={[rp.srTd,{flex:2,textAlign:'right',color:'#1a2332',fontWeight:'700'}]}>
+                                {s.fare.toFixed(2)}
+                              </Text>
+                            </View>
+                          ))}
+                          {stages.length===0&&(
+                            <Text style={{fontSize:11,color:'#aaa',textAlign:'center',paddingVertical:6,fontStyle:'italic'}}>
+                              No stage data
+                            </Text>
+                          )}
+                        </>
+                      )}
+
+                      {/* FULL / HALF / FREE / LUGG counts */}
+                      <View style={rp.srCountsRow}>
+                        <View style={rp.srCountChip}>
+                          <Text style={rp.srCountLabel}>FULL</Text>
+                          <Text style={[rp.srCountVal,{color:'#1a2332'}]}>{grandFull}</Text>
+                        </View>
+                        {grandHalf>0&&(
+                          <View style={rp.srCountChip}>
+                            <Text style={rp.srCountLabel}>HALF</Text>
+                            <Text style={[rp.srCountVal,{color:'#E65100'}]}>{grandHalf}</Text>
+                          </View>
+                        )}
+                        {grandFree>0&&(
+                          <View style={rp.srCountChip}>
+                            <Text style={rp.srCountLabel}>FREE</Text>
+                            <Text style={[rp.srCountVal,{color:'#4CAF50'}]}>{grandFree}</Text>
+                          </View>
+                        )}
+                        <View style={rp.srCountChip}>
+                          <Text style={rp.srCountLabel}>LUGG</Text>
+                          <Text style={[rp.srCountVal,{color:'#888'}]}>{posLuggCnt}</Text>
+                        </View>
+                      </View>
+
+                      {/* TRIP.COLL / TOT.COLL */}
+                      <View style={rp.srCollRow}>
+                        <View style={{flex:1}}>
+                          <Text style={rp.srCollLabel}>TRIP.COLL Rs.</Text>
+                          <Text style={rp.srCollVal}>₹{grandTotal.toFixed(2)}</Text>
+                        </View>
+                        <View style={rp.srCollDivider}/>
+                        <View style={{flex:1,alignItems:'flex-end'}}>
+                          <Text style={rp.srCollLabel}>TOT.COLL Rs.</Text>
+                          <Text style={[rp.srCollVal,{color:'#00b7f3'}]}>₹{totColl.toFixed(2)}</Text>
+                        </View>
+                      </View>
+
+                      {/* Print Status Report button */}
+                      <TouchableOpacity
+                        style={[rp.srPrintBtn, printingStatus===tripId&&{opacity:.6}]}
+                        onPress={()=>printStatusReport(tripId, idx)}
+                        disabled={printingStatus===tripId}
+                      >
+                        {printingStatus===tripId
+                          ? <ActivityIndicator size="small" color="#fff"/>
+                          : <><Printer size={14} color="#fff"/><Text style={rp.srPrintBtnText}>Print Status Report</Text></>
+                        }
+                      </TouchableOpacity>
+                    </View>
+
+                    {/* ── Daily Report print button ── */}
                     <TouchableOpacity style={rp.printBtn} onPress={()=>printDailyReport(tripId)}>
                       <Printer size={15} color="#fff"/>
-                      <Text style={rp.printBtnText}>Print This Trip Report</Text>
+                      <Text style={rp.printBtnText}>Print Full Trip Report</Text>
                     </TouchableOpacity>
                   </View>
                 )}
@@ -1753,7 +1968,6 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
         </View>
       )}
 
-      {/* ── Collection chart ─────────────────────────────────────────────── */}
       <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginTop:20,marginBottom:12}}>
         <Text style={sh.sectionTitle}>Collection</Text>
         <View style={{flexDirection:'row',gap:4}}>
@@ -1790,6 +2004,7 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
     </ScrollView>
   );
 };
+
 const rp=StyleSheet.create({
   totalPill:{backgroundColor:'#E8F5E9',paddingHorizontal:10,paddingVertical:4,borderRadius:10},
   totalPillText:{fontSize:12,color:'#2E7D32',fontWeight:'700'},
@@ -1818,15 +2033,39 @@ const rp=StyleSheet.create({
   stageTotalAmt:{fontSize:16,fontWeight:'800',color:'#00b7f3'},
   printBtn:{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:6,marginTop:10,backgroundColor:'#1a2332',paddingVertical:11,borderRadius:10},
   printBtnText:{color:'#fff',fontSize:13,fontWeight:'700'},
+  // ── Status Report card styles ──────────────────────────────────────────────
+  statusReportCard:{marginTop:14,backgroundColor:'#fff',borderRadius:12,borderWidth:1.5,borderColor:'#1a2332',overflow:'hidden'},
+  statusReportHeader:{flexDirection:'row',alignItems:'center',gap:8,backgroundColor:'#1a2332',paddingHorizontal:12,paddingVertical:9},
+  statusReportTitle:{fontSize:13,fontWeight:'900',color:'#fff',letterSpacing:1,flex:1},
+  wayBillBadge:{backgroundColor:'#ffffff22',paddingHorizontal:8,paddingVertical:2,borderRadius:8},
+  wayBillText:{fontSize:10,color:'#fff',fontWeight:'700'},
+  statusMetaRow:{flexDirection:'row',paddingHorizontal:10,paddingVertical:8,borderBottomWidth:1,borderBottomColor:'#e8e8e8',gap:4},
+  statusMetaItem:{flex:1,alignItems:'center'},
+  statusMetaLabel:{fontSize:9,color:'#888',fontWeight:'700',letterSpacing:.5},
+  statusMetaVal:{fontSize:12,fontWeight:'800',color:'#1a2332',marginTop:1},
+  srTableHdr:{flexDirection:'row',backgroundColor:'#E8EDF2',paddingVertical:6,paddingHorizontal:8},
+  srTh:{flex:1,fontSize:9,fontWeight:'800',color:'#1a2332',textAlign:'center'},
+  srTr:{flexDirection:'row',paddingVertical:6,paddingHorizontal:8},
+  srTd:{flex:1,fontSize:10,color:'#333',textAlign:'center'},
+  srCountsRow:{flexDirection:'row',paddingHorizontal:10,paddingVertical:8,gap:6,borderTopWidth:1,borderTopColor:'#e8e8e8',flexWrap:'wrap'},
+  srCountChip:{flexDirection:'row',alignItems:'center',gap:4,backgroundColor:'#F0F4F8',paddingHorizontal:10,paddingVertical:5,borderRadius:8},
+  srCountLabel:{fontSize:10,color:'#888',fontWeight:'700'},
+  srCountVal:{fontSize:14,fontWeight:'900',marginLeft:4},
+  srCollRow:{flexDirection:'row',alignItems:'center',paddingHorizontal:12,paddingVertical:10,borderTopWidth:1,borderTopColor:'#e8e8e8',backgroundColor:'#F7FAFC'},
+  srCollDivider:{width:1,backgroundColor:'#e0e0e0',height:32,marginHorizontal:8},
+  srCollLabel:{fontSize:10,color:'#888',fontWeight:'700'},
+  srCollVal:{fontSize:16,fontWeight:'900',color:'#1a2332',marginTop:2},
+  srPrintBtn:{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:6,margin:10,backgroundColor:'#1a2332',paddingVertical:10,borderRadius:9},
+  srPrintBtnText:{color:'#fff',fontSize:13,fontWeight:'700'},
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Trip number helpers
 // ─────────────────────────────────────────────────────────────────────────────
-const IST_OFFSET_MINUTES = 330; // India Standard Time
+const IST_OFFSET_MINUTES = 330;
+
 const getIstDateKey = (d: Date = new Date()): string => {
   const istMs = d.getTime() + IST_OFFSET_MINUTES * 60 * 1000;
-  // Slice UTC date after shifting by +5:30 => IST date key
   return new Date(istMs).toISOString().slice(0, 10);
 };
 
@@ -1840,99 +2079,81 @@ const getIstDayRangeIso = (d: Date = new Date()): {startIso: string; endIso: str
   const y = istNow.getUTCFullYear();
   const m = istNow.getUTCMonth();
   const day = istNow.getUTCDate();
-
   const startUtc = new Date(Date.UTC(y, m, day, 0, 0, 0) - offsetMs);
   const endUtc = new Date(Date.UTC(y, m, day + 1, 0, 0, 0) - offsetMs);
   return {startIso: startUtc.toISOString(), endIso: endUtc.toISOString()};
 };
 
-// Supabase: we compute "current trip number" as the MAX trip_number for today (IST) per bus.
-// If the expected table/columns are missing, we fall back to AsyncStorage so the app still works.
 const loadTripNumber = async (busId: string): Promise<number> => {
-  const fallback = async () => {
+  const fallback = async (): Promise<number> => {
     try {
       const val = await AsyncStorage.getItem(getTripNumberKey(busId));
       return val ? parseInt(val, 10) : 0;
-    } catch {
-      return 0;
-    }
+    } catch { return 0; }
   };
 
   try {
-    const {startIso, endIso} = getIstDayRangeIso();
-    const {data, error} = await supabase
+    const { startIso, endIso } = getIstDayRangeIso();
+    const { data, error } = await supabase
       .from('trips')
       .select('trip_number')
       .eq('bus_id', busId)
+      .not('trip_number', 'is', null)
       .gte('start_time', startIso)
       .lt('start_time', endIso)
-      .order('trip_number', {ascending: false})
+      .order('trip_number', { ascending: false })
       .limit(1);
 
     if (error) throw error;
     const num = Number(data?.[0]?.trip_number ?? 0);
-    return Number.isFinite(num) ? num : 0;
+    return Number.isFinite(num) && num > 0 ? num : await fallback();
   } catch {
     return fallback();
   }
 };
 
 const incrementTripNumber = async (busId: string, tripId?: string | null): Promise<number> => {
-  const {startIso, endIso} = getIstDayRangeIso();
-
-  const fallbackLatest = async () => {
-    const val = await AsyncStorage.getItem(getTripNumberKey(busId));
-    return val ? parseInt(val, 10) : 0;
-  };
+  const { startIso, endIso } = getIstDayRangeIso();
 
   let latest = 0;
   try {
-    const {data, error} = await supabase
+    const { data, error } = await supabase
       .from('trips')
       .select('trip_number')
       .eq('bus_id', busId)
+      .not('trip_number', 'is', null)
       .gte('start_time', startIso)
       .lt('start_time', endIso)
-      .order('trip_number', {ascending: false})
+      .order('trip_number', { ascending: false })
       .limit(1);
+
     if (error) throw error;
-    latest = Number(data?.[0]?.trip_number ?? 0);
-    if (!Number.isFinite(latest)) latest = 0;
+    const v = Number(data?.[0]?.trip_number ?? 0);
+    latest = Number.isFinite(v) ? v : 0;
   } catch {
-    latest = await fallbackLatest().catch(() => 0);
+    try {
+      const val = await AsyncStorage.getItem(getTripNumberKey(busId));
+      latest = val ? parseInt(val, 10) : 0;
+    } catch { latest = 0; }
   }
 
   const nextNum = latest + 1;
 
-  // Persist "incremented" value to Supabase (trip row), and also store in AsyncStorage as backup/offline.
-  try {
-    if (tripId) {
-      // Most schemas use `id` as PK; we attempt a couple of common alternatives.
-      const updateCandidates: Array<{table: string; idColumn: string}> = [
-        {table: 'trips', idColumn: 'id'},
-        {table: 'trips', idColumn: 'trip_id'},
-        {table: 'trip', idColumn: 'id'},
-        {table: 'trip', idColumn: 'trip_id'},
-      ];
-
-      for (const c of updateCandidates) {
-        const {error} = await supabase
-          .from(c.table)
-          .update({trip_number: nextNum})
-          .eq(c.idColumn, tripId);
-        if (!error) break;
-      }
+  if (tripId) {
+    try {
+      const { error } = await supabase
+        .from('trips')
+        .update({ trip_number: nextNum })
+        .eq('id', tripId);
+      if (error) console.warn('[TripNumber] DB update failed:', error.message);
+    } catch (e) {
+      console.warn('[TripNumber] Supabase update threw:', e);
     }
-  } catch (e) {
-    // Don't block UI on counter persistence failures.
-    console.warn('[TripNumber] Supabase update failed:', e);
   }
 
   try {
     await AsyncStorage.setItem(getTripNumberKey(busId), String(nextNum));
-  } catch {
-    // ignore
-  }
+  } catch { /* ignore */ }
 
   return nextNum;
 };
@@ -1942,22 +2163,17 @@ const incrementTripNumber = async (busId: string, tripId?: string | null): Promi
 // ─────────────────────────────────────────────────────────────────────────────
 const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
   const [activeTab,setActiveTab]=useState('ticket');
-
   const [dashboard,setDashboard]=useState<any>(null);
   const [dashLoading,setDashLoading]=useState(true);
   const [verifyingTicket,setVerifyingTicket]=useState<string|null>(null);
   const [accessToken,setAccessToken]=useState<string|null>(null);
   const [localTripNumber,setLocalTripNumber]=useState<number>(0);
   const posHook=usePOSTickets();
-  // ADD THIS — run once then delete
-  //useEffect(() => { posHook.clearAll(); }, []);
-
 
   useEffect(()=>{AsyncStorage.getItem('access_token').then(t=>setAccessToken(t)).catch(()=>{});},[]);
   const {pendingRequests,clearTicket}=useVerificationRealtime(dashboard?.active_trip?.trip_id,dashboard?.active_trip?.status);
   useEffect(()=>{fetchDashboard();},[]);
 
-  // IST midnight reset: when the date changes, reload today's trip counter for this bus.
   useEffect(() => {
     const counterBusId = dashboard?.active_trip?.bus_id ?? dashboard?.bus?.id;
     if (!counterBusId) return;
@@ -1992,10 +2208,34 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
     }catch(e){console.error(e);}finally{setDashLoading(false);}
   };
 
-  const handleTripStarted = async () => {
+  const handleTripStarted = async (started?: {direction:string;route_name?:string;start_time:string}) => {
     try {
-      const r = await api.get('/conductor/dashboard');
-      const dash = r.data;
+      if (started) {
+        setDashboard((prev:any)=>{
+          if (!prev || prev?.active_trip?.trip_id) return prev;
+          return {
+            ...prev,
+            active_trip: {
+              ...(prev.active_trip || {}),
+              trip_id: null,
+              route_name: started.route_name || prev?.active_trip?.route_name || '',
+              direction: started.direction,
+              start_time: started.start_time,
+              status: 'running',
+              bus_number: prev?.bus?.vehicle_number ?? prev?.active_trip?.bus_number,
+            },
+          };
+        });
+      }
+
+      let dash:any = null;
+      for (let i = 0; i < 6; i++) {
+        const r = await api.get('/conductor/dashboard');
+        dash = r.data;
+        if (dash?.active_trip?.trip_id) break;
+        await new Promise<void>((resolve) => setTimeout(() => resolve(), 700));
+      }
+      if (!dash) return;
       const busId = dash?.active_trip?.bus_id ?? dash?.bus?.id;
       const tripId = dash?.active_trip?.trip_id ?? dash?.active_trip?.id ?? null;
 
@@ -2010,7 +2250,6 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
         }
       }
 
-      // Ensure UI reads the updated number even if backend/dashboard lags.
       setDashboard(
         nextNum != null && dash?.active_trip
           ? {...dash, active_trip: {...dash.active_trip, trip_number: nextNum}}
@@ -2038,7 +2277,6 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
 
   return (
     <SafeAreaView style={{flex:1,backgroundColor:'#F0F4F8'}}>
-      {/* Top bar */}
       <View style={sh.topBar}>
         <View>
           <View style={sh.conductorBadge}><BadgeCheck size={11} color="#fff"/><Text style={sh.conductorBadgeText}>CONDUCTOR</Text></View>
@@ -2070,7 +2308,6 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
         </View>
       </View>
 
-      {/* Tab content */}
       <View style={{flex:1}}>
         {activeTab==='ticket'&&<TicketTab activeTrip={at} user={user} busNumber={busNum} onTicketIssued={posHook.saveTicket} tripNumber={displayTripNumber}/>}
         {activeTab==='trip'  &&<TripTab dashboard={dashboard} onRefresh={handleTripStarted} pendingRequests={pendingRequests} verifyingTicket={verifyingTicket} onVerifyTicket={handleVerify} tripNumber={displayTripNumber} posHook={posHook}/>}
@@ -2078,7 +2315,6 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
         {activeTab==='report'&&<ReportTab dashboard={dashboard} user={user} posHook={posHook}/>}
       </View>
 
-      {/* Tab bar */}
       <View style={sh.tabBar}>
         {TABS.map(tab=>{
           const isActive=activeTab===tab.key;
@@ -2204,6 +2440,32 @@ const tk=StyleSheet.create({
   busPillText:{fontSize:12,color:'#1565C0',fontWeight:'600'},
   dirErr:{flexDirection:'row',alignItems:'flex-start',gap:8,backgroundColor:'#FFEBEE',borderRadius:10,padding:10,marginBottom:12,borderWidth:1,borderColor:'#FFCDD2'},
   dirErrText:{fontSize:13,color:'#C62828',flex:1,lineHeight:18},
+  ticketCard:{marginHorizontal:16,marginBottom:16,backgroundColor:'#fff',borderRadius:12,padding:14,borderWidth:1,borderColor:'#e7e7e7'},
+  startTripPrompt:{alignItems:'center',justifyContent:'center',paddingVertical:18,paddingHorizontal:8},
+  startTripPromptTitle:{fontSize:18,fontWeight:'700',color:'#1a2332',marginTop:8},
+  startTripPromptText:{fontSize:13,color:'#6B7280',textAlign:'center',marginTop:6,lineHeight:18},
+  tripSelectorBar:{flexDirection:'row',alignItems:'center',backgroundColor:'#F1F1F3',borderRadius:18,paddingVertical:10,paddingHorizontal:10,marginBottom:12},
+  tripSide:{flex:1,flexDirection:'row',alignItems:'center',gap:6,minWidth:0},
+  tripSideCol:{flex:1,minWidth:0},
+  tripSideHint:{fontSize:11,color:'#6B7280',fontWeight:'600'},
+  tripSideText:{fontSize:15,fontWeight:'700',color:'#374151'},
+  swapBtn:{width:36,height:36,borderRadius:18,backgroundColor:'#fff',borderWidth:1,borderColor:'#d8d8dc',justifyContent:'center',alignItems:'center',marginHorizontal:10},
+  fieldLabel:{fontSize:14,fontWeight:'600',color:'#333',marginBottom:6,marginTop:6},
+  fieldInput:{backgroundColor:'#f8f8f8',borderRadius:6,borderWidth:1,borderColor:'#ddd',paddingHorizontal:10,paddingVertical:10,marginBottom:8,color:'#1a1a1a'},
+  fieldInputText:{fontSize:15,color:'#444'},
+  countHeaderRow:{flexDirection:'row',gap:10,marginTop:6},
+  countHead:{flex:1,fontSize:20,fontWeight:'700',color:'#333'},
+  countInputRow:{flexDirection:'row',gap:10,marginTop:6},
+  countCell:{flex:1,flexDirection:'row',alignItems:'center',gap:6},
+  countInput:{flex:1,backgroundColor:'#f8f8f8',borderRadius:6,borderWidth:1,borderColor:'#ddd',paddingHorizontal:10,paddingVertical:8,fontSize:18,color:'#1a1a1a',textAlign:'center'},
+  stepBtn:{width:32,height:32,borderRadius:16,backgroundColor:'#00b7f3',justifyContent:'center',alignItems:'center'},
+  stepBtnDisabled:{backgroundColor:'#e7edf3'},
+  payWrap:{alignItems:'center',marginTop:14,marginBottom:8},
+  payLabel:{fontSize:34,color:'#8a8a8a',fontWeight:'700'},
+  payValue:{fontSize:52,color:'#1f2a7a',fontWeight:'800',marginTop:-8},
+  payMeta:{fontSize:16,color:'#777',fontWeight:'700'},
+  ticketPrintBtn:{marginTop:10,backgroundColor:'#f39c12',borderRadius:8,paddingVertical:13,alignItems:'center'},
+  ticketPrintText:{fontSize:20,fontWeight:'800',color:'#fff'},
   section:{marginBottom:24,paddingHorizontal:20},
   sectionTitle:{fontSize:20,fontWeight:'700',color:'#1a1a1a',marginBottom:4},
   sectionSub:{fontSize:14,color:'#666',lineHeight:20,marginBottom:16},
@@ -2213,12 +2475,12 @@ const tk=StyleSheet.create({
   selLabel:{fontSize:12,color:'#666',marginBottom:4,fontWeight:'500'},
   selValue:{fontSize:18,color:'#1a1a1a',fontWeight:'600'},
   selPlaceholder:{color:'#999',fontWeight:'400'},
-  placesGrid:{flexDirection:'row',flexWrap:'wrap',gap:8,marginBottom:16,paddingHorizontal:4},
-  chip:{backgroundColor:'#fff',paddingVertical:10,paddingHorizontal:16,borderRadius:20,borderWidth:1,borderColor:'#e0e0e0'},
-  chipSel:{backgroundColor:'#00b7f3',borderColor:'#00b7f3'},
-  chipDis:{backgroundColor:'#f5f5f5',borderColor:'#f0f0f0',opacity:.5},
-  chipText:{fontSize:14,color:'#333',fontWeight:'500'},
-  chipTextSel:{color:'#fff'},
+  placesGrid:{marginBottom:14,backgroundColor:'#fff',borderRadius:10,borderWidth:1,borderColor:'#e2e8f0',overflow:'hidden'},
+  chip:{paddingVertical:11,paddingHorizontal:12,borderBottomWidth:1,borderBottomColor:'#eef2f7',backgroundColor:'#fff'},
+  chipSel:{backgroundColor:'#E8F7FF'},
+  chipDis:{backgroundColor:'#f8fafc',opacity:.55},
+  chipText:{fontSize:14,color:'#334155',fontWeight:'600'},
+  chipTextSel:{color:'#0284c7'},
   chipTextDis:{color:'#999'},
   revBtn:{position:'absolute',right:16,top:36,backgroundColor:'#fff',borderRadius:24,width:48,height:48,justifyContent:'center',alignItems:'center',elevation:6,zIndex:10,borderWidth:2,borderColor:'#f0f0f0'},
   revBtnDis:{backgroundColor:'#f8f8f8',borderColor:'#eaeaea'},
@@ -2245,6 +2507,9 @@ const tk=StyleSheet.create({
   ticketTypeWrap:{backgroundColor:'#fff',borderRadius:14,padding:16,borderWidth:1,borderColor:'#eee',marginTop:4},
   ticketTypeRow:{flexDirection:'row',alignItems:'center',justifyContent:'space-between'},
   ticketTypeLabelWrap:{flexDirection:'row',alignItems:'center',gap:10,flex:1},
+  langWrap:{marginTop:12,paddingTop:12,borderTopWidth:1,borderTopColor:'#f0f0f0'},
+  langTitle:{fontSize:13,color:'#666',fontWeight:'600',marginBottom:8},
+  luggageInput:{backgroundColor:'#F7FAFC',borderWidth:1,borderColor:'#dfe7ef',borderRadius:10,paddingVertical:9,paddingHorizontal:12,fontSize:14,color:'#1a2332'},
   typeBadge:{paddingHorizontal:8,paddingVertical:3,borderRadius:8,marginRight:2},
   typeBadgeText:{fontSize:10,fontWeight:'900',letterSpacing:0.5},
   typeLabel:{fontSize:14,fontWeight:'600',color:'#1a1a1a'},
