@@ -7,7 +7,7 @@ import {
 import {SafeAreaView}            from 'react-native-safe-area-context';
 import AsyncStorage              from '@react-native-async-storage/async-storage';
 import {
-  Receipt, ArrowUpDown, Printer, Minus, Plus,
+  Receipt, ArrowUpDown, Printer as PrinterIcon, Minus, Plus,
   Bus, Play, Pause, Square, BarChart3, PlusCircle,
   Users, User, CheckCircle, BadgeCheck, RefreshCw,
   X, ChevronRight, Bell, LogOut, Navigation, Clock,
@@ -62,6 +62,95 @@ const routeNameForDirection = (routeName?: string, direction?: string) => {
 const fareStr     = (n: number) => n%1===0 ? `${n}.00` : n.toFixed(2);
 const genId       = () => `pos_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage code helpers — always return numeric code (e.g. "003") from any stop format
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Extract numeric stage code from a POS stop label like "003-CBE-Coimbatore"
+ * Returns zero-padded 3-digit code.
+ */
+const stageCode = (label: string): string => {
+  if (!label || label === '?') return '???';
+  const parts = label.split('-');
+  if (parts.length >= 2 && /^\d+$/.test(parts[0].trim())) {
+    return parts[0].trim().padStart(3, '0');
+  }
+  return label.slice(0, 3).padStart(3, '0');
+};
+
+/**
+ * Extract numeric stage code from an app stop name.
+ * Handles formats like "003-CBE-Coimbatore", "Coimbatore", plain names.
+ * Falls back to first 3 chars if no numeric prefix found.
+ */
+const stageCodeFromName = (name: string): string => {
+  if (!name || name === 'Unknown' || name === '?') return '???';
+  const parts = name.split('-');
+  if (parts.length >= 2 && /^\d+$/.test(parts[0].trim())) {
+    return parts[0].trim().padStart(3, '0');
+  }
+  // Try to find a numeric token anywhere (e.g. stop_name stored as "CBE-003-Coimbatore")
+  for (const part of parts) {
+    if (/^\d+$/.test(part.trim())) {
+      return part.trim().padStart(3, '0');
+    }
+  }
+  return name.slice(0, 3).padStart(3, '0');
+};
+
+/**
+ * Build a combined, numerically-sorted array of stage rows merging app breakdown
+ * and POS tickets. App tickets are merged into the F (full) column — NOT shown separately.
+ */
+const buildCombinedStageRows = (
+  appBreakdown: any[],
+  posTix: any[]
+): Array<{ss:string; es:string; f:number; h:number; l:number; p:number; amt:number}> => {
+  const map: Record<string, {ss:string; es:string; f:number; h:number; l:number; p:number; amt:number}> = {};
+
+  // ── App tickets — merged into F/H columns ──
+  for (const rb of appBreakdown) {
+    const ssCode = stageCodeFromName(rb.from);
+    const esCode = stageCodeFromName(rb.to);
+    // Skip rows where we genuinely cannot determine stage codes
+    if (ssCode === '???' && esCode === '???') continue;
+    const k = `${ssCode}|||${esCode}`;
+    if (!map[k]) map[k] = { ss: ssCode, es: esCode, f: 0, h: 0, l: 0, p: 0, amt: 0 };
+    const fullCnt = Number(rb.full_count ?? 0);
+    const halfCnt = Number(rb.half_count ?? 0);
+    const freeCnt = Number(rb.free_count ?? 0);
+    // Free passengers count as full for display purposes
+    map[k].f   += fullCnt + freeCnt;
+    map[k].h   += halfCnt;
+    map[k].amt += Number(rb.total_fare ?? rb.revenue ?? 0);
+  }
+
+  // ── POS tickets ──
+  for (const t of posTix) {
+    const ssCode = stageCode(t.from_stop);
+    const esCode = stageCode(t.to_stop);
+    if (ssCode === '???' && esCode === '???') continue;
+    const k = `${ssCode}|||${esCode}`;
+    if (!map[k]) map[k] = { ss: ssCode, es: esCode, f: 0, h: 0, l: 0, p: 0, amt: 0 };
+    const cnt = Number(t.ticket_count ?? 0);
+    const hasLuggage = Number(t.luggage_amount ?? 0) > 0;
+    const luggCnt = hasLuggage ? 1 : 0;
+    const passCnt = Math.max(0, cnt - luggCnt);
+    if ((t as any).ticket_type === 'half') {
+      map[k].h += passCnt;
+    } else {
+      map[k].f += passCnt;
+    }
+    map[k].l   += luggCnt;
+    map[k].amt += Number(t.fare ?? 0);
+  }
+
+  return Object.values(map).sort((a, b) =>
+    a.ss.localeCompare(b.ss, undefined, { numeric: true })
+  );
+};
+
 const getNextTicketNumber = async (busId: string | null): Promise<number | null> => {
   if (!busId) return null;
   try {
@@ -77,12 +166,85 @@ const getNextTicketNumber = async (busId: string | null): Promise<number | null>
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Printer
+// Printer (no-op on iOS / dev; store to AsyncStorage instead)
 // ─────────────────────────────────────────────────────────────────────────────
 let NyxPrinter: any = null, PrinterStatus: any = null, PrintAlign: any = null;
 if (Platform.OS === 'android') {
   try { const n=require('nyx-printer-react-native'); NyxPrinter=n.default; PrinterStatus=n.PrinterStatus; PrintAlign=n.PrintAlign; } catch(_){}
 }
+
+const MOCK_PRINT_KEY = 'mock_print_log';
+const mockPrint = async (lines: {text:string;textSize?:number;align?:string}[]) => {
+  try {
+    const existing = await AsyncStorage.getItem(MOCK_PRINT_KEY);
+    const log: any[] = existing ? JSON.parse(existing) : [];
+    log.push({ ts: new Date().toISOString(), lines });
+    await AsyncStorage.setItem(MOCK_PRINT_KEY, JSON.stringify(log.slice(-50)));
+  } catch(e) { console.warn('mockPrint error', e); }
+};
+
+class Printer {
+  private lines: {text:string;textSize?:number;align?:string}[] = [];
+  private useReal: boolean;
+
+  constructor() {
+    this.useReal = Platform.OS === 'android' && !!NyxPrinter;
+  }
+
+  async checkReady(): Promise<boolean> {
+    if (!this.useReal) return true;
+    const ret = await NyxPrinter.getPrinterStatus();
+    if (ret !== PrinterStatus.SDK_OK) {
+      Alert.alert('Printer Error', PrinterStatus.msg(ret));
+      return false;
+    }
+    return true;
+  }
+
+  async text(text: string, opts?: {textSize?:number; align?:string}) {
+    this.lines.push({text, ...opts});
+    if (this.useReal) {
+      const alignVal = opts?.align === 'CENTER' ? PrintAlign.CENTER : undefined;
+      await NyxPrinter.printText(text, {textSize: opts?.textSize, align: alignVal});
+    }
+  }
+
+  async finish() {
+    if (this.useReal) {
+      await NyxPrinter.printEndAutoOut();
+    } else {
+      await mockPrint(this.lines);
+      showToast('Saved to print log (no printer connected)');
+    }
+    this.lines = [];
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Print alignment helpers — receipt paper ~32 chars wide at normal font size
+// ─────────────────────────────────────────────────────────────────────────────
+const PRINT_WIDTH = 32;
+
+const printLR = (label: string, value: string, width = PRINT_WIDTH): string => {
+  const lbl = String(label ?? '');
+  const val = String(value ?? '');
+  const space = Math.max(1, width - lbl.length - val.length);
+  return lbl + ' '.repeat(space) + val;
+};
+
+// Fixed column widths: SS(5) ES(5) F(3) H(3) L(3) P(3) AMT(rest)
+const printStageRow = (ss: string, es: string, f: string, h: string, l: string, p: string, amt: string): string => {
+  const ssP  = String(ss  ?? '').slice(0, 5).padEnd(5);
+  const esP  = String(es  ?? '').slice(0, 5).padEnd(5);
+  const fP   = String(f   ?? '').slice(0, 3).padEnd(3);
+  const hP   = String(h   ?? '').slice(0, 3).padEnd(3);
+  const lP   = String(l   ?? '').slice(0, 3).padEnd(3);
+  const pP   = String(p   ?? '').slice(0, 3).padEnd(3);
+  const amtP = String(amt ?? '').slice(0, 7).padStart(7);
+  return `${ssP} ${esP} ${fP} ${hP} ${lP} ${pP} ${amtP}`;
+};
+
+const DIVIDER = '--------------------------------';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tabs
@@ -184,599 +346,6 @@ const StartTripModal = ({visible,onClose,onStarted}:{visible:boolean;onClose:()=
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Trip Report Modal
-// ─────────────────────────────────────────────────────────────────────────────
-const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripId:any;onClose:()=>void;posHook?:ReturnType<typeof usePOSTickets>}) => {
-  const [report,setReport]=useState<any>(null);
-  const [appTrip,setAppTrip]=useState<any>(null);
-  const [loading,setLoading]=useState(false);
-  const [printing,setPrinting]=useState(false);
-
-  useEffect(()=>{
-    if(visible&&tripId){
-      setReport(null);
-      setAppTrip(null);
-      (async()=>{
-        setLoading(true);
-        try{const r=await api.get(`/conductor/trip/${tripId}/report`);setReport(r.data);}
-        catch{Alert.alert('Error','Could not load report');}
-        try{
-          const {data:rows, error} = await supabase
-            .from('tickets')
-            .select('ticket_type,payment_method,ticket_count,total_fare,fare,from_stop_id,to_stop_id,luggage_amount')
-            .eq('trip_id', tripId)
-            .neq('payment_method', 'pos');
-
-          if(error) throw error;
-          const appRows:any[] = rows || [];
-
-          const stopIds = [...new Set(appRows.flatMap(r => [r.from_stop_id, r.to_stop_id]).filter(Boolean))];
-          const stopMap: Record<string,string> = {};
-
-          if(stopIds.length){
-            const {data:stops, error:stopErr} = await supabase
-              .from('stops')
-              .select('id, stop_name')
-              .in('id', stopIds);
-
-            if(!stopErr){
-              (stops || []).forEach((s:any)=>{ stopMap[String(s.id)] = s.stop_name; });
-            }
-          }
-
-          const map: Record<string,{
-            from:string; to:string;
-            full_count:number; half_count:number; free_count:number;
-            total_fare:number;
-          }> = {};
-
-          let full = 0, half = 0, free = 0, tickets = 0, collection = 0, luggage = 0, luggageCount = 0;
-
-          for(const r of appRows){
-            const cnt = Number(r.ticket_count ?? 1);
-            const pm  = String(r.payment_method ?? '').toLowerCase();
-            const tt  = (r.ticket_type ?? 'full') as string;
-            const hasLuggage = Number(r.luggage_amount ?? 0) > 0;
-            const passengerCnt = Math.max(0, cnt - (hasLuggage ? 1 : 0));
-            luggage += Number(r.luggage_amount ?? 0);
-            if (hasLuggage) luggageCount += 1;
-
-            const unit = Number(r.fare ?? 0);
-            const total = r.total_fare != null ? Number(r.total_fare) : unit * cnt;
-
-            const fromName = stopMap[String(r.from_stop_id)] ?? 'Unknown';
-            const toName   = stopMap[String(r.to_stop_id)]   ?? 'Unknown';
-            const k = `${fromName}|||${toName}`;
-            if(!map[k]) map[k] = {from:fromName,to:toName,full_count:0,half_count:0,free_count:0,total_fare:0};
-
-            const isFree = pm === 'fr';
-            if(isFree){
-              map[k].free_count += passengerCnt; free += passengerCnt;
-            } else if(tt === 'half'){
-              map[k].half_count += passengerCnt; half += passengerCnt;
-            } else {
-              map[k].full_count += passengerCnt; full += passengerCnt;
-            }
-
-            map[k].total_fare += total;
-            tickets += cnt;
-            collection += total;
-          }
-
-          const breakdown = Object.values(map).sort((a,b)=>b.total_fare - a.total_fare);
-          setAppTrip({tickets, collection, full, half, free, breakdown, luggage, luggageCount});
-        }catch(e){
-          setAppTrip({tickets:0, collection:0, full:0, half:0, free:0, breakdown:[], luggage:0, luggageCount:0});
-        }
-        finally{setLoading(false);}
-      })();
-    }
-  },[visible,tripId]);
-
-  const tripPOSTix = (posHook?.tickets||[]).filter((t:any)=>t.trip_id===tripId);
-  const posCnt     = tripPOSTix.reduce((s:number,t:any)=>s+t.ticket_count,0);
-  const posAmt     = tripPOSTix.reduce((s:number,t:any)=>s+t.fare,0);
-
-  const posFullCnt = tripPOSTix
-    .filter((t:any)=>(t.ticket_type??'full')==='full')
-    .reduce((s:number,t:any)=>s+Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)),0);
-  const posHalfCnt = tripPOSTix
-    .filter((t:any)=>t.ticket_type==='half')
-    .reduce((s:number,t:any)=>s+Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)),0);
-  const posLuggageCnt = tripPOSTix.reduce((s:number,t:any)=>s+(Number(t.luggage_amount ?? 0)>0?1:0),0);
-
-  const appSummary = appTrip || {};
-  const appCollection  = Number(appSummary.collection ?? 0);
-  const appLuggage     = Number(appSummary.luggage ?? 0);
-  const appLuggageCnt  = Number(appSummary.luggageCount ?? 0);
-  const appFullCnt     = Number(appSummary.full ?? 0);
-  const appHalfCnt     = Number(appSummary.half ?? 0);
-  const appFreeCnt     = Number(appSummary.free ?? 0);
-  const appPassengers  = Number(appSummary.tickets ?? 0);
-
-  const grandCollection = appCollection + posAmt;
-  const grandFull       = appFullCnt  + posFullCnt;
-  const grandHalf       = appHalfCnt  + posHalfCnt;
-  const grandFree       = appFreeCnt;
-  const grandLuggageCnt = appLuggageCnt + posLuggageCnt;
-  const grandPassengers = grandFull + grandHalf + grandFree + grandLuggageCnt;
-
-  const cleanBreakdown = (appSummary.breakdown||[]).filter((rb:any)=>{
-    const f=englishStop(rb.from), t=englishStop(rb.to);
-    return (f && f!=='?' && f.trim()!=='') || (t && t!=='?' && t.trim()!=='');
-  });
-
-  const posMap:Record<string,{from:string;to:string;fullCount:number;halfCount:number;count:number;fare:number}> = {};
-  for(const t of tripPOSTix){
-    const f=posStopLabel(t.from_stop), to=posStopLabel(t.to_stop);
-    const k=`${f}|||${to}`;
-    if(!posMap[k]) posMap[k]={from:f,to:to,fullCount:0,halfCount:0,count:0,fare:0};
-    if((t as any).ticket_type==='half'){
-      posMap[k].halfCount+=t.ticket_count;
-    } else {
-      posMap[k].fullCount+=t.ticket_count;
-    }
-    posMap[k].count+=t.ticket_count;
-    posMap[k].fare +=t.fare;
-  }
-  const posBreakdownRows=Object.values(posMap);
-  const posLuggage = tripPOSTix.reduce((s:number,t:any)=>s+Number(t.luggage_amount ?? 0),0);
-  const totalLuggage = appLuggage + posLuggage;
-
-  const handlePrint=async()=>{
-    if(Platform.OS!=='android'||!NyxPrinter){Alert.alert('Notice','Printer only on Android.');return;}
-    setPrinting(true);
-    try{
-      const ret=await NyxPrinter.getPrinterStatus();
-      if(ret!==PrinterStatus.SDK_OK){Alert.alert('Printer Error',PrinterStatus.msg(ret));return;}
-      const fmt=(n:number)=>n%1===0?`${n}`:n.toFixed(2);
-      const busNum=report?.bus_number??tripPOSTix[0]?.bus_number??'N/A';
-      const dir=(report?.direction??tripPOSTix[0]?.direction??'').toUpperCase();
-      const today=new Date().toLocaleDateString('en-GB').replace(/\//g,'-');
-
-      await NyxPrinter.printText('SPS - ZYRAP',{textSize:28,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('TRIP REPORT',{textSize:24,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`${report?.route_name||''}`,{textSize:22,align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`Date : ${today}  Bus : ${busNum}`,{textSize:18});
-      await NyxPrinter.printText(`Dir  : ${dir}  Status : ${(report?.status||'').toUpperCase()}`,{textSize:18});
-      await NyxPrinter.printText(`Time : ${formatTime(report?.start_time)}${report?.end_time?` - ${formatTime(report.end_time)}`:'- ongoing'}`,{textSize:18});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`App Full : ${appFullCnt}   Half : ${appHalfCnt}   Free : ${appFreeCnt}   Lugg : ${appLuggageCnt}`,{textSize:18});
-      if(posCnt>0){
-        await NyxPrinter.printText(`POS Full : ${posFullCnt}   Half : ${posHalfCnt}   Lugg : ${posLuggageCnt}   Rs.${fmt(posAmt)}`,{textSize:18});
-      }
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`Total Tickets : ${grandPassengers}`,{textSize:20});
-      await NyxPrinter.printText(`Rs. ${fmt(grandCollection)}`,{textSize:36,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      if(cleanBreakdown.length>0){
-        await NyxPrinter.printText('App Stage-wise:',{textSize:18});
-        for(const rb of cleanBreakdown){
-          await NyxPrinter.printText(
-            `${englishStop(rb.from)} -> ${englishStop(rb.to)}\n  F:${rb.full_count||0} H:${rb.half_count||0} FR:${rb.free_count||0}  Rs.${fmt(Number(rb.total_fare??rb.revenue??0))}`,
-            {textSize:17}
-          );
-          await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});
-        }
-      }
-      if(posBreakdownRows.length>0){
-        await NyxPrinter.printText('POS Stage-wise:',{textSize:18});
-        for(const rb of posBreakdownRows){
-          await NyxPrinter.printText(
-            `${rb.from} -> ${rb.to}\n  Tickets:${rb.count}  Rs.${fmt(rb.fare)}`,
-            {textSize:17}
-          );
-          await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});
-        }
-      }
-      await NyxPrinter.printText('** Safe Journey **',{align:PrintAlign.CENTER});
-      await NyxPrinter.printEndAutoOut();
-      showToast('Trip report printed!');
-    }catch(e:any){Alert.alert('Print Error',e.message||'Unknown');}
-    finally{setPrinting(false);}
-  };
-
-  return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
-      <View style={sh.modalOverlay}>
-        <View style={[sh.bottomSheet,{maxHeight:'95%'}]}>
-          <View style={sh.sheetHandle}/>
-          <View style={sh.modalHeader}>
-            <Text style={sh.modalTitle}>Trip Report</Text>
-            <View style={{flexDirection:'row',alignItems:'center',gap:10}}>
-              {report&&(
-                <TouchableOpacity
-                  style={[tr.printBtn,printing&&{opacity:.6}]}
-                  onPress={handlePrint}
-                  disabled={printing}
-                >
-                  {printing
-                    ? <ActivityIndicator size="small" color="#fff"/>
-                    : <><Printer size={14} color="#fff"/><Text style={tr.printBtnText}>Print</Text></>
-                  }
-                </TouchableOpacity>
-              )}
-              <TouchableOpacity onPress={onClose}><X size={24} color="#444"/></TouchableOpacity>
-            </View>
-          </View>
-
-          {loading
-            ? <ActivityIndicator size="large" color="#00b7f3" style={{marginVertical:40}}/>
-            : report
-            ? (
-              <ScrollView showsVerticalScrollIndicator={false}>
-                <Text style={sh.reportRoute}>{report.route_name}</Text>
-                <View style={{flexDirection:'row',alignItems:'center',gap:8,marginBottom:12,flexWrap:'wrap'}}>
-                  <StatusBadge status={report.status}/>
-                  <Text style={{fontSize:12,color:'#888'}}>
-                    {formatTime(report.start_time)}
-                    {report.end_time?` – ${formatTime(report.end_time)}`:'– ongoing'}
-                    {' · '}{formatDuration(report.start_time,report.end_time)}
-                  </Text>
-                  {(report.bus_number||tripPOSTix[0]?.bus_number)&&
-                    <Text style={{fontSize:12,color:'#888'}}>🚌 {report.bus_number??tripPOSTix[0]?.bus_number}</Text>}
-                </View>
-
-                <View style={sh.summaryRow}>
-                  {[
-                    {label:'Full',    val:grandFull,                        color:'#1a2332'},
-                    {label:'Half',    val:grandHalf,                        color:'#FF9800'},
-                    {label:'Free',    val:grandFree,                        color:'#4CAF50'},
-                    {label:'Lugg',    val:grandLuggageCnt,                  color:'#6A1B9A'},
-                    {label:'POS',     val:`${posCnt} · ₹${posAmt.toFixed(0)}`, color:'#7B1FA2'},
-                    {label:'Total',   val:`₹${grandCollection.toFixed(0)}`, color:'#00b7f3'},
-                  ].map(i=>(
-                    <View key={i.label} style={sh.summaryCard}>
-                      <Text style={[sh.summaryNum,{color:i.color}]}>{i.val}</Text>
-                      <Text style={sh.summaryLabel}>{i.label}</Text>
-                    </View>
-                  ))}
-                </View>
-
-                {posCnt>0&&(
-                  <View style={{flexDirection:'row',gap:8,marginBottom:12,flexWrap:'wrap'}}>
-                    <View style={tr.legendChip}>
-                      <Users size={10} color="#00b7f3"/>
-                      <Text style={[tr.legendText,{color:'#00b7f3'}]}>
-                        App: {appPassengers} ({appFullCnt}F{appHalfCnt>0?` · ${appHalfCnt}H`:''}{appLuggageCnt>0?` · ${appLuggageCnt}L`:''}){appFreeCnt>0?` · ${appFreeCnt}FR`:''} · ₹{appCollection.toFixed(0)}
-                      </Text>
-                    </View>
-                    <View style={[tr.legendChip,{backgroundColor:'#EDE7F6',borderColor:'#CE93D8'}]}>
-                      <Printer size={10} color="#7B1FA2"/>
-                      <Text style={[tr.legendText,{color:'#7B1FA2'}]}>
-                        POS: {posCnt} ({posFullCnt}F{posHalfCnt>0?` · ${posHalfCnt}H`:''}{posLuggageCnt>0?` · ${posLuggageCnt}L`:''}) · ₹{posAmt.toFixed(0)}
-                      </Text>
-                    </View>
-                  </View>
-                )}
-                {totalLuggage>0&&(
-                  <View style={{flexDirection:'row',gap:8,marginBottom:12,flexWrap:'wrap'}}>
-                    <View style={tr.legendChip}>
-                      <Text style={[tr.legendText,{color:'#6A1B9A'}]}>Luggage: ₹{totalLuggage.toFixed(0)}</Text>
-                    </View>
-                  </View>
-                )}
-
-                {cleanBreakdown.length>0&&(
-                  <View style={{marginTop:4}}>
-                    <View style={tr.secHeader}>
-                      <Users size={12} color="#00b7f3"/>
-                      <Text style={[tr.secLabel,{color:'#00b7f3'}]}>APP STAGES</Text>
-                    </View>
-                    <View style={sh.tableHeader}>
-                      {['SS','ES','F','H','FR','AMT'].map((h,i)=>(
-                        <Text key={i} style={[sh.th,h==='AMT'&&{flex:1.8,textAlign:'right'}]}>{h}</Text>
-                      ))}
-                    </View>
-                    {cleanBreakdown.map((rb:any,i:number)=>(
-                      <View key={i} style={[sh.tableRow,i%2===0&&{backgroundColor:'#F7FAFC'}]}>
-                        <Text style={sh.td} numberOfLines={1}>{englishStop(rb.from)}</Text>
-                        <Text style={sh.td} numberOfLines={1}>{englishStop(rb.to)}</Text>
-                        <Text style={sh.td}>{rb.full_count>0?rb.full_count:'-'}</Text>
-                        <Text style={sh.td}>{rb.half_count>0?rb.half_count:'-'}</Text>
-                        <Text style={sh.td}>{rb.free_count>0?rb.free_count:'-'}</Text>
-                        <Text style={[sh.td,{flex:1.8,textAlign:'right',color:'#00b7f3',fontWeight:'700'}]}>
-                          ₹{Number(rb.total_fare??rb.revenue??0).toFixed(0)}
-                        </Text>
-                      </View>
-                    ))}
-                  </View>
-                )}
-
-                {posBreakdownRows.length>0&&(
-                  <View style={{marginTop:12}}>
-                    <View style={tr.secHeader}>
-                      <Printer size={12} color="#7B1FA2"/>
-                      <Text style={tr.secLabel}>POS STAGES</Text>
-                    </View>
-                    <View style={[sh.tableHeader,{backgroundColor:'#7B1FA2'}]}>
-                      {['From','To','F','H','Amt'].map((h,i)=>(
-                        <Text key={i} style={[sh.th,i===4&&{flex:1.8,textAlign:'right'}]}>{h}</Text>
-                      ))}
-                    </View>
-                    {posBreakdownRows.map((rb,i)=>(
-                      <View key={i} style={[sh.tableRow,{backgroundColor:i%2===0?'#F3E5F5':'#EDE7F6'}]}>
-                        <Text style={[sh.td,{color:'#4A148C'}]} numberOfLines={1}>{rb.from}</Text>
-                        <Text style={[sh.td,{color:'#4A148C'}]} numberOfLines={1}>{rb.to}</Text>
-                        <Text style={[sh.td,{color:'#1565C0',fontWeight:'700'}]}>{rb.fullCount>0?rb.fullCount:'-'}</Text>
-                        <Text style={[sh.td,{color:'#E65100',fontWeight:'700'}]}>{rb.halfCount>0?rb.halfCount:'-'}</Text>
-                        <Text style={[sh.td,{flex:1.8,textAlign:'right',color:'#7B1FA2',fontWeight:'700'}]}>
-                          ₹{rb.fare.toFixed(0)}
-                        </Text>
-                      </View>
-                    ))}
-                  </View>
-                )}
-
-                <View style={tr.grandTotal}>
-                  <Text style={tr.grandTotalLabel}>
-                    Grand Total — {grandPassengers} tickets
-                  </Text>
-                  <Text style={tr.grandTotalAmt}>₹{grandCollection.toFixed(0)}</Text>
-                </View>
-
-                <View style={{height:24}}/>
-              </ScrollView>
-            )
-            : null
-          }
-        </View>
-      </View>
-    </Modal>
-  );
-};
-const tr=StyleSheet.create({
-  printBtn:{flexDirection:'row',alignItems:'center',gap:5,backgroundColor:'#1a2332',paddingHorizontal:12,paddingVertical:7,borderRadius:10},
-  printBtnText:{color:'#fff',fontSize:12,fontWeight:'700'},
-  legendChip:{flexDirection:'row',alignItems:'center',gap:4,backgroundColor:'#E3F2FD',paddingHorizontal:8,paddingVertical:4,borderRadius:8,borderWidth:1,borderColor:'#90CAF9'},
-  legendText:{fontSize:11,fontWeight:'600'},
-  secHeader:{flexDirection:'row',alignItems:'center',gap:6,paddingVertical:5,paddingHorizontal:2,marginBottom:4,marginTop:8},
-  secLabel:{fontSize:11,fontWeight:'800',color:'#7B1FA2',letterSpacing:.5},
-  grandTotal:{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginTop:16,padding:14,backgroundColor:'#1a2332',borderRadius:12},
-  grandTotalLabel:{fontSize:13,fontWeight:'700',color:'#fff'},
-  grandTotalAmt:{fontSize:22,fontWeight:'900',color:'#00b7f3'},
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Stage Filter
-// ─────────────────────────────────────────────────────────────────────────────
-const StageFilter = ({tripId,baseTickets,baseCollection,posTix,direction,onPrint}:{tripId:any;baseTickets:any;baseCollection:any;posTix?:any[];direction?:string;onPrint:(d:any)=>void}) => {
-  const [stops,setStops]=useState<any[]>([]);
-  const [loading,setLoading]=useState(false);
-  const [fromStop,setFrom]=useState<any>(null);
-  const [toStop,setTo]=useState<any>(null);
-  const [pFrom,setPFrom]=useState(false);
-  const [pTo,setPTo]=useState(false);
-  const [filtered,setFiltered]=useState<any>(null);
-  const [filtering,setFiltering]=useState(false);
-  const [open,setOpen]=useState(false);
-  useEffect(()=>{if(open&&tripId&&stops.length===0){(async()=>{setLoading(true);try{const r=await api.get(`/conductor/trip/${tripId}/stages`);setStops(r.data?.stops||[]);}catch{}finally{setLoading(false);}})();}}, [open,tripId]);
-  useEffect(()=>{setStops([]);setFrom(null);setTo(null);setFiltered(null);setOpen(false);},[tripId]);
-  const apply = async(f:any,t:any) => {
-    if(!f && !t){ setFiltered(null); return; }
-    setFiltering(true);
-
-    try{
-      const stopMap: Record<string,string> = (stops||[]).reduce((acc:any,s:any) => {
-        acc[s.id] = s.name;
-        return acc;
-      }, {});
-
-      let q:any = supabase
-        .from('tickets')
-        .select('ticket_type,payment_method,ticket_count,total_fare,fare,from_stop_id,to_stop_id')
-        .eq('trip_id', tripId)
-        .neq('payment_method', 'pos');
-
-      if(f?.id) q = q.eq('from_stop_id', f.id);
-      if(t?.id) q = q.eq('to_stop_id', t.id);
-
-      const {data, error} = await q;
-      if(error) throw error;
-      const rows:any[] = data || [];
-
-      const map: Record<string, {
-        from: string; to: string;
-        full_count: number; half_count: number; free_count: number;
-        total_fare: number;
-      }> = {};
-
-      let full = 0, half = 0, free = 0, tickets = 0, collection = 0;
-
-      for(const r of rows){
-        const cnt = Number(r.ticket_count ?? 1);
-        const pm  = String(r.payment_method ?? '').toLowerCase();
-        const tt  = (r.ticket_type ?? 'full') as string;
-
-        const unit = Number(r.fare ?? 0);
-        const total = r.total_fare != null ? Number(r.total_fare) : unit * cnt;
-
-        const fromName = stopMap[r.from_stop_id] ?? 'Unknown';
-        const toName   = stopMap[r.to_stop_id]   ?? 'Unknown';
-        const k = `${fromName}|||${toName}`;
-        if(!map[k]) map[k] = {from: fromName, to: toName, full_count:0, half_count:0, free_count:0, total_fare:0};
-
-        const isFree = pm === 'fr';
-        if(isFree){
-          map[k].free_count += cnt;
-          free += cnt;
-        } else if(tt === 'half'){
-          map[k].half_count += cnt;
-          half += cnt;
-        } else {
-          map[k].full_count += cnt;
-          full += cnt;
-        }
-
-        map[k].total_fare += total;
-        tickets += cnt;
-        collection += total;
-      }
-
-      const breakdown = Object.values(map).sort((a,b) => b.total_fare - a.total_fare);
-      setFiltered({tickets, collection, full, half, free, breakdown});
-    } catch {
-      Alert.alert('Error','Could not filter');
-      setFiltered(null);
-    } finally {
-      setFiltering(false);
-    }
-  };
-  const selF=(s:any)=>{setFrom(s);setPFrom(false);apply(s,toStop);};
-  const selT=(s:any)=>{setTo(s);setPTo(false);apply(fromStop,s);};
-  const clear=()=>{setFrom(null);setTo(null);setFiltered(null);};
-  const isFilt=!!(fromStop||toStop);
-  const isDN = isDownDirection(direction);
-
-  const orderedStops = isDN ? [...stops].reverse() : stops;
-
-  const posTixArr = posTix||[];
-  const matchedPOS = isFilt
-    ? posTixArr.filter((t:any)=>{
-        const tFrom = englishStop(t.from_stop).toLowerCase();
-        const tTo   = englishStop(t.to_stop).toLowerCase();
-        const selFromName = fromStop ? englishStop(fromStop.name).toLowerCase() : null;
-        const selToName   = toStop   ? englishStop(toStop.name).toLowerCase()   : null;
-        const fromOk = !selFromName || tFrom.includes(selFromName) || selFromName.includes(tFrom);
-        const toOk   = !selToName   || tTo.includes(selToName)     || selToName.includes(tTo);
-        return fromOk && toOk;
-      })
-    : posTixArr;
-
-  const posStageCnt = matchedPOS.reduce((s:number,t:any)=>s+t.ticket_count,0);
-  const posStageAmt = matchedPOS.reduce((s:number,t:any)=>s+t.fare,0);
-
-  const appTix = isFilt ? (filtered?.tickets ?? 0) : baseTickets;
-  const appCol = isFilt ? (filtered?.collection ?? 0) : baseCollection;
-
-  const posFullTotal = matchedPOS.reduce((s:number,t:any)=> {
-    return ((t.ticket_type ?? 'full') === 'half') ? s : s + t.ticket_count;
-  }, 0);
-  const posHalfTotal = matchedPOS.reduce((s:number,t:any)=> {
-    return t.ticket_type === 'half' ? s + t.ticket_count : s;
-  }, 0);
-
-  const dTix = appTix + posStageCnt;
-  const dCol = appCol + posStageAmt;
-
-  const dF  = isFilt ? ((filtered?.full ?? 0) + posFullTotal) : null;
-  const dH  = isFilt ? ((filtered?.half ?? 0) + posHalfTotal) : null;
-  const dFr = isFilt ? (filtered?.free ?? 0) : null;
-
-  const cleanBreakdown = (filtered?.breakdown||[]).filter((rb:any)=>{
-    const f=englishStop(rb.from), t=englishStop(rb.to);
-    return (f && f!=='?' && f.trim()!=='') || (t && t!=='?' && t.trim()!=='');
-  });
-
-  const posBreakdownMap: Record<string,{from:string;to:string;fullCount:number;halfCount:number;count:number;fare:number}> = {};
-  for(const t of matchedPOS){
-    const f=posStopLabel(t.from_stop)||'POS', to=posStopLabel(t.to_stop)||'POS';
-    const k=`${f}|||${to}`;
-    if(!posBreakdownMap[k]) posBreakdownMap[k]={from:f,to:to,fullCount:0,halfCount:0,count:0,fare:0};
-    if((t as any).ticket_type==='half'){
-      posBreakdownMap[k].halfCount+=t.ticket_count;
-    } else {
-      posBreakdownMap[k].fullCount+=t.ticket_count;
-    }
-    posBreakdownMap[k].count+=t.ticket_count;
-    posBreakdownMap[k].fare +=t.fare;
-  }
-  const posBreakdownRows = Object.values(posBreakdownMap);
-
-  const printBreakdown = [
-    ...cleanBreakdown,
-    ...posBreakdownRows.map(r=>({from:r.from,to:r.to,full_count:r.fullCount,half_count:r.halfCount,free_count:0,total_fare:r.fare})),
-  ];
-
-  return (
-    <View style={sf.wrapper}>
-      <TouchableOpacity style={[sf.toggle,open&&sf.toggleActive]} onPress={()=>setOpen(v=>!v)} activeOpacity={.7}>
-        <BarChart3 size={14} color={open?'#fff':'#00b7f3'}/><Text style={[sf.toggleText,open&&{color:'#fff'}]}>Stage Filter</Text>
-        {isFilt&&<View style={sf.activeDot}/>}<Text style={{fontSize:12,color:open?'#fff':'#00b7f3'}}>{open?'▲':'▼'}</Text>
-      </TouchableOpacity>
-      {open&&(
-        <View style={sf.panel}>
-          <View style={{flexDirection:'row',alignItems:'center',gap:6,marginBottom:8}}>
-            <View style={[sf.dirBadge,{backgroundColor:isDN?'#EDE7F6':'#E3F2FD'}]}>
-              <Text style={[sf.dirBadgeText,{color:isDN?'#7B1FA2':'#1565C0'}]}>{isDN?'↓ DN  STY → CBE':'↑ UP  CBE → STY'}</Text>
-            </View>
-          </View>
-          <View style={sf.statsRow}>
-            <View style={sf.stat}><Ticket size={14} color="#00b7f3"/><Text style={[sf.statVal,{color:'#00b7f3'}]}>{dTix}</Text><Text style={sf.statLabel}>Tickets</Text></View>
-            <View style={sf.statDivider}/>
-            <View style={sf.stat}><DollarSign size={14} color="#4CAF50"/><Text style={[sf.statVal,{color:'#4CAF50'}]}>₹{Number(dCol).toFixed(2)}</Text><Text style={sf.statLabel}>Revenue</Text></View>
-            {posStageCnt>0&&<><View style={sf.statDivider}/><View style={sf.stat}><Printer size={12} color="#7B1FA2"/><Text style={[sf.statVal,{color:'#7B1FA2',fontSize:13}]}>{posStageCnt}</Text><Text style={sf.statLabel}>POS</Text></View></>}
-            {isFilt&&dF!==null&&(<><View style={sf.statDivider}/><View style={sf.stat}><Text style={[sf.statVal,{color:'#1a2332',fontSize:13}]}>{dF}F{dH&&dH>0?` · ${dH}H`:''}{dFr&&dFr>0?` · ${dFr}FR`:''}</Text><Text style={sf.statLabel}>Break</Text></View></>)}
-          </View>
-          {loading?<ActivityIndicator size="small" color="#00b7f3" style={{marginVertical:10}}/>:orderedStops.length===0?<Text style={sf.noStops}>No stops yet.</Text>:(
-            <>
-              <View style={sf.pickerRow}>
-                <TouchableOpacity style={[sf.picker,fromStop&&sf.pickerActive]} onPress={()=>{setPFrom(v=>!v);setPTo(false);}}>
-                  <Text style={[sf.pickerText,fromStop&&{color:'#00b7f3',fontWeight:'700'}]} numberOfLines={1}>{fromStop?englishStop(fromStop.name):'From Stage'}</Text>
-                  {fromStop&&<TouchableOpacity onPress={()=>{setFrom(null);apply(null,toStop);}} hitSlop={{top:8,bottom:8,left:8,right:8}}><X size={12} color="#00b7f3"/></TouchableOpacity>}
-                </TouchableOpacity>
-                <Text style={{color:'#ccc',fontSize:16}}>→</Text>
-                <TouchableOpacity style={[sf.picker,toStop&&sf.pickerActive]} onPress={()=>{setPTo(v=>!v);setPFrom(false);}}>
-                  <Text style={[sf.pickerText,toStop&&{color:'#00b7f3',fontWeight:'700'}]} numberOfLines={1}>{toStop?englishStop(toStop.name):'To Stage'}</Text>
-                  {toStop&&<TouchableOpacity onPress={()=>{setTo(null);apply(fromStop,null);}} hitSlop={{top:8,bottom:8,left:8,right:8}}><X size={12} color="#00b7f3"/></TouchableOpacity>}
-                </TouchableOpacity>
-              </View>
-              {pFrom&&<View style={sf.dropdown}><Text style={sf.dropdownLabel}>FROM STAGE  ({isDN?'STY → CBE':'CBE → STY'})</Text><ScrollView style={{maxHeight:160}} nestedScrollEnabled>{orderedStops.map((s:any)=>(<TouchableOpacity key={s.id} style={[sf.dropdownOption,fromStop?.id===s.id&&sf.dropdownOptionActive]} onPress={()=>selF(s)}><View style={{flex:1}}><Text style={sf.dropdownName}>{englishStop(s.name)}</Text><Text style={sf.dropdownSub}>{shortStop(s.name)}</Text></View>{fromStop?.id===s.id&&<CheckCircle size={13} color="#00b7f3"/>}</TouchableOpacity>))}</ScrollView></View>}
-              {pTo&&<View style={sf.dropdown}><Text style={sf.dropdownLabel}>TO STAGE  ({isDN?'STY → CBE':'CBE → STY'})</Text><ScrollView style={{maxHeight:160}} nestedScrollEnabled>{orderedStops.map((s:any)=>(<TouchableOpacity key={s.id} style={[sf.dropdownOption,toStop?.id===s.id&&sf.dropdownOptionActive]} onPress={()=>selT(s)}><View style={{flex:1}}><Text style={sf.dropdownName}>{englishStop(s.name)}</Text><Text style={sf.dropdownSub}>{shortStop(s.name)}</Text></View>{toStop?.id===s.id&&<CheckCircle size={13} color="#00b7f3"/>}</TouchableOpacity>))}</ScrollView></View>}
-              {filtering&&<ActivityIndicator size="small" color="#00b7f3" style={{marginTop:8}}/>}
-              {isFilt&&!filtering&&(
-                <>
-                  <View style={sf.resultBadge}><CheckCircle size={12} color="#4CAF50"/><Text style={sf.resultText} numberOfLines={2}>{dTix} ticket{dTix!==1?'s':''}{fromStop?` from ${englishStop(fromStop.name)}`:''}{toStop?` to ${englishStop(toStop.name)}`:''}{' · '}₹{Number(dCol).toFixed(2)}</Text><TouchableOpacity onPress={clear} style={{marginLeft:4}}><X size={12} color="#888"/></TouchableOpacity></View>
-                  <TouchableOpacity style={sf.printBtn} onPress={()=>onPrint({fromStop,toStop,tickets:dTix,collection:dCol,full:dF,half:dH,free:dFr,breakdown:printBreakdown})}>
-                    <Printer size={14} color="#fff"/><Text style={sf.printBtnText}>Print Stage Report</Text>
-                  </TouchableOpacity>
-                </>
-              )}
-              {isFilt&&!filtering&&(cleanBreakdown.length>0||posBreakdownRows.length>0)&&(
-                <View style={sf.table}>
-                  <View style={sf.tableHeader}>{['SS','ES','F','H','FR','AMT'].map((h,i)=><Text key={i} style={[sf.th,h==='AMT'&&{flex:1.8,textAlign:'right'}]}>{h}</Text>)}</View>
-                  {cleanBreakdown.map((rb:any,i:number)=>(
-                    <View key={`app-${i}`} style={[sf.tableRow,i%2===0&&{backgroundColor:'#F7FAFC'}]}>
-                      <Text style={sf.td} numberOfLines={1}>{englishStop(rb.from)}</Text><Text style={sf.td} numberOfLines={1}>{englishStop(rb.to)}</Text>
-                      <Text style={sf.td}>{rb.full_count>0?rb.full_count:'-'}</Text><Text style={sf.td}>{rb.half_count>0?rb.half_count:'-'}</Text><Text style={sf.td}>{rb.free_count>0?rb.free_count:'-'}</Text>
-                      <Text style={[sf.td,{flex:1.8,textAlign:'right',color:'#00b7f3',fontWeight:'700'}]}>₹{Number(rb.total_fare??rb.revenue??0).toFixed(2)}</Text>
-                    </View>
-                  ))}
-                  {posBreakdownRows.map((rb,i)=>(
-                    <View key={`pos-${i}`} style={[sf.tableRow,{backgroundColor:'#F3E5F5'}]}>
-                      <Text style={[sf.td,{color:'#4A148C'}]} numberOfLines={1}>{rb.from}</Text>
-                      <Text style={[sf.td,{color:'#4A148C'}]} numberOfLines={1}>{rb.to}</Text>
-                      <Text style={[sf.td,{color:'#7B1FA2',fontWeight:'700'}]}>{rb.fullCount>0?rb.fullCount:'-'}</Text>
-                      <Text style={[sf.td,{color:'#E65100',fontWeight:'700'}]}>{rb.halfCount>0?rb.halfCount:'-'}</Text>
-                      <Text style={sf.td}>-</Text>
-                      <Text style={[sf.td,{flex:1.8,textAlign:'right',color:'#7B1FA2',fontWeight:'700'}]}>₹{rb.fare.toFixed(2)}</Text>
-                    </View>
-                  ))}
-                </View>
-              )}
-            </>
-          )}
-        </View>
-      )}
-    </View>
-  );
-};
-const sf = StyleSheet.create({
-  wrapper:{marginTop:10,marginBottom:4},toggle:{flexDirection:'row',alignItems:'center',gap:6,alignSelf:'flex-start',paddingHorizontal:12,paddingVertical:7,borderRadius:20,borderWidth:1.5,borderColor:'#00b7f3',backgroundColor:'#F0FAFF',marginBottom:8},
-  toggleActive:{backgroundColor:'#00b7f3',borderColor:'#00b7f3'},toggleText:{fontSize:13,fontWeight:'600',color:'#00b7f3'},activeDot:{width:7,height:7,borderRadius:4,backgroundColor:'#FF5252'},
-  panel:{backgroundColor:'#F0FAFF',borderRadius:12,padding:12,borderWidth:1,borderColor:'#B3E5FC',marginBottom:4},statsRow:{flexDirection:'row',backgroundColor:'#fff',borderRadius:10,padding:10,marginBottom:12,alignItems:'center'},
-  stat:{flex:1,flexDirection:'row',alignItems:'center',justifyContent:'center',gap:4},statVal:{fontSize:14,fontWeight:'800'},statLabel:{fontSize:10,color:'#888'},statDivider:{width:1,backgroundColor:'#e0e0e0',height:22,marginHorizontal:4},
-  noStops:{fontSize:12,color:'#aaa',textAlign:'center',paddingVertical:8,fontStyle:'italic'},pickerRow:{flexDirection:'row',alignItems:'center',gap:8},
-  picker:{flex:1,flexDirection:'row',alignItems:'center',gap:6,backgroundColor:'#fff',borderRadius:10,paddingHorizontal:10,paddingVertical:9,borderWidth:1.5,borderColor:'#ddd'},pickerActive:{borderColor:'#00b7f3',backgroundColor:'#E8F7FF'},pickerText:{fontSize:13,color:'#aaa',flex:1},
-  dropdown:{backgroundColor:'#fff',borderRadius:10,marginTop:8,borderWidth:1,borderColor:'#e0e0e0',overflow:'hidden'},dropdownLabel:{fontSize:10,fontWeight:'700',color:'#888',letterSpacing:.5,paddingHorizontal:12,paddingTop:8,paddingBottom:4},
-  dropdownOption:{flexDirection:'row',alignItems:'center',gap:10,paddingVertical:9,paddingHorizontal:12,borderBottomWidth:1,borderBottomColor:'#F0F4F8'},dropdownOptionActive:{backgroundColor:'#E8F7FF'},dropdownName:{fontSize:13,color:'#1a2332',fontWeight:'600'},dropdownSub:{fontSize:11,color:'#888',marginTop:1},
-  resultBadge:{flexDirection:'row',alignItems:'center',gap:5,marginTop:8,backgroundColor:'#E8F5E9',paddingHorizontal:10,paddingVertical:5,borderRadius:8,alignSelf:'flex-start',flexShrink:1},resultText:{fontSize:11,color:'#2E7D32',fontWeight:'600',flexShrink:1},
-  printBtn:{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:6,marginTop:8,backgroundColor:'#00b7f3',paddingVertical:9,paddingHorizontal:14,borderRadius:10},printBtnText:{color:'#fff',fontSize:13,fontWeight:'700'},
-  dirBadge:{paddingHorizontal:10,paddingVertical:4,borderRadius:10,alignSelf:'flex-start'},dirBadgeText:{fontSize:11,fontWeight:'700'},table:{marginTop:10,borderRadius:8,overflow:'hidden'},tableHeader:{flexDirection:'row',backgroundColor:'#1a2332',paddingVertical:7,paddingHorizontal:8},th:{flex:1,fontSize:10,fontWeight:'700',color:'#fff',textAlign:'center'},tableRow:{flexDirection:'row',paddingVertical:7,paddingHorizontal:8},td:{flex:1,fontSize:11,color:'#333',textAlign:'center'},
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 // TAB 1 — Ticket
 // ─────────────────────────────────────────────────────────────────────────────
 const halfFare = (full: number): number => Math.ceil(full / 2);
@@ -832,18 +401,8 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
   );
 
   const handlePrint = async () => {
-    if (Platform.OS !== 'android') {
-      Alert.alert('Notice', 'Printer only on Android.');
-      setShowConfirm(false);
-      return;
-    }
     setIssuing(true);
     try {
-      const ret = await NyxPrinter.getPrinterStatus();
-      if (ret !== PrinterStatus.SDK_OK) {
-        Alert.alert('Printer Error', PrinterStatus.msg(ret));
-        return;
-      }
       const now = new Date();
       const dp = now.toLocaleDateString('en-GB').replace(/\//g, '-');
       const tp = now.toLocaleTimeString('en-GB', { hour12: false });
@@ -870,39 +429,31 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
       const luggageTicketOnFull = luggageOnFull > 0 ? 1 : 0;
       const luggageTicketOnHalf = luggageOnHalf > 0 ? 1 : 0;
 
-      await NyxPrinter.printText('SPS - ZYRAP', { textSize: 28, align: PrintAlign.CENTER });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+      const p = new Printer();
+      const ready = await p.checkReady();
+      if (!ready) { setIssuing(false); return; }
+
+      await p.text('SPS - ZYRAP', { textSize: 28, align: 'CENTER' });
+      await p.text(DIVIDER, { align: 'CENTER' });
       const numLine = [
         fullTicketNum  ? `#${fullTicketNum}`  : null,
         halfTicketNum  ? `#${halfTicketNum}`  : null,
       ].filter(Boolean).join(' / ');
-      if (numLine) {
-        await NyxPrinter.printText(`Ticket: ${numLine}`, { textSize: 20, align: PrintAlign.CENTER });
-      }
-      await NyxPrinter.printText(`${dp}   ${tp}`, { textSize: 22, align: PrintAlign.CENTER });
-      await NyxPrinter.printText(`Bus: ${busNumber}          CASH`, { textSize: 22 });
-      if (luggageAmount > 0) await NyxPrinter.printText(`Luggage: Rs ${fareStr(luggageAmount)}`, { textSize: 20 });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      await NyxPrinter.printText(`${fnum}-${fn}`, { textSize: 24 });
-      await NyxPrinter.printText(`${tnum}-${tn}`, { textSize: 24 });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      if (fullCount > 0)
-        await NyxPrinter.printText(
-          `ADULT(S): ${fullCount} * ${fareStr(baseFullFare)} = ${fareStr(fullTotal)}`,
-          { textSize: 22 },
-        );
-      if (halfCount > 0)
-        await NyxPrinter.printText(
-          `CHILD(S): ${halfCount} * ${fareStr(baseHalfFare)} = ${fareStr(halfTotal)}`,
-          { textSize: 22 },
-        );
-      if (luggageAmount > 0) {
-        await NyxPrinter.printText(`LUGGAGE : Rs ${fareStr(luggageAmount)}`, { textSize: 22 });
-      }
-      await NyxPrinter.printText(`Rs : ${fareStr(grandTotal)}`, { textSize: 36, align: PrintAlign.CENTER });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      await NyxPrinter.printText(fortune, { textSize: 18, align: PrintAlign.CENTER });
-      await NyxPrinter.printEndAutoOut();
+      if (numLine) await p.text(`Ticket: ${numLine}`, { textSize: 20, align: 'CENTER' });
+      await p.text(`${dp}   ${tp}`, { textSize: 22, align: 'CENTER' });
+      await p.text(`Bus: ${busNumber}          CASH`, { textSize: 22 });
+      if (luggageAmount > 0) await p.text(`Luggage: Rs ${fareStr(luggageAmount)}`, { textSize: 20 });
+      await p.text(DIVIDER, { align: 'CENTER' });
+      await p.text(`${fnum}-${fn}`, { textSize: 24 });
+      await p.text(`${tnum}-${tn}`, { textSize: 24 });
+      await p.text(DIVIDER, { align: 'CENTER' });
+      if (fullCount > 0) await p.text(`ADULT(S): ${fullCount} * ${fareStr(baseFullFare)} = ${fareStr(fullTotal)}`, { textSize: 22 });
+      if (halfCount > 0) await p.text(`CHILD(S): ${halfCount} * ${fareStr(baseHalfFare)} = ${fareStr(halfTotal)}`, { textSize: 22 });
+      if (luggageAmount > 0) await p.text(`LUGGAGE : Rs ${fareStr(luggageAmount)}`, { textSize: 22 });
+      await p.text(`Rs : ${fareStr(grandTotal)}`, { textSize: 36, align: 'CENTER' });
+      await p.text(DIVIDER, { align: 'CENTER' });
+      await p.text(fortune, { textSize: 18, align: 'CENTER' });
+      await p.finish();
 
       if (fullCount > 0 || isLuggageOnlyTicket) {
         const t: POSTicket = {
@@ -949,7 +500,7 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
         onTicketIssued(t);
       }
 
-      showToast(`Ticket printed · ₹${grandTotal}`);
+      showToast(`Ticket issued · ₹${grandTotal}`);
       setShowConfirm(false);
       setFullCount(1);
       setHalfCount(0);
@@ -957,7 +508,7 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
       setLuggageInput('0');
       setActiveDrop(null);
     } catch (e: any) {
-      Alert.alert('Print Error', e.message || 'Unknown');
+      Alert.alert('Error', e.message || 'Unknown');
     } finally {
       setIssuing(false);
     }
@@ -1089,19 +640,19 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
       <Modal animationType="slide" transparent visible={showConfirm} onRequestClose={()=>setShowConfirm(false)}>
         <View style={sh.modalOverlay}><View style={sh.bottomSheet}>
           <View style={sh.sheetHandle}/>
-          <View style={{alignItems:'center',marginBottom:16}}><Printer size={32} color="#00b7f3"/><Text style={sh.modalTitle}>Confirm Ticket</Text></View>
+          <View style={{alignItems:'center',marginBottom:16}}><PrinterIcon size={32} color="#00b7f3"/><Text style={sh.modalTitle}>Confirm Ticket</Text></View>
           <View style={tk.detailRow}><Text style={tk.detailLabel}>Bus</Text><Text style={tk.detailVal}>{busNumber}</Text></View>
           <View style={tk.detailRow}><Text style={tk.detailLabel}>From</Text><Text style={tk.detailVal}>{selStart?.label?.split('-')[0]}</Text></View>
           <View style={tk.detailRow}><Text style={tk.detailLabel}>To</Text><Text style={tk.detailVal}>{selDest?.label?.split('-')[0]}</Text></View>
           {luggageAmount>0&&<View style={tk.detailRow}><Text style={tk.detailLabel}>Luggage</Text><Text style={tk.detailVal}>₹{fareStr(luggageAmount)}</Text></View>}
           {fullCount>0&&<View style={tk.detailRow}><Text style={tk.detailLabel}>Adult</Text><Text style={tk.detailVal}>{fullCount} × ₹{fareStr(baseFullFare)} = ₹{fareStr(fullTotal)}</Text></View>}
-          {halfCount>0&&<View style={tk.detailRow}><Text style={[tk.detailLabel,{color:'#FF9800'}]}>Child</Text><Text style={[tk.detailVal,{color:'#FF9800'}]}>{halfCount} × ₹{fareStr(baseHalfFare)} = ₹{fareStr(halfTotal)}</Text></View>}
+          {halfCount>0&&<View style={tk.detailRow}><Text style={tk.detailLabel}>Child</Text><Text style={[tk.detailVal,{color:'#FF9800'}]}>{halfCount} × ₹{fareStr(baseHalfFare)} = ₹{fareStr(halfTotal)}</Text></View>}
           <View style={tk.fareDivider}/>
           <View style={tk.detailRow}><Text style={tk.fareTotalLabel}>Total ({totalTickets} tickets)</Text><Text style={tk.fareTotalVal}>₹{fareStr(grandTotal)}</Text></View>
           <View style={{flexDirection:'row',gap:12,marginTop:16}}>
             <TouchableOpacity style={sh.cancelBtn} onPress={()=>setShowConfirm(false)}><Text style={sh.cancelBtnText}>Cancel</Text></TouchableOpacity>
             <TouchableOpacity style={[sh.primaryBtn,{flex:1},issuing&&{opacity:.6}]} onPress={handlePrint} disabled={issuing}>
-              {issuing?<ActivityIndicator color="#fff"/>:<><Printer size={16} color="#fff"/><Text style={sh.primaryBtnText}>Print & Issue</Text></>}
+              {issuing?<ActivityIndicator color="#fff"/>:<><PrinterIcon size={16} color="#fff"/><Text style={sh.primaryBtnText}>Issue Ticket</Text></>}
             </TouchableOpacity>
           </View>
         </View></View>
@@ -1116,7 +667,6 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
 const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTicket,tripNumber,posHook}:{dashboard:any;onRefresh:(payload?:{direction:string;route_name?:string;start_time:string})=>void|Promise<void>;pendingRequests:any[];verifyingTicket:string|null;onVerifyTicket:(id:string)=>void;tripNumber:number;posHook:ReturnType<typeof usePOSTickets>}) => {
   const [changing,setChanging]=useState(false);
   const [startModal,setStartModal]=useState(false);
-  const [reportTrip,setReportTrip]=useState<any>(null);
   const at=dashboard?.active_trip;
 
   const activePOSTix   = posHook.tickets.filter((t:any)=>t.trip_id===at?.trip_id);
@@ -1130,21 +680,17 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
   useEffect(() => {
     const tid = at?.trip_id;
     if (!tid) { setAppOnlyTickets(0); setAppOnlyFare(0); return; }
-
     let cancelled = false;
     setAppTripLoading(true);
-
     (async () => {
-      try{
+      try {
         const {data, error} = await supabase
           .from('tickets')
           .select('ticket_count,total_fare,fare')
           .eq('trip_id', tid)
           .neq('payment_method', 'pos');
-
         if (error) throw error;
         const rows: any[] = data || [];
-
         const count = rows.reduce((s, r) => s + Number(r.ticket_count ?? 1), 0);
         const total = rows.reduce((s, r) => {
           const cnt = Number(r.ticket_count ?? 1);
@@ -1152,7 +698,6 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
           const t = r.total_fare != null ? Number(r.total_fare) : unit * cnt;
           return s + t;
         }, 0);
-
         if (!cancelled) { setAppOnlyTickets(count); setAppOnlyFare(total); }
       } catch (e) {
         if (!cancelled) { setAppOnlyTickets(0); setAppOnlyFare(0); }
@@ -1160,11 +705,9 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
         if (!cancelled) setAppTripLoading(false);
       }
     })();
-
     return () => { cancelled = true; };
   }, [at?.trip_id]);
 
-  const displayPOSCount = activePOSCount;
   const totalFareCombined = appOnlyFare + activePOSFare;
 
   const changeStatus=async(s:string)=>{
@@ -1177,32 +720,9 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
     }}]);
   };
 
-  const printStage=async(data:any)=>{
-    if(Platform.OS!=='android'||!NyxPrinter){Alert.alert('Notice','Printer only on Android.');return;}
-    try{
-      const ret=await NyxPrinter.getPrinterStatus();if(ret!==PrinterStatus.SDK_OK){Alert.alert('Printer Error',PrinterStatus.msg(ret));return;}
-      const bn=at?.bus_number??dashboard?.bus?.vehicle_number??'N/A';
-      const fmt=(n:number)=>n%1===0?`${n}`:n.toFixed(2);
-      const fE=data.fromStop?englishStop(data.fromStop.name):'All',fL=data.fromStop?shortStop(data.fromStop.name):'';
-      const tE=data.toStop?englishStop(data.toStop.name):'All',tL=data.toStop?shortStop(data.toStop.name):'';
-      await NyxPrinter.printText('SPS - ZYRAP',{textSize:32,align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`${new Date().toLocaleString()}  Bus: ${bn}`,{textSize:20});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText('STAGE REPORT',{textSize:26,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`From : ${fE}${fL?' ('+fL+')':''}\nTo   : ${tE}${tL?' ('+tL+')':''}`,{});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`Tickets: ${data.tickets}  F:${data.full??0} H:${data.half??0} FR:${data.free??0}`,{});
-      await NyxPrinter.printText(`Rs. ${fmt(Number(data.collection))}`,{textSize:32,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      if(data.breakdown?.length>0){await NyxPrinter.printText('Stage-wise:',{});for(const rb of data.breakdown){await NyxPrinter.printText(`${englishStop(rb.from)} -> ${englishStop(rb.to)}\n  F:${rb.full_count??0} H:${rb.half_count??0} FR:${rb.free_count??0}  Rs.${fmt(Number(rb.total_fare??rb.revenue??0))}`,{});await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});}}
-      await NyxPrinter.printText('** Safe Journey **',{align:PrintAlign.CENTER});
-      await NyxPrinter.printEndAutoOut();showToast('Stage report printed!');
-    }catch(e:any){Alert.alert('Print Error',e.message||'Unknown');}
-  };
-
   return (
     <ScrollView style={{flex:1}} contentContainerStyle={{padding:16}} showsVerticalScrollIndicator={false}>
+
       {pendingRequests.length>0&&(
         <View style={sh.pendingSection}>
           <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:4}}>
@@ -1213,6 +733,7 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
           {pendingRequests.map((i:any)=><PendingVerifyRow key={i.ticket_id} item={i} onVerify={onVerifyTicket} verifying={verifyingTicket}/>)}
         </View>
       )}
+
       <View style={sh.card}>
         {at?(
           <>
@@ -1225,11 +746,13 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
               </View>
               <StatusBadge status={at.status}/>
             </View>
+
             <View style={{flexDirection:'row',gap:12,marginBottom:14,flexWrap:'wrap'}}>
               <View style={{flexDirection:'row',alignItems:'center',gap:4}}><Clock size={13} color="#888"/><Text style={{fontSize:12,color:'#888'}}>Started {formatTime(at.start_time)}</Text></View>
               <View style={{flexDirection:'row',alignItems:'center',gap:4}}><Timer size={13} color="#888"/><Text style={{fontSize:12,color:'#888'}}>{formatDuration(at.start_time,null)}</Text></View>
               {(at.bus_number||dashboard?.bus?.vehicle_number)&&<View style={{flexDirection:'row',alignItems:'center',gap:4}}><Bus size={13} color="#888"/><Text style={{fontSize:12,color:'#888'}}>{at.bus_number??dashboard?.bus?.vehicle_number}</Text></View>}
             </View>
+
             <View style={sh.inlineStats}>
               <View style={sh.inlineStat}>
                 <Ticket size={15} color="#00b7f3"/>
@@ -1237,7 +760,7 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
                 <Text style={sh.inlineStatLabel}>App Tkts</Text>
               </View>
               <View style={sh.inlineStatDivider}/>
-              {displayPOSCount>0&&<><View style={sh.inlineStat}><Printer size={15} color="#7B1FA2"/><Text style={[sh.inlineStatVal,{color:'#7B1FA2'}]}>{displayPOSCount}</Text><Text style={sh.inlineStatLabel}>POS Tkts</Text></View><View style={sh.inlineStatDivider}/></>}
+              {activePOSCount>0&&<><View style={sh.inlineStat}><PrinterIcon size={15} color="#7B1FA2"/><Text style={[sh.inlineStatVal,{color:'#7B1FA2'}]}>{activePOSCount}</Text><Text style={sh.inlineStatLabel}>POS Tkts</Text></View><View style={sh.inlineStatDivider}/></>}
               <View style={sh.inlineStat}>
                 <DollarSign size={15} color="#4CAF50"/>
                 <Text style={[sh.inlineStatVal,{color:'#4CAF50'}]}>₹{appTripLoading ? '…' : Number(totalFareCombined).toFixed(0)}</Text>
@@ -1245,11 +768,18 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
               </View>
               {pendingRequests.length>0&&<><View style={sh.inlineStatDivider}/><View style={sh.inlineStat}><UserCheck size={15} color="#f57c00"/><Text style={[sh.inlineStatVal,{color:'#f57c00'}]}>{pendingRequests.length}</Text><Text style={sh.inlineStatLabel}>Pending</Text></View></>}
             </View>
-            <StageFilter tripId={at.trip_id} baseTickets={appOnlyTickets} baseCollection={appOnlyFare} posTix={activePOSTix} direction={at?.direction} onPrint={printStage}/>
+
+            <View style={{flexDirection:'row',gap:8,marginBottom:12,flexWrap:'wrap'}}>
+              <View style={[tt.dirBadge,{backgroundColor:isDownDirection(at.direction)?'#EDE7F6':'#E3F2FD'}]}>
+                <Text style={[tt.dirBadgeText,{color:isDownDirection(at.direction)?'#7B1FA2':'#1565C0'}]}>
+                  {isDownDirection(at.direction)?'↓ DN  STY → CBE':'↑ UP  CBE → STY'}
+                </Text>
+              </View>
+            </View>
+
             <View style={sh.tripActions}>
               {at.status==='running'&&<TouchableOpacity style={[sh.tripAction,{backgroundColor:'#FFF8E1'}]} onPress={()=>changeStatus('paused')} disabled={changing}><Pause size={17} color="#F57F17"/><Text style={[sh.tripActionText,{color:'#F57F17'}]}>Pause</Text></TouchableOpacity>}
               {at.status==='paused'&&<TouchableOpacity style={[sh.tripAction,{backgroundColor:'#E8F5E9'}]} onPress={()=>changeStatus('running')} disabled={changing}><Play size={17} color="#2E7D32"/><Text style={[sh.tripActionText,{color:'#2E7D32'}]}>Resume</Text></TouchableOpacity>}
-              <TouchableOpacity style={[sh.tripAction,{backgroundColor:'#E3F2FD'}]} onPress={()=>setReportTrip(at.trip_id)}><BarChart3 size={17} color="#1565C0"/><Text style={[sh.tripActionText,{color:'#1565C0'}]}>Report</Text></TouchableOpacity>
               <TouchableOpacity style={[sh.tripAction,{backgroundColor:'#FCE4EC'}]} onPress={()=>changeStatus('completed')} disabled={changing}>
                 {changing?<ActivityIndicator size="small" color="#C62828"/>:<Square size={17} color="#C62828"/>}
                 <Text style={[sh.tripActionText,{color:'#C62828'}]}>End Trip</Text>
@@ -1264,23 +794,17 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
           </View>
         )}
       </View>
+
       {at&&<TouchableOpacity style={sh.newTripBtn} onPress={()=>setStartModal(true)}><PlusCircle size={17} color="#00b7f3"/><Text style={{color:'#00b7f3',fontWeight:'600',fontSize:14}}>Start Another Trip</Text></TouchableOpacity>}
-      {(dashboard?.recent_trips||[]).length>0&&(
-        <View style={[sh.card,{marginTop:12}]}>
-          <Text style={sh.sectionTitle}>Recent Trips</Text>
-          {dashboard.recent_trips.slice(0,5).map((trip:any,i:number)=>(
-            <TouchableOpacity key={i} style={sh.recentTripRow} onPress={()=>setReportTrip(trip.trip_id)}>
-              <View style={{flex:1}}><Text style={sh.recentTripRoute}>{routeNameForDirection(trip.route_name, trip?.direction)}</Text><Text style={{fontSize:11,color:'#888',marginTop:2}}>{formatDate(trip.start_time)} · {trip.direction}</Text><View style={{flexDirection:'row',gap:8,marginTop:4}}><Text style={{fontSize:12,color:'#666'}}>🎟 {trip.tickets_sold}</Text><Text style={{fontSize:12,color:'#4CAF50'}}>₹{trip.collection}</Text></View></View>
-              <View style={{alignItems:'flex-end',gap:6}}><StatusBadge status={trip.status}/><ChevronRight size={18} color="#ccc"/></View>
-            </TouchableOpacity>
-          ))}
-        </View>
-      )}
+
       <StartTripModal visible={startModal} onClose={()=>setStartModal(false)} onStarted={onRefresh}/>
-      <TripReportModal visible={!!reportTrip} tripId={reportTrip} onClose={()=>setReportTrip(null)} posHook={posHook}/>
     </ScrollView>
   );
 };
+const tt = StyleSheet.create({
+  dirBadge:{paddingHorizontal:10,paddingVertical:4,borderRadius:10,alignSelf:'flex-start'},
+  dirBadgeText:{fontSize:11,fontWeight:'700'},
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TAB 3 — Riders
@@ -1333,14 +857,14 @@ const RidersTab = ({activeTrip,pendingRequests,onVerifyTicket,verifyingTicket,po
         <ScrollView contentContainerStyle={{paddingHorizontal:16,paddingBottom:20}}>
           {tripPOS.length>0&&(
             <View style={{marginBottom:12}}>
-              <View style={rr.secHeader}><Printer size={13} color="#7B1FA2"/><Text style={rr.secLabel}>POS TICKETS · {posPassengerCount} passengers</Text></View>
+              <View style={rr.secHeader}><PrinterIcon size={13} color="#7B1FA2"/><Text style={rr.secLabel}>POS TICKETS · {posPassengerCount} passengers</Text></View>
               {tripPOS.map(t=>{
                 const isHalf=(t as any).ticket_type==='half';
                 return(
                 <View key={t.id} style={[rr.posCard,isHalf&&{backgroundColor:'#FFF8E1',borderColor:'#FFE082'}]}>
                   <View style={rr.posLeft}>
                     <View style={[rr.posAvatar,isHalf&&{backgroundColor:'#FFF3E0'}]}>
-                      <Printer size={14} color={isHalf?'#E65100':'#7B1FA2'}/>
+                      <PrinterIcon size={14} color={isHalf?'#E65100':'#7B1FA2'}/>
                     </View>
                     <View style={{flex:1}}>
                       <Text style={[rr.posRoute,isHalf&&{color:'#E65100'}]}>
@@ -1422,554 +946,961 @@ const rr=StyleSheet.create({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TAB 4 — Report  (with Status Report per trip)
+// Stage Filter — app tickets are included in filtered data and merged into F column
 // ─────────────────────────────────────────────────────────────────────────────
-const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:ReturnType<typeof usePOSTickets>}) => {
-  const [collection,setCollection]   = useState<any>(null);
-  const [collLoading,setCollLoading] = useState(false);
-  const [period,setPeriod]           = useState('today');
-  const [expandedTrip,setExpandedTrip] = useState<string|null>(null);
-  const [appTickets,setAppTickets]   = useState<Record<string,any>>({});
-  const [appLoading,setAppLoading]   = useState<Record<string,boolean>>({});
-  const [printingStatus,setPrintingStatus] = useState<string|null>(null);
+const StageFilter = ({tripId,baseTickets,baseCollection,posTix,direction,onPrint,appBreakdown}:{tripId:any;baseTickets:any;baseCollection:any;posTix?:any[];direction?:string;onPrint:(d:any)=>void;appBreakdown?:any[]}) => {
+  const [stops,setStops]=useState<any[]>([]);
+  const [loading,setLoading]=useState(false);
+  const [fromStop,setFrom]=useState<any>(null);
+  const [toStop,setTo]=useState<any>(null);
+  const [pFrom,setPFrom]=useState(false);
+  const [pTo,setPTo]=useState(false);
+  const [filtered,setFiltered]=useState<any>(null);
+  const [filtering,setFiltering]=useState(false);
+  const [open,setOpen]=useState(false);
+  useEffect(()=>{if(open&&tripId&&stops.length===0){(async()=>{setLoading(true);try{const r=await api.get(`/conductor/trip/${tripId}/stages`);setStops(r.data?.stops||[]);}catch{}finally{setLoading(false);}})();}}, [open,tripId]);
+  useEffect(()=>{setStops([]);setFrom(null);setTo(null);setFiltered(null);setOpen(false);},[tripId]);
 
-  useEffect(()=>{fetchCol('today');},[]);
-  const fetchCol=async(p:string)=>{
-    setCollLoading(true);
-    try{const r=await api.get(`/conductor/collection/summary?period=${p}`);setCollection(r.data);}
-    catch{}finally{setCollLoading(false);}
+  const apply = async(f:any,t:any) => {
+    if(!f && !t){ setFiltered(null); return; }
+    setFiltering(true);
+    try{
+      const stopMap: Record<string,string> = (stops||[]).reduce((acc:any,s:any) => { acc[s.id] = s.name; return acc; }, {});
+
+      let q:any = supabase.from('tickets')
+        .select('ticket_type,payment_method,ticket_count,total_fare,fare,from_stop_id,to_stop_id')
+        .eq('trip_id', tripId)
+        .neq('payment_method', 'pos');
+
+      if(f?.id && !t?.id) {
+        q = q.eq('from_stop_id', f.id);
+      } else if(!f?.id && t?.id) {
+        q = q.eq('to_stop_id', t.id);
+      }
+      // If both selected, fetch all and filter by range in JS
+
+      const {data, error} = await q;
+      if(error) throw error;
+      let rows:any[] = data || [];
+
+      if(f?.id && t?.id) {
+        const stopOrder: Record<string, number> = {};
+        stops.forEach((s: any, idx: number) => { stopOrder[s.id] = idx; });
+        const fIdx = stopOrder[f.id] ?? -1;
+        const tIdx = stopOrder[t.id] ?? Infinity;
+        const [rangeStart, rangeEnd] = fIdx <= tIdx ? [fIdx, tIdx] : [tIdx, fIdx];
+
+        rows = rows.filter((r: any) => {
+          const fromIdx = stopOrder[r.from_stop_id] ?? -1;
+          const toIdx   = stopOrder[r.to_stop_id]   ?? Infinity;
+          return (
+            (fromIdx >= rangeStart && fromIdx <= rangeEnd) ||
+            (toIdx   >= rangeStart && toIdx   <= rangeEnd) ||
+            (fromIdx <= rangeStart && toIdx   >= rangeEnd)
+          );
+        });
+      }
+
+      // Build per-stop-pair breakdown with stage CODES (not names)
+      const map: Record<string, {ss:string; es:string; from:string; to:string; full_count:number; half_count:number; free_count:number; total_fare:number}> = {};
+      let full = 0, half = 0, free = 0, tickets = 0, collection = 0;
+      for(const r of rows){
+        const cnt = Number(r.ticket_count ?? 1);
+        const pm  = String(r.payment_method ?? '').toLowerCase();
+        const tt  = (r.ticket_type ?? 'full') as string;
+        const unit = Number(r.fare ?? 0);
+        const total = r.total_fare != null ? Number(r.total_fare) : unit * cnt;
+        const fromName = stopMap[r.from_stop_id] ?? 'Unknown';
+        const toName   = stopMap[r.to_stop_id]   ?? 'Unknown';
+        // Use stage codes as keys for consistent merging
+        const ssCode = stageCodeFromName(fromName);
+        const esCode = stageCodeFromName(toName);
+        const k = `${ssCode}|||${esCode}`;
+        if(!map[k]) map[k] = {ss: ssCode, es: esCode, from: fromName, to: toName, full_count:0, half_count:0, free_count:0, total_fare:0};
+        const isFree = pm === 'fr';
+        if(isFree){ map[k].free_count += cnt; free += cnt; }
+        else if(tt === 'half'){ map[k].half_count += cnt; half += cnt; }
+        else { map[k].full_count += cnt; full += cnt; }
+        map[k].total_fare += total;
+        tickets += cnt;
+        collection += total;
+      }
+      const breakdown = Object.values(map);
+      setFiltered({tickets, collection, full, half, free, breakdown});
+    } catch { Alert.alert('Error','Could not filter'); setFiltered(null); }
+    finally { setFiltering(false); }
+  };
+  const selF=(s:any)=>{setFrom(s);setPFrom(false);apply(s,toStop);};
+  const selT=(s:any)=>{setTo(s);setPTo(false);apply(fromStop,s);};
+  const clear=()=>{setFrom(null);setTo(null);setFiltered(null);};
+  const isFilt=!!(fromStop||toStop);
+  const isDN = isDownDirection(direction);
+  const orderedStops = isDN ? [...stops].reverse() : stops;
+  const posTixArr = posTix||[];
+
+  // Filter POS tickets by range (same flexible matching)
+  const matchedPOS = isFilt
+    ? posTixArr.filter((t:any)=>{
+        const tFromName = englishStop(t.from_stop).toLowerCase().trim();
+        const tToName   = englishStop(t.to_stop).toLowerCase().trim();
+        const selFromName = fromStop ? englishStop(fromStop.name).toLowerCase().trim() : null;
+        const selToName   = toStop   ? englishStop(toStop.name).toLowerCase().trim()   : null;
+
+        if (fromStop && toStop) {
+          const stopOrder: Record<string, number> = {};
+          orderedStops.forEach((s: any, idx: number) => {
+            const sName = englishStop(s.name).toLowerCase().trim();
+            stopOrder[sName] = idx;
+          });
+          const fIdx = stopOrder[selFromName!] ?? -1;
+          const tIdx = stopOrder[selToName!]   ?? Infinity;
+          const [rangeStart, rangeEnd] = fIdx <= tIdx ? [fIdx, tIdx] : [tIdx, fIdx];
+          const ticketFromIdx = stopOrder[tFromName] ?? -1;
+          const ticketToIdx   = stopOrder[tToName]   ?? Infinity;
+          return (
+            (ticketFromIdx >= rangeStart && ticketFromIdx <= rangeEnd) ||
+            (ticketToIdx   >= rangeStart && ticketToIdx   <= rangeEnd) ||
+            (ticketFromIdx <= rangeStart && ticketToIdx   >= rangeEnd)
+          );
+        }
+        const fromOk = !selFromName || tFromName.includes(selFromName) || selFromName.includes(tFromName);
+        const toOk   = !selToName   || tToName.includes(selToName)     || selToName.includes(tToName);
+        return fromOk && toOk;
+      })
+    : posTixArr;
+
+  // Filter app breakdown by range when both stops selected
+  const matchedAppBreakdown: any[] = isFilt && filtered
+    ? (filtered.breakdown ?? [])
+    : (appBreakdown ?? []);
+
+  // Combined rows merge app + POS with stage numbers
+  const combinedRows = isFilt && !filtering
+    ? buildCombinedStageRows(filtered?.breakdown ?? [], matchedPOS)
+    : buildCombinedStageRows(appBreakdown ?? [], posTixArr);
+
+  const posStageCnt = matchedPOS.reduce((s:number,t:any)=>s+t.ticket_count,0);
+  const posStageAmt = matchedPOS.reduce((s:number,t:any)=>s+t.fare,0);
+  const appTix = isFilt ? (filtered?.tickets ?? 0) : baseTickets;
+  const appCol = isFilt ? (filtered?.collection ?? 0) : baseCollection;
+  const dTix = appTix + posStageCnt;
+  const dCol = appCol + posStageAmt;
+
+  // Combined F/H totals for display (app + POS merged)
+  const dF = combinedRows.reduce((s, r) => s + r.f, 0);
+  const dH = combinedRows.reduce((s, r) => s + r.h, 0);
+  const dFr = isFilt ? (filtered?.free ?? 0) : null;
+
+  const printBreakdown = combinedRows.map(r => ({
+    ss: r.ss, es: r.es,
+    full_count: r.f, half_count: r.h, free_count: r.l,
+    total_fare: r.amt,
+  }));
+
+  return (
+    <View style={sf.wrapper}>
+      <TouchableOpacity style={[sf.toggle,open&&sf.toggleActive]} onPress={()=>setOpen(v=>!v)} activeOpacity={.7}>
+        <BarChart3 size={14} color={open?'#fff':'#00b7f3'}/><Text style={[sf.toggleText,open&&{color:'#fff'}]}>Stage Filter</Text>
+        {isFilt&&<View style={sf.activeDot}/>}<Text style={{fontSize:12,color:open?'#fff':'#00b7f3'}}>{open?'▲':'▼'}</Text>
+      </TouchableOpacity>
+      {open&&(
+        <View style={sf.panel}>
+          <View style={{flexDirection:'row',alignItems:'center',gap:6,marginBottom:8}}>
+            <View style={[sf.dirBadge,{backgroundColor:isDN?'#EDE7F6':'#E3F2FD'}]}>
+              <Text style={[sf.dirBadgeText,{color:isDN?'#7B1FA2':'#1565C0'}]}>{isDN?'↓ DN  STY → CBE':'↑ UP  CBE → STY'}</Text>
+            </View>
+          </View>
+          <View style={sf.statsRow}>
+            <View style={sf.stat}><Ticket size={14} color="#00b7f3"/><Text style={[sf.statVal,{color:'#00b7f3'}]}>{dTix}</Text><Text style={sf.statLabel}>Tickets</Text></View>
+            <View style={sf.statDivider}/>
+            <View style={sf.stat}><DollarSign size={14} color="#4CAF50"/><Text style={[sf.statVal,{color:'#4CAF50'}]}>₹{Number(dCol).toFixed(2)}</Text><Text style={sf.statLabel}>Revenue</Text></View>
+            {posStageCnt>0&&<><View style={sf.statDivider}/><View style={sf.stat}><PrinterIcon size={12} color="#7B1FA2"/><Text style={[sf.statVal,{color:'#7B1FA2',fontSize:13}]}>{posStageCnt}</Text><Text style={sf.statLabel}>POS</Text></View></>}
+            {(dF > 0 || dH > 0) && (
+              <><View style={sf.statDivider}/><View style={sf.stat}><Text style={[sf.statVal,{color:'#1a2332',fontSize:13}]}>{dF}F{dH>0?` · ${dH}H`:''}{dFr&&dFr>0?` · ${dFr}FR`:''}</Text><Text style={sf.statLabel}>Break</Text></View></>
+            )}
+          </View>
+          {loading?<ActivityIndicator size="small" color="#00b7f3" style={{marginVertical:10}}/>:orderedStops.length===0?<Text style={sf.noStops}>No stops yet.</Text>:(
+            <>
+              <View style={sf.pickerRow}>
+                <TouchableOpacity style={[sf.picker,fromStop&&sf.pickerActive]} onPress={()=>{setPFrom(v=>!v);setPTo(false);}}>
+                  <Text style={[sf.pickerText,fromStop&&{color:'#00b7f3',fontWeight:'700'}]} numberOfLines={1}>{fromStop?englishStop(fromStop.name):'From Stage'}</Text>
+                  {fromStop&&<TouchableOpacity onPress={()=>{setFrom(null);apply(null,toStop);}} hitSlop={{top:8,bottom:8,left:8,right:8}}><X size={12} color="#00b7f3"/></TouchableOpacity>}
+                </TouchableOpacity>
+                <Text style={{color:'#ccc',fontSize:16}}>→</Text>
+                <TouchableOpacity style={[sf.picker,toStop&&sf.pickerActive]} onPress={()=>{setPTo(v=>!v);setPFrom(false);}}>
+                  <Text style={[sf.pickerText,toStop&&{color:'#00b7f3',fontWeight:'700'}]} numberOfLines={1}>{toStop?englishStop(toStop.name):'To Stage'}</Text>
+                  {toStop&&<TouchableOpacity onPress={()=>{setTo(null);apply(fromStop,null);}} hitSlop={{top:8,bottom:8,left:8,right:8}}><X size={12} color="#00b7f3"/></TouchableOpacity>}
+                </TouchableOpacity>
+              </View>
+              {pFrom&&<View style={sf.dropdown}><Text style={sf.dropdownLabel}>FROM STAGE  ({isDN?'STY → CBE':'CBE → STY'})</Text><ScrollView style={{maxHeight:160}} nestedScrollEnabled>{orderedStops.map((s:any)=>(<TouchableOpacity key={s.id} style={[sf.dropdownOption,fromStop?.id===s.id&&sf.dropdownOptionActive]} onPress={()=>selF(s)}><View style={{flex:1}}><Text style={sf.dropdownName}>{englishStop(s.name)}</Text><Text style={sf.dropdownSub}>{shortStop(s.name)}</Text></View>{fromStop?.id===s.id&&<CheckCircle size={13} color="#00b7f3"/>}</TouchableOpacity>))}</ScrollView></View>}
+              {pTo&&<View style={sf.dropdown}><Text style={sf.dropdownLabel}>TO STAGE  ({isDN?'STY → CBE':'CBE → STY'})</Text><ScrollView style={{maxHeight:160}} nestedScrollEnabled>{orderedStops.map((s:any)=>(<TouchableOpacity key={s.id} style={[sf.dropdownOption,toStop?.id===s.id&&sf.dropdownOptionActive]} onPress={()=>selT(s)}><View style={{flex:1}}><Text style={sf.dropdownName}>{englishStop(s.name)}</Text><Text style={sf.dropdownSub}>{shortStop(s.name)}</Text></View>{toStop?.id===s.id&&<CheckCircle size={13} color="#00b7f3"/>}</TouchableOpacity>))}</ScrollView></View>}
+              {filtering&&<ActivityIndicator size="small" color="#00b7f3" style={{marginTop:8}}/>}
+              {isFilt&&!filtering&&(
+                <>
+                  <View style={sf.resultBadge}><CheckCircle size={12} color="#4CAF50"/><Text style={sf.resultText} numberOfLines={2}>{dTix} ticket{dTix!==1?'s':''}{fromStop?` from ${englishStop(fromStop.name)}`:''}{toStop?` to ${englishStop(toStop.name)}`:''}{' · '}₹{Number(dCol).toFixed(2)}</Text><TouchableOpacity onPress={clear} style={{marginLeft:4}}><X size={12} color="#888"/></TouchableOpacity></View>
+                  <TouchableOpacity style={sf.printBtn} onPress={()=>onPrint({fromStop,toStop,tickets:dTix,collection:dCol,full:dF,half:dH,free:dFr,breakdown:printBreakdown})}>
+                    <PrinterIcon size={14} color="#fff"/><Text style={sf.printBtnText}>Print Stage Report</Text>
+                  </TouchableOpacity>
+                </>
+              )}
+              {/* Stage table — always show combined rows when open */}
+              {!filtering&&combinedRows.length>0&&(
+                <View style={sf.table}>
+                  <View style={sf.tableHeader}>{['SS','ES','F','H','L','P','AMT'].map((h,i)=><Text key={i} style={[sf.th,i===6&&{flex:1.8,textAlign:'right'}]}>{h}</Text>)}</View>
+                  {combinedRows.map((rb, i) => (
+                    <View key={i} style={[sf.tableRow, i%2===0&&{backgroundColor:'#F7FAFC'}]}>
+                      <Text style={sf.td} numberOfLines={1}>{rb.ss}</Text>
+                      <Text style={sf.td} numberOfLines={1}>{rb.es}</Text>
+                      <Text style={sf.td}>{rb.f > 0 ? rb.f : '-'}</Text>
+                      <Text style={sf.td}>{rb.h > 0 ? rb.h : '-'}</Text>
+                      <Text style={sf.td}>{rb.l > 0 ? rb.l : '0'}</Text>
+                      <Text style={sf.td}>0</Text>
+                      <Text style={[sf.td,{flex:1.8,textAlign:'right',color:'#00b7f3',fontWeight:'700'}]}>₹{Number(rb.amt).toFixed(2)}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+            </>
+          )}
+        </View>
+      )}
+    </View>
+  );
+};
+const sf = StyleSheet.create({
+  wrapper:{marginTop:10,marginBottom:4},toggle:{flexDirection:'row',alignItems:'center',gap:6,alignSelf:'flex-start',paddingHorizontal:12,paddingVertical:7,borderRadius:20,borderWidth:1.5,borderColor:'#00b7f3',backgroundColor:'#F0FAFF',marginBottom:8},
+  toggleActive:{backgroundColor:'#00b7f3',borderColor:'#00b7f3'},toggleText:{fontSize:13,fontWeight:'600',color:'#00b7f3'},activeDot:{width:7,height:7,borderRadius:4,backgroundColor:'#FF5252'},
+  panel:{backgroundColor:'#F0FAFF',borderRadius:12,padding:12,borderWidth:1,borderColor:'#B3E5FC',marginBottom:4},statsRow:{flexDirection:'row',backgroundColor:'#fff',borderRadius:10,padding:10,marginBottom:12,alignItems:'center'},
+  stat:{flex:1,flexDirection:'row',alignItems:'center',justifyContent:'center',gap:4},statVal:{fontSize:14,fontWeight:'800'},statLabel:{fontSize:10,color:'#888'},statDivider:{width:1,backgroundColor:'#e0e0e0',height:22,marginHorizontal:4},
+  noStops:{fontSize:12,color:'#aaa',textAlign:'center',paddingVertical:8,fontStyle:'italic'},pickerRow:{flexDirection:'row',alignItems:'center',gap:8},
+  picker:{flex:1,flexDirection:'row',alignItems:'center',gap:6,backgroundColor:'#fff',borderRadius:10,paddingHorizontal:10,paddingVertical:9,borderWidth:1.5,borderColor:'#ddd'},pickerActive:{borderColor:'#00b7f3',backgroundColor:'#E8F7FF'},pickerText:{fontSize:13,color:'#aaa',flex:1},
+  dropdown:{backgroundColor:'#fff',borderRadius:10,marginTop:8,borderWidth:1,borderColor:'#e0e0e0',overflow:'hidden'},dropdownLabel:{fontSize:10,fontWeight:'700',color:'#888',letterSpacing:.5,paddingHorizontal:12,paddingTop:8,paddingBottom:4},
+  dropdownOption:{flexDirection:'row',alignItems:'center',gap:10,paddingVertical:9,paddingHorizontal:12,borderBottomWidth:1,borderBottomColor:'#F0F4F8'},dropdownOptionActive:{backgroundColor:'#E8F7FF'},dropdownName:{fontSize:13,color:'#1a2332',fontWeight:'600'},dropdownSub:{fontSize:11,color:'#888',marginTop:1},
+  resultBadge:{flexDirection:'row',alignItems:'center',gap:5,marginTop:8,backgroundColor:'#E8F5E9',paddingHorizontal:10,paddingVertical:5,borderRadius:8,alignSelf:'flex-start',flexShrink:1},resultText:{fontSize:11,color:'#2E7D32',fontWeight:'600',flexShrink:1},
+  printBtn:{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:6,marginTop:8,backgroundColor:'#00b7f3',paddingVertical:9,paddingHorizontal:14,borderRadius:10},printBtnText:{color:'#fff',fontSize:13,fontWeight:'700'},
+  dirBadge:{paddingHorizontal:10,paddingVertical:4,borderRadius:10,alignSelf:'flex-start'},dirBadgeText:{fontSize:11,fontWeight:'700'},
+  table:{marginTop:10,borderRadius:8,overflow:'hidden'},
+  tableHeader:{flexDirection:'row',backgroundColor:'#1a2332',paddingVertical:7,paddingHorizontal:8},
+  th:{flex:1,fontSize:10,fontWeight:'700',color:'#fff',textAlign:'center'},
+  tableRow:{flexDirection:'row',paddingVertical:7,paddingHorizontal:8},
+  td:{flex:1,fontSize:11,color:'#333',textAlign:'center'},
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TAB 4 — Report
+// ─────────────────────────────────────────────────────────────────────────────
+
+const TripReportSection = ({dashboard, posHook}: {dashboard:any; posHook:ReturnType<typeof usePOSTickets>}) => {
+  const [reportTrip,setReportTrip] = useState<any>(null);
+  const [report,setReport] = useState<any>(null);
+  const [appTrip,setAppTrip] = useState<any>(null);
+  const [loading,setLoading] = useState(false);
+  const [printing,setPrinting] = useState(false);
+
+  const recentTrips = dashboard?.recent_trips ?? [];
+  const at = dashboard?.active_trip;
+
+  useEffect(()=>{
+    const id = reportTrip;
+    if(!id){ setReport(null); setAppTrip(null); return; }
+    setReport(null); setAppTrip(null);
+    (async()=>{
+      setLoading(true);
+      try{
+        const r=await api.get(`/conductor/trip/${id}/report`);
+        setReport(r.data);
+      } catch{ Alert.alert('Error','Could not load report'); }
+
+      try{
+        const {data:rows, error} = await supabase.from('tickets').select('ticket_type,payment_method,ticket_count,total_fare,fare,from_stop_id,to_stop_id,luggage_amount').eq('trip_id', id).neq('payment_method', 'pos');
+        if(error) throw error;
+        const appRows:any[] = rows || [];
+        const stopIds = [...new Set(appRows.flatMap(r => [r.from_stop_id, r.to_stop_id]).filter(Boolean))];
+        const stopMap: Record<string,string> = {};
+        if(stopIds.length){
+          const {data:stops, error:stopErr} = await supabase.from('stops').select('id, stop_name').in('id', stopIds);
+          if(!stopErr){ (stops || []).forEach((s:any)=>{ stopMap[String(s.id)] = s.stop_name; }); }
+        }
+        // Build breakdown with stage codes as keys
+        const map: Record<string,any> = {};
+        let full=0,half=0,free=0,tickets=0,collection=0,luggage=0,luggageCount=0;
+        for(const r of appRows){
+          const cnt=Number(r.ticket_count??1), pm=String(r.payment_method??'').toLowerCase(), tt=(r.ticket_type??'full') as string;
+          const hasLuggage=Number(r.luggage_amount??0)>0, passengerCnt=Math.max(0,cnt-(hasLuggage?1:0));
+          luggage+=Number(r.luggage_amount??0); if(hasLuggage) luggageCount+=1;
+          const unit=Number(r.fare??0), total=r.total_fare!=null?Number(r.total_fare):unit*cnt;
+          const fromName=stopMap[String(r.from_stop_id)]??'Unknown', toName=stopMap[String(r.to_stop_id)]??'Unknown';
+          // Use stage codes as map keys so they merge correctly with POS
+          const ssCode = stageCodeFromName(fromName);
+          const esCode = stageCodeFromName(toName);
+          const k=`${ssCode}|||${esCode}`;
+          if(!map[k]) map[k]={from:fromName,to:toName,full_count:0,half_count:0,free_count:0,total_fare:0};
+          const isFree=pm==='fr';
+          if(isFree){map[k].free_count+=passengerCnt;free+=passengerCnt;}
+          else if(tt==='half'){map[k].half_count+=passengerCnt;half+=passengerCnt;}
+          else{map[k].full_count+=passengerCnt;full+=passengerCnt;}
+          map[k].total_fare+=total; tickets+=cnt; collection+=total;
+        }
+        const breakdown=Object.values(map);
+        setAppTrip({tickets,collection,full,half,free,breakdown,luggage,luggageCount});
+      } catch{
+        setAppTrip({tickets:0,collection:0,full:0,half:0,free:0,breakdown:[],luggage:0,luggageCount:0});
+      } finally{ setLoading(false); }
+    })();
+  },[reportTrip]);
+
+  const tripPOSTix = (posHook?.tickets||[]).filter((t:any)=>t.trip_id===reportTrip);
+  const posLuggageCnt = tripPOSTix.reduce((s:number,t:any)=>s+(Number(t.luggage_amount??0)>0?1:0),0);
+  const appSummary=appTrip||{};
+  const appCollection=Number(appSummary.collection??0), appLuggage=Number(appSummary.luggage??0), appLuggageCnt=Number(appSummary.luggageCount??0);
+  const appFullCnt=Number(appSummary.full??0), appHalfCnt=Number(appSummary.half??0), appFreeCnt=Number(appSummary.free??0);
+
+  // Combined stage rows — app tickets merged into F/H columns alongside POS
+  const combinedStageRows = buildCombinedStageRows(appSummary.breakdown ?? [], tripPOSTix);
+
+  // Grand totals derived from combined rows
+  const grandFull = combinedStageRows.reduce((s, r) => s + r.f, 0);
+  const grandHalf = combinedStageRows.reduce((s, r) => s + r.h, 0);
+  const grandLuggageCnt = combinedStageRows.reduce((s, r) => s + r.l, 0) + appLuggageCnt;
+  const grandCollection = appCollection + tripPOSTix.reduce((s:number,t:any)=>s+t.fare,0);
+  const grandFree = appFreeCnt; // free count tracked separately
+
+  const totalLuggage=appLuggage+tripPOSTix.reduce((s:number,t:any)=>s+Number(t.luggage_amount??0),0);
+
+  // ── TRIP SHEET PRINT ─────────────────────────────────────────────────────
+  const handlePrint = async () => {
+    setPrinting(true);
+    try{
+      const fmt=(n:number)=>n%1===0?`${n}.00`:n.toFixed(2);
+      const busNum=report?.bus_number??tripPOSTix[0]?.bus_number??'N/A';
+      const wayBill=report?.way_bill_number??report?.waybill??report?.way_bill??'—';
+      const tripNum=report?.trip_number??'';
+      const routeName=report?.route_name??'';
+      const now=new Date();
+      const dateStr=now.toLocaleDateString('en-GB',{day:'2-digit',month:'2-digit',year:'2-digit'}).replace(/\//g,'/');
+      const timeStr=now.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',hour12:false});
+      const startTime=report?.start_time ? new Date(report.start_time).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',hour12:false}) : '—';
+
+      const posSortedTix = [...tripPOSTix].filter(t=>t.ticket_number).sort((a,b)=>Number(a.ticket_number)-Number(b.ticket_number));
+      const ticketRangeStr = posSortedTix.length >= 2
+        ? `${posSortedTix[0].ticket_number} - ${posSortedTix[posSortedTix.length-1].ticket_number}`
+        : posSortedTix.length === 1 ? String(posSortedTix[0].ticket_number) : '';
+
+      const p=new Printer(); const ready=await p.checkReady(); if(!ready){setPrinting(false);return;}
+
+      await p.text('SPS - ZYRAP', {textSize:22, align:'CENTER'});
+      await p.text('TRIP SHEET', {textSize:26, align:'CENTER'});
+      await p.text(`${dateStr}  ${timeStr}`, {textSize:18, align:'CENTER'});
+      await p.text(DIVIDER);
+      await p.text(printLR('WAY BILL No.:', wayBill), {textSize:18});
+      await p.text(printLR('BUS NUMBER:', busNum), {textSize:18});
+      await p.text(printLR('MACHINE ID:', 'SPS-POS-01'), {textSize:18});
+      await p.text(DIVIDER);
+      await p.text(`TRIP No. : ${tripNum}`, {textSize:20, align:'CENTER'});
+      await p.text(printLR('BUS START:', `${dateStr} ${startTime}`), {textSize:18});
+      await p.text(`${routeName}`, {textSize:20, align:'CENTER'});
+      if (ticketRangeStr) await p.text(printLR('TICKET No.:', ticketRangeStr), {textSize:18});
+      await p.text(DIVIDER);
+
+      await p.text(printStageRow('SS','ES','F','H','L','P','AMT'), {textSize:18});
+      await p.text(DIVIDER);
+
+      // Combined rows: stage numbers + app+POS merged into F/H
+      for (const row of combinedStageRows) {
+        await p.text(
+          printStageRow(row.ss, row.es, String(row.f||'-'), String(row.h||'-'), String(row.l||0), '0', fmt(row.amt)),
+          {textSize:17}
+        );
+      }
+      if (combinedStageRows.length === 0) await p.text('  (no stage data)', {textSize:17});
+
+      await p.text(DIVIDER);
+      await p.text(printLR('FULL :', String(grandFull)), {textSize:20});
+      if (grandHalf > 0) await p.text(printLR('HALF :', String(grandHalf)), {textSize:20});
+      if (grandFree > 0) await p.text(printLR('FREE :', String(grandFree)), {textSize:20});
+      await p.text(printLR('LUGG :', String(grandLuggageCnt)), {textSize:20});
+      await p.text(DIVIDER);
+      await p.text(printLR('TRP TOTAL Rs.:', fmt(grandCollection)), {textSize:22});
+      await p.text(DIVIDER);
+      await p.text('** Safe Journey **', {align:'CENTER'});
+      await p.finish();
+    } catch(e:any){Alert.alert('Print Error',e.message||'Unknown');}
+    finally{setPrinting(false);}
   };
 
-  const fetchAppTickets=async(tripId:string)=>{
+  const printStageReport = async (data:any) => {
+    try{
+      const fmt=(n:number)=>n%1===0?`${n}`:n.toFixed(2);
+      const p=new Printer(); const ready=await p.checkReady(); if(!ready)return;
+      const fE=data.fromStop?englishStop(data.fromStop.name):'All', tE=data.toStop?englishStop(data.toStop.name):'All';
+      await p.text('SPS - ZYRAP',{textSize:32,align:'CENTER'});
+      await p.text(`${new Date().toLocaleString()}`,{textSize:20});
+      await p.text(DIVIDER);
+      await p.text('STAGE REPORT',{textSize:26,align:'CENTER'});
+      await p.text(DIVIDER);
+      await p.text(`From : ${fE}`);
+      await p.text(`To   : ${tE}`);
+      await p.text(DIVIDER);
+      await p.text(printLR('Tickets:', String(data.tickets)));
+      await p.text(printLR('F:', String(data.full??0)) + '  ' + printLR('H:', String(data.half??0)) + '  FR:' + String(data.free??0));
+      await p.text(printLR('Rs.', fmt(Number(data.collection))),{textSize:32});
+      await p.text(DIVIDER);
+      await p.text('** Safe Journey **',{align:'CENTER'});
+      await p.finish();
+    } catch(e:any){Alert.alert('Print Error',e.message||'Unknown');}
+  };
+
+  return (
+    <View>
+      <View style={rp4.sectionHeader}>
+        <Receipt size={16} color="#1a2332"/>
+        <Text style={rp4.sectionTitle}>Trip Sheet</Text>
+      </View>
+
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{marginBottom:10}}>
+        {at&&(
+          <TouchableOpacity
+            style={[rp4.tripChip, reportTrip===at.trip_id&&rp4.tripChipActive]}
+            onPress={()=>setReportTrip(reportTrip===at.trip_id?null:at.trip_id)}
+          >
+            <Text style={[rp4.tripChipText, reportTrip===at.trip_id&&{color:'#fff'}]}>
+              Active Trip {at.trip_number?`#${at.trip_number}`:''}
+            </Text>
+          </TouchableOpacity>
+        )}
+        {recentTrips.slice(0,10).map((trip:any,i:number)=>(
+          <TouchableOpacity
+            key={trip.trip_id}
+            style={[rp4.tripChip, reportTrip===trip.trip_id&&rp4.tripChipActive]}
+            onPress={()=>setReportTrip(reportTrip===trip.trip_id?null:trip.trip_id)}
+          >
+            <Text style={[rp4.tripChipText, reportTrip===trip.trip_id&&{color:'#fff'}]}>
+              {routeNameForDirection(trip.route_name, trip.direction)?.split(' ')[0]||`Trip ${i+1}`}
+              {trip.trip_number?` #${trip.trip_number}`:''}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
+
+      {!reportTrip&&(
+        <View style={rp4.emptyCard}>
+          <Receipt size={36} color="#ccc"/>
+          <Text style={{fontSize:14,color:'#bbb',marginTop:8}}>Select a trip to view its trip sheet</Text>
+        </View>
+      )}
+
+      {reportTrip&&loading&&<ActivityIndicator size="large" color="#00b7f3" style={{marginVertical:30}}/>}
+
+      {reportTrip&&!loading&&report&&(
+        <View style={rp4.reportCard}>
+          {/* ── Trip Sheet Header Card ── */}
+          <View style={ts.headerBox}>
+            <Text style={ts.headerTitle}>TRIP SHEET</Text>
+            <Text style={ts.headerMeta}>{new Date().toLocaleDateString('en-GB')}  {new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',hour12:false})}</Text>
+          </View>
+
+          <View style={ts.metaGrid}>
+            <View style={ts.metaRow}><Text style={ts.metaKey}>WAY BILL No.</Text><Text style={ts.metaVal}>{report?.way_bill_number??report?.waybill??report?.way_bill??'—'}</Text></View>
+            <View style={ts.metaRow}><Text style={ts.metaKey}>BUS NUMBER</Text><Text style={ts.metaVal}>{report?.bus_number??tripPOSTix[0]?.bus_number??'N/A'}</Text></View>
+            <View style={ts.metaRow}><Text style={ts.metaKey}>TRIP No.</Text><Text style={ts.metaVal}>{report?.trip_number??'—'}</Text></View>
+            <View style={ts.metaRow}><Text style={ts.metaKey}>BUS START</Text><Text style={ts.metaVal}>{formatTime(report?.start_time)}</Text></View>
+            <View style={ts.metaRow}><Text style={ts.metaKey}>ROUTE</Text><Text style={[ts.metaVal,{flex:2}]}>{report?.route_name??'—'}</Text></View>
+            <View style={ts.metaRow}><Text style={ts.metaKey}>STATUS</Text><StatusBadge status={report.status}/></View>
+          </View>
+
+          <View style={{flexDirection:'row',justifyContent:'flex-end',marginBottom:10}}>
+            <TouchableOpacity style={[rp4.printBtn,printing&&{opacity:.6}]} onPress={handlePrint} disabled={printing}>
+              {printing?<ActivityIndicator size="small" color="#fff"/>:<><PrinterIcon size={13} color="#fff"/><Text style={rp4.printBtnText}>Print Trip Sheet</Text></>}
+            </TouchableOpacity>
+          </View>
+
+          {/* Stage Table — stage numbers, app+POS merged into F/H */}
+          {combinedStageRows.length > 0 && (
+            <View style={{marginBottom:12}}>
+              <View style={ts.tableHeader}>
+                {['SS','ES','F','H','L','P','AMT'].map((h,i)=>(
+                  <Text key={i} style={[ts.th, i===6&&{flex:2,textAlign:'right'}]}>{h}</Text>
+                ))}
+              </View>
+              {combinedStageRows.map((rb, i) => (
+                <View key={i} style={[ts.tableRow, i%2===0&&{backgroundColor:'#F7FAFC'}]}>
+                  <Text style={ts.td} numberOfLines={1}>{rb.ss}</Text>
+                  <Text style={ts.td} numberOfLines={1}>{rb.es}</Text>
+                  <Text style={ts.td}>{rb.f > 0 ? rb.f : '-'}</Text>
+                  <Text style={ts.td}>{rb.h > 0 ? rb.h : '-'}</Text>
+                  <Text style={ts.td}>{rb.l > 0 ? rb.l : '0'}</Text>
+                  <Text style={ts.td}>0</Text>
+                  <Text style={[ts.td,{flex:2,textAlign:'right',color:'#00b7f3',fontWeight:'700'}]}>
+                    {Number(rb.amt).toFixed(2)}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          )}
+
+          {/* Totals — app and POS combined, no separate lines */}
+          <View style={ts.totalsBox}>
+            <View style={ts.totalRow}><Text style={ts.totalKey}>FULL</Text><Text style={ts.totalVal}>{grandFull}</Text></View>
+            {grandHalf > 0 && <View style={ts.totalRow}><Text style={ts.totalKey}>HALF</Text><Text style={[ts.totalVal,{color:'#FF9800'}]}>{grandHalf}</Text></View>}
+            {grandFree > 0 && <View style={ts.totalRow}><Text style={ts.totalKey}>FREE</Text><Text style={[ts.totalVal,{color:'#4CAF50'}]}>{grandFree}</Text></View>}
+            <View style={ts.totalRow}><Text style={ts.totalKey}>LUGG</Text><Text style={ts.totalVal}>{grandLuggageCnt}</Text></View>
+            <View style={[ts.totalRow,{borderTopWidth:1,borderTopColor:'#ddd',marginTop:4,paddingTop:6}]}>
+              <Text style={[ts.totalKey,{fontSize:15,fontWeight:'700'}]}>TRP TOTAL Rs.</Text>
+              <Text style={[ts.totalVal,{fontSize:20,color:'#00b7f3',fontWeight:'900'}]}>{grandCollection.toFixed(2)}</Text>
+            </View>
+          </View>
+
+          <StageFilter
+            tripId={reportTrip}
+            baseTickets={appSummary.tickets??0}
+            baseCollection={appSummary.collection??0}
+            posTix={tripPOSTix}
+            direction={report.direction}
+            onPrint={printStageReport}
+            appBreakdown={appSummary.breakdown??[]}
+          />
+        </View>
+      )}
+    </View>
+  );
+};
+
+// Trip Sheet screen styles
+const ts = StyleSheet.create({
+  headerBox:{backgroundColor:'#1a2332',borderRadius:10,padding:12,marginBottom:12,alignItems:'center'},
+  headerTitle:{fontSize:20,fontWeight:'900',color:'#fff',letterSpacing:1},
+  headerMeta:{fontSize:12,color:'#90CAF9',marginTop:4},
+  metaGrid:{backgroundColor:'#F7FAFC',borderRadius:10,padding:10,marginBottom:10},
+  metaRow:{flexDirection:'row',alignItems:'center',paddingVertical:5,borderBottomWidth:1,borderBottomColor:'#EEF2F7'},
+  metaKey:{fontSize:12,color:'#888',fontWeight:'700',width:110,letterSpacing:.3},
+  metaVal:{fontSize:13,color:'#1a2332',fontWeight:'600',flex:1},
+  tableHeader:{flexDirection:'row',backgroundColor:'#1a2332',paddingVertical:8,paddingHorizontal:10,borderRadius:6,marginBottom:2},
+  th:{flex:1,fontSize:11,fontWeight:'800',color:'#fff',textAlign:'center'},
+  tableRow:{flexDirection:'row',paddingVertical:7,paddingHorizontal:10,borderRadius:4},
+  td:{flex:1,fontSize:12,color:'#333',textAlign:'center'},
+  totalsBox:{backgroundColor:'#F0F4F8',borderRadius:10,padding:12,marginTop:4},
+  totalRow:{flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingVertical:4},
+  totalKey:{fontSize:13,color:'#555',fontWeight:'700',letterSpacing:.5},
+  totalVal:{fontSize:16,fontWeight:'800',color:'#1a2332'},
+});
+
+// ── Section 2: Status Report ──────────────────────────────────────────────────
+const StatusReportSection = ({dashboard, posHook}: {dashboard:any; posHook:ReturnType<typeof usePOSTickets>}) => {
+  const [appTickets,setAppTickets] = useState<Record<string,any>>({});
+  const [appLoading,setAppLoading] = useState<Record<string,boolean>>({});
+  const [printingStatus,setPrintingStatus] = useState<string|null>(null);
+  const [expandedTrip,setExpandedTrip] = useState<string|null>(null);
+
+  const recentTrips: any[] = dashboard?.recent_trips ?? [];
+  const posByTrip = posHook.todayByTrip();
+
+  const todayTripIds: string[] = recentTrips.filter((t:any)=>{
+    const today=new Date().toDateString();
+    return t.start_time && new Date(t.start_time).toDateString()===today;
+  }).map((t:any)=>t.trip_id as string);
+
+  const allTripIds = Array.from(new Set([...Object.keys(posByTrip), ...todayTripIds]));
+
+  const backendTrip=(id:string)=>recentTrips.find((t:any)=>t.trip_id===id);
+
+  const fetchAppTickets = async (tripId:string) => {
     if(appTickets[tripId]||appLoading[tripId]) return;
     setAppLoading(p=>({...p,[tripId]:true}));
     try{
       const r=await api.get(`/conductor/trip/${tripId}/report`);
-      setAppTickets(p=>({...p,[tripId]:r.data||{}}));
-    }catch{
-      setAppTickets(p=>({...p,[tripId]:{}}));
-    }finally{
-      setAppLoading(p=>({...p,[tripId]:false}));
+      // Also fetch stop names so we can build stage codes for app tickets
+      const reportData = r.data || {};
+      // Enrich route_breakdown with stage codes
+      const rawBreakdown: any[] = reportData.route_breakdown ?? [];
+      setAppTickets(p=>({...p,[tripId]:reportData}));
     }
+    catch{ setAppTickets(p=>({...p,[tripId]:{}})); }
+    finally{ setAppLoading(p=>({...p,[tripId]:false})); }
   };
 
-  const stats    = dashboard?.today_stats||{};
-  const posByTrip= posHook.todayByTrip();
-  const posSummary = posHook.todaySummary();
-
-  const recentTripIds: string[] = (dashboard?.recent_trips||[])
-    .filter((t:any)=>{
-      const today=new Date().toDateString();
-      return t.start_time && new Date(t.start_time).toDateString()===today;
-    })
-    .map((t:any)=>t.trip_id as string);
-
-  const allTripIds = Array.from(new Set([...Object.keys(posByTrip), ...recentTripIds]));
-
-  const backendTrip=(id:string)=>(dashboard?.recent_trips||[]).find((t:any)=>t.trip_id===id);
-
-  const max = collection?.daily?Math.max(...collection.daily.map((d:any)=>d.collection),1):1;
-
-  const mergedStages=(tripId:string)=>{
-    const posStages    = posHook.stageBreakdown(posByTrip[tripId]||[]);
+  // Combined sorted stage rows for a trip (app + POS merged, stage numbers)
+  const getCombinedRows = (tripId: string) => {
+    const posTix = posByTrip[tripId]||[];
     const appBreakdown = appTickets[tripId]?.route_breakdown||[];
-    const map:Record<string,{from:string;to:string;count:number;fare:number;posCount:number;appCount:number}> = {};
-
-    for(const s of posStages){
-      const k=`${s.from}|||${s.to}`;
-      if(!map[k]) map[k]={from:s.from,to:s.to,count:0,fare:0,posCount:0,appCount:0};
-      map[k].count    += s.count;
-      map[k].fare     += s.fare;
-      map[k].posCount += s.count;
-    }
-    for(const rb of appBreakdown){
-      const f=englishStop(rb.from), t=englishStop(rb.to);
-      const validFrom = f && f !== '?' && f.trim() !== '';
-      const validTo   = t && t !== '?' && t.trim() !== '';
-      if(!validFrom && !validTo) continue;
-      const k=`${f}|||${t}`;
-      if(!map[k]) map[k]={from:f,to:t,count:0,fare:0,posCount:0,appCount:0};
-      const appCnt = (rb.full_count||0)+(rb.half_count||0)+(rb.free_count||0);
-      const appFare= Number(rb.total_fare??rb.revenue??0);
-      map[k].count    += appCnt;
-      map[k].fare     += appFare;
-      map[k].appCount += appCnt;
-    }
-    return Object.values(map).sort((a,b)=>b.fare-a.fare);
+    return buildCombinedStageRows(appBreakdown, posTix);
   };
 
-  // ── Status Report printer (matches the physical receipt format) ─────────────
-  const printStatusReport = async (tripId: string, idx: number) => {
-    if (Platform.OS !== 'android' || !NyxPrinter) {
-      Alert.alert('Notice', 'Printer only on Android.');
-      return;
-    }
+  // ── STATUS REPORT PRINT ─────────────────────────────────────────────────
+  const printStatusReport = async (tripId:string, idx:number) => {
     setPrintingStatus(tripId);
-    try {
-      const ret = await NyxPrinter.getPrinterStatus();
-      if (ret !== PrinterStatus.SDK_OK) {
-        Alert.alert('Printer Error', PrinterStatus.msg(ret));
-        return;
-      }
-
-      const bt         = backendTrip(tripId);
-      const posTix     = posByTrip[tripId] || [];
-      const reportData = appTickets[tripId] || {};
-      const summary    = reportData?.summary;
-
-      const busNum  = posTix[0]?.bus_number ?? bt?.bus_number ?? 'N/A';
-      const wayBill = bt?.way_bill_number ?? bt?.waybill ?? bt?.way_bill ?? '—';
-      const tripNum = bt?.trip_number ?? (idx + 1);
-      const firstT  = posTix[0]?.issued_at ?? bt?.start_time;
-      const dt      = firstT ? new Date(firstT) : new Date();
-      const dateStr = dt.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: '2-digit' }).replace(/\//g, '/');
-      const timeStr = dt.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
-
-      const posTotal   = posTix.reduce((s: number, t: any) => s + t.fare, 0);
-      const posCnt     = posTix.reduce((s: number, t: any) => s + t.ticket_count, 0);
-      const posLuggCnt = posTix.reduce((s:number,t:any)=>s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0),0);
-      const posFullCnt = posTix.filter((t: any) => (t.ticket_type ?? 'full') !== 'half').reduce((s: number, t: any) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
-      const posHalfCnt = posTix.filter((t: any) => t.ticket_type === 'half').reduce((s: number, t: any) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
-
-      const rawBackendTotal = Number(summary?.total_collection ?? bt?.collection ?? 0);
-      const rawBackendFull  = Number(summary?.total_full ?? 0);
-      const rawBackendHalf  = Number(summary?.total_half ?? 0);
-      const rawBackendFree  = Number(summary?.total_free ?? 0);
-      const appTotal        = Math.max(0, rawBackendTotal - posTotal);
-      const appFullCnt      = rawBackendFull;
-      const appHalfCnt      = rawBackendHalf;
-      const appFreeCnt      = rawBackendFree;
-
-      const grandFull  = appFullCnt + posFullCnt;
-      const grandHalf  = appHalfCnt + posHalfCnt;
-      const grandFree  = appFreeCnt;
-      const grandTotal = appTotal + posTotal;
-
-      // cumulative collection: sum all trips up to and including this one (today)
-      const tripsSoFar = allTripIds.slice(0, idx + 1);
-      const totColl = tripsSoFar.reduce((sum, tid) => {
-        const b   = backendTrip(tid);
-        const pTix = posByTrip[tid] || [];
-        const pAmt = pTix.reduce((s: number, t: any) => s + t.fare, 0);
-        const rSummary = appTickets[tid]?.summary;
-        const rTotal   = Number(rSummary?.total_collection ?? b?.collection ?? 0);
-        // app portion = rTotal - pAmt (if backend already includes POS, adjust)
-        const appAmt = Math.max(0, rTotal - pAmt);
-        return sum + appAmt + pAmt;
-      }, 0);
-
-      // Build stage rows: SS ES F H L P AMT
-      // L = luggage tickets
-      // P = pass/free
-      const stages = mergedStages(tripId);
-
-      const fmt = (n: number) => n % 1 === 0 ? `${n}.00` : n.toFixed(2);
-      const col1 = 7, col2 = 7, col3 = 3, col4 = 3, col5 = 3, col6 = 3;
-      const pad = (s: string, w: number) => s.length >= w ? s.slice(0, w) : s + ' '.repeat(w - s.length);
-      const rpad = (s: string, w: number) => s.length >= w ? s.slice(0, w) : ' '.repeat(w - s.length) + s;
-
-      await NyxPrinter.printText('SPS - ZYRAP', { textSize: 22, align: PrintAlign.CENTER });
-      await NyxPrinter.printText('STATUS REPORT', { textSize: 26, align: PrintAlign.CENTER });
-      await NyxPrinter.printText(`BUS No:${busNum} WAY BILL No: ${wayBill}`, { textSize: 18 });
-      await NyxPrinter.printText(`${dateStr}  ${timeStr}`, { textSize: 18, align: PrintAlign.CENTER });
-      await NyxPrinter.printText(`TRIP No. : ${tripNum}`, { textSize: 22, align: PrintAlign.CENTER });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      // Header row
-      await NyxPrinter.printText(
-        `${pad('SS', col1)} ${pad('ES', col2)} ${pad('F', col3)} ${pad('H', col4)} ${pad('L', col5)} ${pad('P', col6)}  AMT`,
-        { textSize: 18 }
-      );
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-
-      // Stage rows
-      for (const s of stages) {
-        const ssLabel = (s.from ?? '').slice(0, col1);
-        const esLabel = (s.to ?? '').slice(0, col2);
-        // F = full tickets for this stage (app full + pos full approximated by ratio)
-        // For simplicity we show combined count in F, 0 in H/L/P
-        // If you track per-stage type you can enhance this
-        const stageF = s.count;
-        const stageH = 0;
-        const stageL = 0;
-        const stageP = 0;
-        const line = `${pad(ssLabel, col1)} ${pad(esLabel, col2)} ${pad(String(stageF), col3)} ${pad(String(stageH), col4)} ${pad(String(stageL), col5)} ${pad(String(stageP), col6)}  ${fmt(s.fare)}`;
-        await NyxPrinter.printText(line, { textSize: 17 });
-      }
-
-      if (stages.length === 0) {
-        await NyxPrinter.printText('  (no stage data)', { textSize: 17 });
-      }
-
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      await NyxPrinter.printText(`FULL : ${grandFull}`, { textSize: 20 });
-      if (grandHalf > 0) await NyxPrinter.printText(`HALF : ${grandHalf}`, { textSize: 20 });
-      if (grandFree > 0) await NyxPrinter.printText(`FREE : ${grandFree}`, { textSize: 20 });
-      await NyxPrinter.printText(`LUGG : ${posLuggCnt}`, { textSize: 20 });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      await NyxPrinter.printText(`TRIP.COLL Rs.:   ${fmt(grandTotal)}`, { textSize: 20 });
-      await NyxPrinter.printText(`TOT.COLL  Rs.:   ${fmt(totColl)}`, { textSize: 20 });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      await NyxPrinter.printText('** Safe Journey **', { align: PrintAlign.CENTER });
-      await NyxPrinter.printEndAutoOut();
-      showToast('Status report printed!');
-    } catch (e: any) {
-      Alert.alert('Print Error', e.message || 'Unknown');
-    } finally {
-      setPrintingStatus(null);
-    }
-  };
-
-  const printDailyReport=async(tripId:string)=>{
-    if(Platform.OS!=='android'||!NyxPrinter){Alert.alert('Notice','Printer only on Android.');return;}
     try{
-      const ret=await NyxPrinter.getPrinterStatus();
-      if(ret!==PrinterStatus.SDK_OK){Alert.alert('Printer Error',PrinterStatus.msg(ret));return;}
+      const bt=backendTrip(tripId);
+      const posTix=posByTrip[tripId]||[];
+      const reportData=appTickets[tripId]||{};
+      const summary=reportData?.summary;
+      const busNum=posTix[0]?.bus_number??bt?.bus_number??'N/A';
+      const wayBill=bt?.way_bill_number??bt?.waybill??bt?.way_bill??'—';
+      const tripNum=bt?.trip_number??(idx+1);
+      const firstT=posTix[0]?.issued_at??bt?.start_time;
+      const dt=firstT?new Date(firstT):new Date();
+      const dateStr=dt.toLocaleDateString('en-GB',{day:'2-digit',month:'2-digit',year:'2-digit'}).replace(/\//g,'/');
+      const timeStr=dt.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',hour12:false});
+      const posTotal=posTix.reduce((s:number,t:any)=>s+t.fare,0);
+      const posLuggCnt=posTix.reduce((s:number,t:any)=>s+(Number(t.luggage_amount??0)>0?1:0),0);
+      const rawBackendTotal=Number(summary?.total_collection??bt?.collection??0);
+      const appTotal=Math.max(0,rawBackendTotal-posTotal);
+      const appFreeCnt=Number(summary?.total_free??0);
+      const grandTotal=appTotal+posTotal;
 
-      const bt      = backendTrip(tripId);
-      const posTix  = posByTrip[tripId]||[];
-      const stages  = mergedStages(tripId);
+      // Combined sorted stage rows
+      const stages = getCombinedRows(tripId);
+      const grandFull = stages.reduce((s, r) => s + r.f, 0);
+      const grandHalf = stages.reduce((s, r) => s + r.h, 0);
 
-      const posTotal = posTix.reduce((s,t)=>s+t.fare,0);
-      const posCnt   = posTix.reduce((s,t)=>s+t.ticket_count,0);
-      const posLuggCnt = posTix.reduce((s:number,t:any)=>s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0),0);
+      const tripsSoFar=allTripIds.slice(0,idx+1);
+      const totColl=tripsSoFar.reduce((sum,tid)=>{
+        const b=backendTrip(tid), pTix=posByTrip[tid]||[], pAmt=pTix.reduce((s:number,t:any)=>s+t.fare,0);
+        const rSum=appTickets[tid]?.summary, rTot=Number(rSum?.total_collection??b?.collection??0);
+        return sum+Math.max(0,rTot-pAmt)+pAmt;
+      },0);
 
-      const reportSummary = appTickets[tripId]?.summary;
-      const rawBackendTotal = Number(reportSummary?.total_collection ?? bt?.collection ?? 0);
-      const rawBackendRows  = Number(reportSummary
-        ? ((reportSummary.total_full||0)+(reportSummary.total_half||0)+(reportSummary.total_free||0))
-        : (bt?.tickets_sold || 0));
-      const appTotal = Math.max(0, rawBackendTotal - posTotal);
-      const appCnt   = Math.max(0, rawBackendRows  - posTix.length);
+      const fmt=(n:number)=>n%1===0?`${n}.00`:n.toFixed(2);
 
-      const grandTotal = posTotal + appTotal;
-      const grandCnt   = posCnt   + appCnt;
+      const p=new Printer(); const ready=await p.checkReady(); if(!ready){setPrintingStatus(null);return;}
 
-      const busNum = posTix[0]?.bus_number ?? bt?.bus_number ?? 'N/A';
-      const dir    = posTix[0]?.direction  ?? bt?.direction  ?? '';
-      const today  = new Date().toLocaleDateString('en-GB').replace(/\//g,'-');
-      const fmt    = (n:number)=>n%1===0?`${n}`:n.toFixed(2);
+      await p.text('SPS - ZYRAP', {textSize:22, align:'CENTER'});
+      await p.text('STATUS REPORT', {textSize:26, align:'CENTER'});
+      await p.text(printLR(`BUS:${busNum}`, `WB:${wayBill}`), {textSize:18});
+      await p.text(`${dateStr}  ${timeStr}`, {textSize:18, align:'CENTER'});
+      await p.text(`TRIP No. : ${tripNum}`, {textSize:22, align:'CENTER'});
+      await p.text(DIVIDER);
 
-      await NyxPrinter.printText('SPS - ZYRAP',{textSize:28,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('DAILY TRIP REPORT',{textSize:22,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`Date : ${today}\nBus  : ${busNum}\nDir  : ${dir.toUpperCase()}`,{textSize:20});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`App Tickets : ${appCnt}   Rs.${fmt(appTotal)}`,{textSize:18});
-      await NyxPrinter.printText(`POS Tickets : ${posCnt} (L:${posLuggCnt})   Rs.${fmt(posTotal)}`,{textSize:18});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`Total : ${grandCnt} tickets`,{textSize:20});
-      await NyxPrinter.printText(`Rs. ${fmt(grandTotal)}`,{textSize:32,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      if(stages.length>0){
-        await NyxPrinter.printText('Stage-wise Collection:',{textSize:20});
-        for(const s of stages){
-          await NyxPrinter.printText(
-            `${s.from} -> ${s.to}\n  Tickets: ${s.count}   Rs.${fmt(s.fare)}`,
-            {textSize:18},
-          );
-          await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});
-        }
+      await p.text(printStageRow('SS','ES','F','H','L','P','AMT'), {textSize:18});
+      await p.text(DIVIDER);
+
+      // Combined stage rows with stage numbers, app+POS merged
+      for (const s of stages) {
+        await p.text(
+          printStageRow(s.ss, s.es, String(s.f||'-'), String(s.h||'-'), String(s.l||0), '0', fmt(s.amt)),
+          {textSize:17}
+        );
       }
-      await NyxPrinter.printText('** End of Report **',{align:PrintAlign.CENTER});
-      await NyxPrinter.printEndAutoOut();
-      showToast('Daily report printed!');
-    }catch(e:any){Alert.alert('Print Error',e.message||'Unknown');}
-  };
+      if (stages.length === 0) await p.text('  (no stage data)', {textSize:17});
 
-  const appOnlyCollection = Math.max(0, (stats.total_collection||0) - posSummary.total);
-  const appOnlyTickets    = Math.max(0, (stats.tickets_sold||0)    - posSummary.rows);
-  const grandTodayTotal   = appOnlyCollection + posSummary.total;
-  const grandTodayTickets = appOnlyTickets    + posSummary.count;
+      await p.text(DIVIDER);
+      await p.text(printLR('FULL :', String(grandFull)), {textSize:20});
+      if (grandHalf > 0) await p.text(printLR('HALF :', String(grandHalf)), {textSize:20});
+      if (appFreeCnt > 0) await p.text(printLR('FREE :', String(appFreeCnt)), {textSize:20});
+      await p.text(printLR('LUGG :', String(posLuggCnt)), {textSize:20});
+      await p.text(DIVIDER);
+      await p.text(printLR('TRIP.COLL Rs.:', fmt(grandTotal)), {textSize:20});
+      await p.text(printLR('TOT.COLL  Rs.:', fmt(totColl)), {textSize:20});
+      await p.text(DIVIDER);
+      await p.text('** Safe Journey **', {align:'CENTER'});
+      await p.finish();
+    } catch(e:any){Alert.alert('Print Error',e.message||'Unknown');}
+    finally{setPrintingStatus(null);}
+  };
 
   return (
-    <ScrollView style={{flex:1}} contentContainerStyle={{padding:16,paddingBottom:40}} showsVerticalScrollIndicator={false}>
-
-      {user&&(
-        <View style={sh.conductorCard}>
-          <View style={sh.conductorAvatar}><BadgeCheck size={26} color="#00b7f3"/></View>
-          <View>
-            <Text style={{fontSize:16,fontWeight:'700',color:'#1a2332'}}>{user.name||'Conductor'}</Text>
-            <Text style={{fontSize:12,color:'#888',marginTop:2}}>ID: {user.conductor_id||user.id}{dashboard?.bus?` · 🚌 ${dashboard.bus.vehicle_number}`:''}</Text>
-          </View>
-        </View>
-      )}
-
-      <Text style={sh.sectionTitle}>Today's Stats</Text>
-      <View style={sh.statsGrid}>
-        {[
-          {Icon:Bus,       label:'Trips',       val:stats.trips_completed??0,      color:'#9C27B0'},
-          {Icon:Ticket,    label:'App Tickets',  val:appOnlyTickets,                color:'#00b7f3'},
-          {Icon:Printer,   label:'POS Tickets',  val:posSummary.count,             color:'#7B1FA2'},
-          {Icon:TrendingUp,label:'Collection',   val:`₹${grandTodayTotal.toFixed(0)}`, color:'#4CAF50'},
-        ].map(i=>(
-          <View key={i.label} style={sh.statCard}>
-            <View style={[sh.statIconBg,{backgroundColor:i.color+'18'}]}><i.Icon size={20} color={i.color}/></View>
-            <Text style={[sh.statVal,{color:i.color}]}>{i.val}</Text>
-            <Text style={sh.statLabel}>{i.label}</Text>
-          </View>
-        ))}
+    <View>
+      <View style={rp4.sectionHeader}>
+        <BarChart3 size={16} color="#1a2332"/>
+        <Text style={rp4.sectionTitle}>Status Report</Text>
       </View>
 
-      {posSummary.count > 0 && (
-        <View style={rp.posSummaryRow}>
-          <View style={rp.posSummaryChip}>
-            <Printer size={11} color="#7B1FA2"/>
-            <Text style={rp.posSummaryText}>
-              POS: {posSummary.count} ({posSummary.full}F{posSummary.half>0?` · ${posSummary.half}H`:''}{(posSummary as any).luggage>0?` · ${(posSummary as any).luggage}L`:''}) · ₹{posSummary.total.toFixed(0)}
-            </Text>
-          </View>
-          <View style={rp.appSummaryChip}>
-            <Users size={11} color="#00b7f3"/>
-            <Text style={rp.appSummaryText}>App: {appOnlyTickets} tickets · ₹{appOnlyCollection.toFixed(0)}</Text>
-          </View>
+      {allTripIds.length===0&&(
+        <View style={rp4.emptyCard}>
+          <BarChart3 size={36} color="#ccc"/>
+          <Text style={{fontSize:14,color:'#bbb',marginTop:8}}>No trips today</Text>
         </View>
       )}
 
-      {allTripIds.length > 0 && (
-        <View style={{marginTop:20}}>
-          <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
-            <Text style={sh.sectionTitle}>Daily Report</Text>
-            <View style={rp.totalPill}>
-              <Text style={rp.totalPillText}>₹{grandTodayTotal.toFixed(0)} · {grandTodayTickets} tickets</Text>
-            </View>
-          </View>
+      {allTripIds.map((tripId,idx)=>{
+        const bt=backendTrip(tripId);
+        const posTix=posByTrip[tripId]||[];
+        const posTotal=posTix.reduce((s:number,t:any)=>s+t.fare,0);
+        const posCnt=posTix.reduce((s:number,t:any)=>s+t.ticket_count,0);
+        const reportData=appTickets[tripId]||{};
+        const summary=reportData?.summary;
+        const rawBackendTotal=Number(summary?.total_collection??bt?.collection??0);
+        const appTotal=Math.max(0,rawBackendTotal-posTotal);
+        const grandTotal=posTotal+appTotal;
+        const busNum=posTix[0]?.bus_number??bt?.bus_number??'N/A';
+        const dir=posTix[0]?.direction??bt?.direction??'';
+        const tripNum=bt?.trip_number??(idx+1);
+        const firstT=posTix[0]?.issued_at??bt?.start_time;
+        const wayBill=bt?.way_bill_number??bt?.waybill??bt?.way_bill??'—';
+        const isOpen=expandedTrip===tripId;
 
-          {allTripIds.map((tripId, idx) => {
-            const bt       = backendTrip(tripId);
-            const posTix   = posByTrip[tripId]||[];
-            const posTotal = posTix.reduce((s,t)=>s+t.fare,0);
-            const posCnt   = posTix.reduce((s,t)=>s+t.ticket_count,0);
+        const appFreeCnt=Number(summary?.total_free??0);
+        const posLuggCnt=posTix.reduce((s:number,t:any)=>s+(Number(t.luggage_amount??0)>0?1:0),0);
 
-            const reportSummary = appTickets[tripId]?.summary;
-            const rawBackendTotal = Number(reportSummary?.total_collection ?? bt?.collection ?? 0);
-            const rawBackendRows  = Number(reportSummary
-              ? ((reportSummary.total_full||0)+(reportSummary.total_half||0)+(reportSummary.total_free||0))
-              : (bt?.tickets_sold || 0));
-            const appTotal = Math.max(0, rawBackendTotal - posTotal);
-            const appCnt   = Math.max(0, rawBackendRows  - posTix.length);
+        // Combined stage rows (used in expanded view + for grand totals)
+        const combinedRows = isOpen ? getCombinedRows(tripId) : [];
+        const grandFull = isOpen ? combinedRows.reduce((s, r) => s + r.f, 0) : 0;
+        const grandHalf = isOpen ? combinedRows.reduce((s, r) => s + r.h, 0) : 0;
 
-            const grandTotal = posTotal + appTotal;
-            const grandCnt   = posCnt   + appCnt;
-            const busNum   = posTix[0]?.bus_number??bt?.bus_number??'N/A';
-            const dir      = posTix[0]?.direction??bt?.direction??'';
-            const firstT   = posTix[0]?.issued_at??bt?.start_time;
-            const isOpen   = expandedTrip===tripId;
-            const stages   = isOpen ? mergedStages(tripId) : [];
-            const isLoadingApp = appLoading[tripId];
+        const tripsSoFar=allTripIds.slice(0,idx+1);
+        const totColl=tripsSoFar.reduce((sum,tid)=>{
+          const b=backendTrip(tid), pTix=posByTrip[tid]||[], pAmt=pTix.reduce((s:number,t:any)=>s+t.fare,0);
+          const rSum=appTickets[tid]?.summary, rTot=Number(rSum?.total_collection??b?.collection??0);
+          return sum+Math.max(0,rTot-pAmt)+pAmt;
+        },0);
 
-            // per-trip grand full/half for status report display
-            const reportData  = appTickets[tripId] || {};
-            const summary     = reportData?.summary;
-            const appFullCnt  = Number(summary?.total_full ?? 0);
-            const appHalfCnt  = Number(summary?.total_half ?? 0);
-            const appFreeCnt  = Number(summary?.total_free ?? 0);
-            const posLuggCnt  = posTix.reduce((s:number,t:any)=>s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0),0);
-            const posFullCnt  = posTix.filter((t:any)=>(t.ticket_type??'full')!=='half').reduce((s:number,t:any)=>s+Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)),0);
-            const posHalfCnt  = posTix.filter((t:any)=>t.ticket_type==='half').reduce((s:number,t:any)=>s+Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)),0);
-            const posLuggage = posTix.reduce((s:number,t:any)=>s+Number(t.luggage_amount ?? 0),0);
-            const grandFull   = appFullCnt + posFullCnt;
-            const grandHalf   = appHalfCnt + posHalfCnt;
-            const grandFree   = appFreeCnt;
-            const tripNum     = bt?.trip_number ?? (idx + 1);
-            const wayBill     = bt?.way_bill_number ?? bt?.waybill ?? bt?.way_bill ?? '—';
+        // For collapsed view: use summary data from API
+        const collapsedFull = Number(summary?.total_full??0) + posTix.filter((t:any)=>(t.ticket_type??'full')!=='half').reduce((s:number,t:any)=>s+Math.max(0,t.ticket_count-(Number(t.luggage_amount??0)>0?1:0)),0);
+        const collapsedHalf = Number(summary?.total_half??0) + posTix.filter((t:any)=>t.ticket_type==='half').reduce((s:number,t:any)=>s+Math.max(0,t.ticket_count-(Number(t.luggage_amount??0)>0?1:0)),0);
 
-            // cumulative collection up to this trip
-            const tripsSoFar  = allTripIds.slice(0, idx + 1);
-            const totColl     = tripsSoFar.reduce((sum, tid) => {
-              const b    = backendTrip(tid);
-              const pTix = posByTrip[tid] || [];
-              const pAmt = pTix.reduce((s: number, t: any) => s + t.fare, 0);
-              const rSum = appTickets[tid]?.summary;
-              const rTot = Number(rSum?.total_collection ?? b?.collection ?? 0);
-              return sum + Math.max(0, rTot - pAmt) + pAmt;
-            }, 0);
-
-            return (
-              <View key={tripId} style={rp.tripCard}>
-                {/* ── Trip header (tap to expand) ── */}
-                <TouchableOpacity style={rp.tripHeader} onPress={()=>{
-                  const next=isOpen?null:tripId;
-                  setExpandedTrip(next);
-                  if(next) fetchAppTickets(next);
-                }} activeOpacity={.7}>
-                  <View style={rp.tripLeft}>
-                    <View style={rp.tripBadge}><Text style={rp.tripBadgeText}>{idx+1}</Text></View>
-                    <View>
-                      <Text style={rp.tripTitle}>
-                        {bt?.route_name ? `${bt.route_name} · ` : ''}{dir.toUpperCase()}  🚌 {busNum}
-                      </Text>
-                      <Text style={rp.tripMeta}>
-                        {firstT?formatTime(firstT):''} · {grandCnt} ticket{grandCnt!==1?'s':''}
-                        {posCnt>0?`  (${posCnt} POS + ${appCnt} App)`:''}
-                      </Text>
-                      {posLuggage>0&&<Text style={[rp.tripMeta,{marginTop:2,color:'#6A1B9A'}]}>Luggage: ₹{posLuggage.toFixed(0)}</Text>}
-                    </View>
-                  </View>
-                  <View style={{alignItems:'flex-end',gap:4}}>
-                    <Text style={rp.tripAmt}>₹{grandTotal.toFixed(0)}</Text>
-                    <Text style={{fontSize:12,color:'#aaa'}}>{isOpen?'▲':'▼ stages'}</Text>
-                  </View>
+        return (
+          <View key={tripId} style={rp4.statusCard}>
+            <View style={rp4.statusCardHeader}>
+              <View style={{flex:1}}>
+                <Text style={rp4.statusCardTitle}>BUS: {busNum}  ·  TRIP #{tripNum}</Text>
+                <Text style={rp4.statusCardMeta}>WB: {wayBill}  ·  {dir.toUpperCase()}  ·  {firstT?formatTime(firstT):'—'}</Text>
+              </View>
+              <View style={{alignItems:'flex-end',gap:4}}>
+                <Text style={rp4.statusCardAmt}>₹{grandTotal.toFixed(2)}</Text>
+                <TouchableOpacity
+                  style={[rp4.expandBtn]}
+                  onPress={()=>{
+                    const next=isOpen?null:tripId;
+                    setExpandedTrip(next);
+                    if(next) fetchAppTickets(next);
+                  }}
+                >
+                  <Text style={{fontSize:11,color:'#00b7f3',fontWeight:'700'}}>{isOpen?'▲ Less':'▼ Detail'}</Text>
                 </TouchableOpacity>
+              </View>
+            </View>
 
-                {isOpen&&(
-                  <View style={rp.stageWrap}>
-                    {/* ── Legend chips ── */}
-                    <View style={{flexDirection:'row',gap:8,marginBottom:8}}>
-                      {appCnt>0&&<View style={rp.legendChip}><Users size={10} color="#00b7f3"/><Text style={[rp.legendText,{color:'#00b7f3'}]}>App: {appCnt} · ₹{appTotal.toFixed(0)}</Text></View>}
-                      {posCnt>0&&<View style={[rp.legendChip,{backgroundColor:'#EDE7F6',borderColor:'#CE93D8'}]}><Printer size={10} color="#7B1FA2"/><Text style={[rp.legendText,{color:'#7B1FA2'}]}>POS: {posCnt} ({posLuggCnt>0?`L:${posLuggCnt}`:'L:0'}) · ₹{posTotal.toFixed(0)}</Text></View>}
+            <View style={rp4.srCountsRow}>
+              <View style={rp4.srCountChip}><Text style={rp4.srCountLabel}>FULL</Text><Text style={[rp4.srCountVal,{color:'#1a2332'}]}>{collapsedFull}</Text></View>
+              {collapsedHalf>0&&<View style={rp4.srCountChip}><Text style={rp4.srCountLabel}>HALF</Text><Text style={[rp4.srCountVal,{color:'#E65100'}]}>{collapsedHalf}</Text></View>}
+              {appFreeCnt>0&&<View style={rp4.srCountChip}><Text style={rp4.srCountLabel}>FREE</Text><Text style={[rp4.srCountVal,{color:'#4CAF50'}]}>{appFreeCnt}</Text></View>}
+              <View style={rp4.srCountChip}><Text style={rp4.srCountLabel}>LUGG</Text><Text style={[rp4.srCountVal,{color:'#888'}]}>{posLuggCnt}</Text></View>
+            </View>
+
+            <View style={rp4.srCollRow}>
+              <View style={{flex:1}}><Text style={rp4.srCollLabel}>TRIP.COLL Rs.</Text><Text style={rp4.srCollVal}>₹{grandTotal.toFixed(2)}</Text></View>
+              <View style={rp4.srCollDivider}/>
+              <View style={{flex:1,alignItems:'flex-end'}}><Text style={rp4.srCollLabel}>TOT.COLL Rs.</Text><Text style={[rp4.srCollVal,{color:'#00b7f3'}]}>₹{totColl.toFixed(2)}</Text></View>
+            </View>
+
+            {isOpen&&(
+              <View style={{padding:10,borderTopWidth:1,borderTopColor:'#e0e0e0'}}>
+                {appLoading[tripId]?(
+                  <ActivityIndicator size="small" color="#1a2332" style={{marginVertical:8}}/>
+                ):(
+                  <>
+                    {/* Combined stage table — stage numbers, app+POS in same F/H columns */}
+                    <View style={rp4.srTableHdr}>
+                      {['SS','ES','F','H','L','P','AMT'].map((h,i)=><Text key={i} style={[rp4.srTh,i===6&&{flex:2,textAlign:'right'}]}>{h}</Text>)}
                     </View>
-
-                    {/* ── Stage table ── */}
-                    {isLoadingApp?(
-                      <ActivityIndicator size="small" color="#00b7f3" style={{marginVertical:8}}/>
-                    ):(
-                      <>
-                        <View style={rp.stageHdr}>
-                          {['From','To','Count','Amount'].map(h=><Text key={h} style={rp.stageTh}>{h}</Text>)}
-                        </View>
-                        {stages.map((s,i)=>(
-                          <View key={i} style={[rp.stageTr,i%2===0&&{backgroundColor:'#fff'}]}>
-                            <Text style={rp.stageTd} numberOfLines={1}>{s.from}</Text>
-                            <Text style={rp.stageTd} numberOfLines={1}>{s.to}</Text>
-                            <Text style={rp.stageTd}>{s.count}</Text>
-                            <Text style={[rp.stageTd,{color:'#00b7f3',fontWeight:'700'}]}>₹{s.fare.toFixed(0)}</Text>
-                          </View>
-                        ))}
-                        {stages.length===0&&<Text style={{fontSize:12,color:'#aaa',textAlign:'center',paddingVertical:8}}>No stage data yet</Text>}
-                      </>
+                    {combinedRows.map((s,i)=>(
+                      <View key={i} style={[rp4.srTr, i%2===0&&{backgroundColor:'#F0F4F8'}]}>
+                        <Text style={rp4.srTd} numberOfLines={1}>{s.ss}</Text>
+                        <Text style={rp4.srTd} numberOfLines={1}>{s.es}</Text>
+                        <Text style={rp4.srTd}>{s.f > 0 ? s.f : '-'}</Text>
+                        <Text style={rp4.srTd}>{s.h > 0 ? s.h : '-'}</Text>
+                        <Text style={rp4.srTd}>{s.l > 0 ? s.l : '0'}</Text>
+                        <Text style={rp4.srTd}>0</Text>
+                        <Text style={[rp4.srTd,{flex:2,textAlign:'right',fontWeight:'700'}]}>{s.amt.toFixed(2)}</Text>
+                      </View>
+                    ))}
+                    {combinedRows.length===0&&<Text style={{fontSize:11,color:'#aaa',textAlign:'center',paddingVertical:6}}>No stage data</Text>}
+                    {/* Grand totals from combined rows */}
+                    {(grandFull > 0 || grandHalf > 0) && (
+                      <View style={{flexDirection:'row',gap:12,paddingTop:6,marginTop:4,borderTopWidth:1,borderTopColor:'#e0e0e0'}}>
+                        <Text style={{fontSize:11,color:'#1a2332',fontWeight:'700'}}>F: {grandFull}</Text>
+                        {grandHalf > 0 && <Text style={{fontSize:11,color:'#E65100',fontWeight:'700'}}>H: {grandHalf}</Text>}
+                      </View>
                     )}
-
-                    <View style={rp.stageTotalRow}>
-                      <Text style={rp.stageTotalLabel}>Grand Total — {grandCnt} tickets</Text>
-                      <Text style={rp.stageTotalAmt}>₹{grandTotal.toFixed(0)}</Text>
-                    </View>
-
-                    {/* ── Status Report card (mirrors physical receipt) ── */}
-                    <View style={rp.statusReportCard}>
-                      <View style={rp.statusReportHeader}>
-                        <BarChart3 size={14} color="#1a2332"/>
-                        <Text style={rp.statusReportTitle}>STATUS REPORT</Text>
-                        <View style={rp.wayBillBadge}>
-                          <Text style={rp.wayBillText}>WB: {wayBill}</Text>
-                        </View>
-                      </View>
-
-                      {/* Meta row */}
-                      <View style={rp.statusMetaRow}>
-                        <View style={rp.statusMetaItem}>
-                          <Text style={rp.statusMetaLabel}>BUS</Text>
-                          <Text style={rp.statusMetaVal}>{busNum}</Text>
-                        </View>
-                        <View style={rp.statusMetaItem}>
-                          <Text style={rp.statusMetaLabel}>TRIP No.</Text>
-                          <Text style={[rp.statusMetaVal,{color:'#1565C0'}]}>#{tripNum}</Text>
-                        </View>
-                        <View style={rp.statusMetaItem}>
-                          <Text style={rp.statusMetaLabel}>TIME</Text>
-                          <Text style={rp.statusMetaVal}>{firstT?formatTime(firstT):'—'}</Text>
-                        </View>
-                        <View style={rp.statusMetaItem}>
-                          <Text style={rp.statusMetaLabel}>DIR</Text>
-                          <Text style={[rp.statusMetaVal,{color:'#7B1FA2'}]}>{dir.toUpperCase()||'—'}</Text>
-                        </View>
-                      </View>
-
-                      {/* Stage table — SS ES F H L P AMT */}
-                      {isLoadingApp?(
-                        <ActivityIndicator size="small" color="#1a2332" style={{marginVertical:8}}/>
-                      ):(
-                        <>
-                          <View style={rp.srTableHdr}>
-                            {['SS','ES','F','H','L','P','AMT'].map((h,i)=>(
-                              <Text key={i} style={[rp.srTh, i===6&&{flex:2,textAlign:'right'}]}>{h}</Text>
-                            ))}
-                          </View>
-                          {stages.map((s,i)=>(
-                            <View key={i} style={[rp.srTr,i%2===0&&{backgroundColor:'#F0F4F8'}]}>
-                              <Text style={rp.srTd} numberOfLines={1}>{s.from}</Text>
-                              <Text style={rp.srTd} numberOfLines={1}>{s.to}</Text>
-                              <Text style={rp.srTd}>{s.count}</Text>
-                              <Text style={rp.srTd}>0</Text>
-                              <Text style={rp.srTd}>0</Text>
-                              <Text style={rp.srTd}>0</Text>
-                              <Text style={[rp.srTd,{flex:2,textAlign:'right',color:'#1a2332',fontWeight:'700'}]}>
-                                {s.fare.toFixed(2)}
-                              </Text>
-                            </View>
-                          ))}
-                          {stages.length===0&&(
-                            <Text style={{fontSize:11,color:'#aaa',textAlign:'center',paddingVertical:6,fontStyle:'italic'}}>
-                              No stage data
-                            </Text>
-                          )}
-                        </>
-                      )}
-
-                      {/* FULL / HALF / FREE / LUGG counts */}
-                      <View style={rp.srCountsRow}>
-                        <View style={rp.srCountChip}>
-                          <Text style={rp.srCountLabel}>FULL</Text>
-                          <Text style={[rp.srCountVal,{color:'#1a2332'}]}>{grandFull}</Text>
-                        </View>
-                        {grandHalf>0&&(
-                          <View style={rp.srCountChip}>
-                            <Text style={rp.srCountLabel}>HALF</Text>
-                            <Text style={[rp.srCountVal,{color:'#E65100'}]}>{grandHalf}</Text>
-                          </View>
-                        )}
-                        {grandFree>0&&(
-                          <View style={rp.srCountChip}>
-                            <Text style={rp.srCountLabel}>FREE</Text>
-                            <Text style={[rp.srCountVal,{color:'#4CAF50'}]}>{grandFree}</Text>
-                          </View>
-                        )}
-                        <View style={rp.srCountChip}>
-                          <Text style={rp.srCountLabel}>LUGG</Text>
-                          <Text style={[rp.srCountVal,{color:'#888'}]}>{posLuggCnt}</Text>
-                        </View>
-                      </View>
-
-                      {/* TRIP.COLL / TOT.COLL */}
-                      <View style={rp.srCollRow}>
-                        <View style={{flex:1}}>
-                          <Text style={rp.srCollLabel}>TRIP.COLL Rs.</Text>
-                          <Text style={rp.srCollVal}>₹{grandTotal.toFixed(2)}</Text>
-                        </View>
-                        <View style={rp.srCollDivider}/>
-                        <View style={{flex:1,alignItems:'flex-end'}}>
-                          <Text style={rp.srCollLabel}>TOT.COLL Rs.</Text>
-                          <Text style={[rp.srCollVal,{color:'#00b7f3'}]}>₹{totColl.toFixed(2)}</Text>
-                        </View>
-                      </View>
-
-                      {/* Print Status Report button */}
-                      <TouchableOpacity
-                        style={[rp.srPrintBtn, printingStatus===tripId&&{opacity:.6}]}
-                        onPress={()=>printStatusReport(tripId, idx)}
-                        disabled={printingStatus===tripId}
-                      >
-                        {printingStatus===tripId
-                          ? <ActivityIndicator size="small" color="#fff"/>
-                          : <><Printer size={14} color="#fff"/><Text style={rp.srPrintBtnText}>Print Status Report</Text></>
-                        }
-                      </TouchableOpacity>
-                    </View>
-
-                    {/* ── Daily Report print button ── */}
-                    <TouchableOpacity style={rp.printBtn} onPress={()=>printDailyReport(tripId)}>
-                      <Printer size={15} color="#fff"/>
-                      <Text style={rp.printBtnText}>Print Full Trip Report</Text>
-                    </TouchableOpacity>
-                  </View>
+                  </>
                 )}
               </View>
-            );
-          })}
+            )}
+
+            <TouchableOpacity
+              style={[rp4.srPrintBtn, printingStatus===tripId&&{opacity:.6}]}
+              onPress={()=>printStatusReport(tripId,idx)}
+              disabled={printingStatus===tripId}
+            >
+              {printingStatus===tripId?<ActivityIndicator size="small" color="#fff"/>:<><PrinterIcon size={13} color="#fff"/><Text style={rp4.srPrintBtnText}>Print Status Report</Text></>}
+            </TouchableOpacity>
+          </View>
+        );
+      })}
+    </View>
+  );
+};
+
+// ── Section 3: Collection Report ─────────────────────────────────────────────
+const CollectionReportSection = ({dashboard, posHook}: {dashboard:any; posHook:ReturnType<typeof usePOSTickets>}) => {
+  const [period,setPeriod] = useState('today');
+  const [collection,setCollection] = useState<any>(null);
+  const [collLoading,setCollLoading] = useState(false);
+  const [expenses,setExpenses] = useState({diesel:'0',driver:'0',conductor:'0',tollgate:'0',pooja:'0',others:'0'});
+  const [printing,setPrinting] = useState(false);
+
+  useEffect(()=>{ fetchCol('today'); },[]);
+
+  const fetchCol = async (p:string) => {
+    setCollLoading(true);
+    try{ const r=await api.get(`/conductor/collection/summary?period=${p}`); setCollection(r.data); }
+    catch{} finally{setCollLoading(false);}
+  };
+
+  const recentTrips: any[] = dashboard?.recent_trips ?? [];
+  const posByTrip = posHook.todayByTrip();
+
+  const todayTripIds: string[] = recentTrips.filter((t:any)=>{
+    const today=new Date().toDateString();
+    return t.start_time && new Date(t.start_time).toDateString()===today;
+  }).map((t:any)=>t.trip_id as string);
+  const allTripIds = Array.from(new Set([...Object.keys(posByTrip), ...todayTripIds]));
+  const backendTrip=(id:string)=>recentTrips.find((t:any)=>t.trip_id===id);
+
+  const totalExpenses = Object.values(expenses).reduce((s,v)=>s+parseAmount(v),0);
+
+  const tripRows = allTripIds.map((tripId,idx)=>{
+    const bt=backendTrip(tripId);
+    const posTix=posByTrip[tripId]||[];
+    const posAmt=posTix.reduce((s:number,t:any)=>s+t.fare,0);
+    const backendTotal=Number(bt?.collection??0);
+    const grandAmt=Math.max(backendTotal, posAmt);
+    return {
+      trip: idx+1,
+      route: bt?.route_name?.split(' ')[0]||'01',
+      amount: grandAmt,
+    };
+  });
+  const totalCollection = tripRows.reduce((s,r)=>s+r.amount,0);
+  const netTotal = totalCollection - totalExpenses;
+
+  const printCollectionReport = async () => {
+    setPrinting(true);
+    try{
+      const now=new Date();
+      const dateStr=now.toLocaleDateString('en-GB',{day:'2-digit',month:'2-digit',year:'2-digit'}).replace(/\//g,'/');
+      const timeStr=now.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',hour12:false});
+      const busNum=dashboard?.bus?.vehicle_number??dashboard?.active_trip?.bus_number??'N/A';
+      const machineId='SPS-POS-01';
+      const fmt=(n:number)=>n%1===0?`${n}.00`:n.toFixed(2);
+
+      const p=new Printer(); const ready=await p.checkReady(); if(!ready){setPrinting(false);return;}
+      await p.text('SPS - ZYRAP',{textSize:22,align:'CENTER'});
+      await p.text('COLLECTION REPORT',{textSize:24,align:'CENTER'});
+      await p.text(`${dateStr}   ${timeStr}`,{textSize:18,align:'CENTER'});
+      await p.text(printLR('BUS NUMBER:', busNum),{textSize:18});
+      await p.text(printLR('MACHINE ID:', machineId),{textSize:18});
+      await p.text(DIVIDER);
+
+      const tripHdr = 'TRIP   ROUTE      AMOUNT'.padEnd(PRINT_WIDTH);
+      await p.text(tripHdr,{textSize:18});
+      await p.text(DIVIDER);
+
+      for(const row of tripRows){
+        const tripStr = String(row.trip).padEnd(6);
+        const routeStr = row.route.slice(0,10).padEnd(10);
+        const amtStr = fmt(row.amount).padStart(8);
+        await p.text(`${tripStr} ${routeStr}${amtStr}`,{textSize:18});
+      }
+      await p.text(DIVIDER);
+      await p.text(printLR('TOTAL Rs. :', fmt(totalCollection)),{textSize:20});
+      await p.text(DIVIDER);
+      await p.text('EXPENSES',{textSize:22,align:'CENTER'});
+      await p.text(DIVIDER);
+      await p.text(printLR('DIESEL    :', fmt(parseAmount(expenses.diesel))),{textSize:18});
+      await p.text(printLR('DRIVER    :', fmt(parseAmount(expenses.driver))),{textSize:18});
+      await p.text(printLR('CONDUCTOR :', fmt(parseAmount(expenses.conductor))),{textSize:18});
+      await p.text(printLR('TOLLGATE  :', fmt(parseAmount(expenses.tollgate))),{textSize:18});
+      await p.text(printLR('POOJA     :', fmt(parseAmount(expenses.pooja))),{textSize:18});
+      await p.text(printLR('OTHERS    :', fmt(parseAmount(expenses.others))),{textSize:18});
+      await p.text(DIVIDER);
+      await p.text(printLR('TOTAL Rs. :', fmt(totalExpenses)),{textSize:18});
+      await p.text(DIVIDER);
+      await p.text(printLR('NET TOTAL Rs. :', fmt(netTotal)),{textSize:22});
+      await p.text(DIVIDER);
+      await p.text('** Safe Journey **',{align:'CENTER'});
+      await p.finish();
+    } catch(e:any){Alert.alert('Print Error',e.message||'Unknown');}
+    finally{setPrinting(false);}
+  };
+
+  const expenseFields: {key:keyof typeof expenses; label:string}[] = [
+    {key:'diesel',   label:'DIESEL'},
+    {key:'driver',   label:'DRIVER'},
+    {key:'conductor',label:'CONDUCTOR'},
+    {key:'tollgate', label:'TOLLGATE'},
+    {key:'pooja',    label:'POOJA'},
+    {key:'others',   label:'OTHERS'},
+  ];
+
+  return (
+    <View>
+      <View style={rp4.sectionHeader}>
+        <DollarSign size={16} color="#1a2332"/>
+        <Text style={rp4.sectionTitle}>Collection Report</Text>
+      </View>
+
+      <View style={rp4.receiptCard}>
+        <Text style={rp4.receiptTitle}>COLLECTION REPORT</Text>
+        <Text style={rp4.receiptMeta}>{new Date().toLocaleDateString('en-GB')}  {new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',hour12:false})}</Text>
+        <Text style={rp4.receiptMeta}>BUS: {dashboard?.bus?.vehicle_number??dashboard?.active_trip?.bus_number??'N/A'}</Text>
+        <View style={rp4.receiptDivider}/>
+
+        <View style={rp4.receiptTableRow}>
+          <Text style={[rp4.receiptTh,{width:40}]}>TRIP</Text>
+          <Text style={[rp4.receiptTh,{flex:1}]}>ROUTE</Text>
+          <Text style={[rp4.receiptTh,{width:90,textAlign:'right'}]}>AMOUNT</Text>
         </View>
-      )}
+        <View style={rp4.receiptDivider}/>
+
+        {tripRows.map((row,i)=>(
+          <View key={i} style={rp4.receiptTableRow}>
+            <Text style={[rp4.receiptTd,{width:40,fontWeight:'700'}]}>{row.trip}</Text>
+            <Text style={[rp4.receiptTd,{flex:1}]}>{row.route}</Text>
+            <Text style={[rp4.receiptTd,{width:90,textAlign:'right'}]}>{row.amount.toFixed(2)}</Text>
+          </View>
+        ))}
+        {tripRows.length===0&&<Text style={{textAlign:'center',color:'#aaa',fontSize:12,paddingVertical:8}}>No trips today</Text>}
+
+        <View style={rp4.receiptDivider}/>
+        <View style={rp4.receiptTotalRow}>
+          <Text style={rp4.receiptTotalLabel}>TOTAL Rs. :</Text>
+          <Text style={rp4.receiptTotalVal}>{totalCollection.toFixed(2)}</Text>
+        </View>
+        <View style={rp4.receiptDivider}/>
+
+        <Text style={[rp4.receiptTh,{textAlign:'center',marginBottom:6}]}>EXPENSES</Text>
+        {expenseFields.map(({key,label})=>(
+          <View key={key} style={rp4.expenseRow}>
+            <Text style={rp4.expenseLabel}>{label}</Text>
+            <Text style={rp4.expenseColon}>:</Text>
+            <TextInput
+              style={rp4.expenseInput}
+              keyboardType="numeric"
+              value={expenses[key]}
+              onChangeText={v=>setExpenses(prev=>({...prev,[key]:v}))}
+              placeholder="0.00"
+              placeholderTextColor="#bbb"
+            />
+          </View>
+        ))}
+        <View style={rp4.receiptDivider}/>
+        <View style={rp4.receiptTotalRow}>
+          <Text style={rp4.receiptTotalLabel}>TOTAL Rs. :</Text>
+          <Text style={rp4.receiptTotalVal}>{totalExpenses.toFixed(2)}</Text>
+        </View>
+        <View style={rp4.receiptDivider}/>
+        <View style={rp4.receiptTotalRow}>
+          <Text style={[rp4.receiptTotalLabel,{fontSize:15}]}>NET TOTAL Rs. :</Text>
+          <Text style={[rp4.receiptTotalVal,{fontSize:20,color:'#00b7f3'}]}>{netTotal.toFixed(2)}</Text>
+        </View>
+      </View>
+
+      <TouchableOpacity style={[rp4.printBtnLarge,printing&&{opacity:.6}]} onPress={printCollectionReport} disabled={printing}>
+        {printing?<ActivityIndicator color="#fff"/>:<><PrinterIcon size={16} color="#fff"/><Text style={rp4.printBtnLargeText}>Print Collection Report</Text></>}
+      </TouchableOpacity>
 
       <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginTop:20,marginBottom:12}}>
-        <Text style={sh.sectionTitle}>Collection</Text>
+        <Text style={sh.sectionTitle}>Collection History</Text>
         <View style={{flexDirection:'row',gap:4}}>
           {['today','week','month'].map(p=>(
             <TouchableOpacity key={p} style={[sh.periodTab,period===p&&sh.periodTabActive]} onPress={()=>{setPeriod(p);fetchCol(p);}}>
@@ -1988,173 +1919,195 @@ const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:Retu
               </View>
             ))}
           </View>
-          {collection?.daily?.length>0&&(
-            <View style={{flexDirection:'row',alignItems:'flex-end',height:110,gap:4,backgroundColor:'#F7FAFC',borderRadius:12,padding:10}}>
-              {collection.daily.map((d:any,i:number)=>(
-                <View key={i} style={{flex:1,alignItems:'center',justifyContent:'flex-end'}}>
-                  <Text style={{fontSize:7,color:'#888',marginBottom:2}}>₹{d.collection}</Text>
-                  <View style={{width:'80%',backgroundColor:'#00b7f3',borderRadius:3,minHeight:4,height:Math.max(4,(d.collection/max)*75)}}/>
-                  <Text style={{fontSize:7,color:'#aaa',marginTop:4}}>{d.date?.slice(5)}</Text>
-                </View>
-              ))}
-            </View>
-          )}
+          {(collection?.daily?.length??0)>0&&(()=>{
+            const max=Math.max(...collection.daily.map((d:any)=>d.collection),1);
+            return (
+              <View style={{flexDirection:'row',alignItems:'flex-end',height:110,gap:4,backgroundColor:'#F7FAFC',borderRadius:12,padding:10}}>
+                {collection.daily.map((d:any,i:number)=>(
+                  <View key={i} style={{flex:1,alignItems:'center',justifyContent:'flex-end'}}>
+                    <Text style={{fontSize:7,color:'#888',marginBottom:2}}>₹{d.collection}</Text>
+                    <View style={{width:'80%',backgroundColor:'#00b7f3',borderRadius:3,minHeight:4,height:Math.max(4,(d.collection/max)*75)}}/>
+                    <Text style={{fontSize:7,color:'#aaa',marginTop:4}}>{d.date?.slice(5)}</Text>
+                  </View>
+                ))}
+              </View>
+            );
+          })()}
         </>
       )}
-    </ScrollView>
+    </View>
   );
 };
 
-const rp=StyleSheet.create({
-  totalPill:{backgroundColor:'#E8F5E9',paddingHorizontal:10,paddingVertical:4,borderRadius:10},
-  totalPillText:{fontSize:12,color:'#2E7D32',fontWeight:'700'},
-  posSummaryRow:{flexDirection:'row',gap:8,marginTop:10,marginBottom:4,flexWrap:'wrap'},
-  posSummaryChip:{flexDirection:'row',alignItems:'center',gap:4,backgroundColor:'#EDE7F6',paddingHorizontal:10,paddingVertical:5,borderRadius:10,borderWidth:1,borderColor:'#CE93D8'},
-  posSummaryText:{fontSize:12,color:'#7B1FA2',fontWeight:'600'},
-  appSummaryChip:{flexDirection:'row',alignItems:'center',gap:4,backgroundColor:'#E3F2FD',paddingHorizontal:10,paddingVertical:5,borderRadius:10,borderWidth:1,borderColor:'#90CAF9'},
-  appSummaryText:{fontSize:12,color:'#1565C0',fontWeight:'600'},
-  tripCard:{backgroundColor:'#fff',borderRadius:14,marginBottom:10,overflow:'hidden',borderWidth:1,borderColor:'#e0e0e0',elevation:2},
-  tripHeader:{flexDirection:'row',justifyContent:'space-between',alignItems:'center',padding:14},
-  tripLeft:{flexDirection:'row',alignItems:'center',gap:12,flex:1},
-  tripBadge:{width:32,height:32,borderRadius:16,backgroundColor:'#E3F2FD',justifyContent:'center',alignItems:'center'},
-  tripBadgeText:{fontSize:14,fontWeight:'800',color:'#1565C0'},
-  tripTitle:{fontSize:14,fontWeight:'700',color:'#1a2332'},
-  tripMeta:{fontSize:12,color:'#888',marginTop:2},
-  tripAmt:{fontSize:20,fontWeight:'800',color:'#00b7f3'},
-  stageWrap:{backgroundColor:'#F7FAFC',borderTopWidth:1,borderTopColor:'#e0e0e0',padding:12},
-  legendChip:{flexDirection:'row',alignItems:'center',gap:4,backgroundColor:'#E3F2FD',paddingHorizontal:8,paddingVertical:4,borderRadius:8,borderWidth:1,borderColor:'#90CAF9'},
-  legendText:{fontSize:11,fontWeight:'600'},
-  stageHdr:{flexDirection:'row',backgroundColor:'#1a2332',borderRadius:6,paddingVertical:7,paddingHorizontal:8,marginBottom:2},
-  stageTh:{flex:1,fontSize:10,fontWeight:'700',color:'#fff',textAlign:'center'},
-  stageTr:{flexDirection:'row',paddingVertical:7,paddingHorizontal:8,borderRadius:4},
-  stageTd:{flex:1,fontSize:12,color:'#333',textAlign:'center'},
-  stageTotalRow:{flexDirection:'row',justifyContent:'space-between',paddingHorizontal:8,paddingVertical:8,borderTopWidth:1,borderTopColor:'#e0e0e0',marginTop:4},
-  stageTotalLabel:{fontSize:13,fontWeight:'700',color:'#1a2332'},
-  stageTotalAmt:{fontSize:16,fontWeight:'800',color:'#00b7f3'},
-  printBtn:{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:6,marginTop:10,backgroundColor:'#1a2332',paddingVertical:11,borderRadius:10},
-  printBtnText:{color:'#fff',fontSize:13,fontWeight:'700'},
-  // ── Status Report card styles ──────────────────────────────────────────────
-  statusReportCard:{marginTop:14,backgroundColor:'#fff',borderRadius:12,borderWidth:1.5,borderColor:'#1a2332',overflow:'hidden'},
-  statusReportHeader:{flexDirection:'row',alignItems:'center',gap:8,backgroundColor:'#1a2332',paddingHorizontal:12,paddingVertical:9},
-  statusReportTitle:{fontSize:13,fontWeight:'900',color:'#fff',letterSpacing:1,flex:1},
-  wayBillBadge:{backgroundColor:'#ffffff22',paddingHorizontal:8,paddingVertical:2,borderRadius:8},
-  wayBillText:{fontSize:10,color:'#fff',fontWeight:'700'},
-  statusMetaRow:{flexDirection:'row',paddingHorizontal:10,paddingVertical:8,borderBottomWidth:1,borderBottomColor:'#e8e8e8',gap:4},
-  statusMetaItem:{flex:1,alignItems:'center'},
-  statusMetaLabel:{fontSize:9,color:'#888',fontWeight:'700',letterSpacing:.5},
-  statusMetaVal:{fontSize:12,fontWeight:'800',color:'#1a2332',marginTop:1},
+const rp4 = StyleSheet.create({
+  sectionHeader:{flexDirection:'row',alignItems:'center',gap:8,paddingVertical:10,paddingHorizontal:2,marginBottom:8,borderBottomWidth:1.5,borderBottomColor:'#1a2332'},
+  sectionTitle:{fontSize:16,fontWeight:'900',color:'#1a2332',letterSpacing:.5},
+  emptyCard:{alignItems:'center',padding:30,backgroundColor:'#F7FAFC',borderRadius:12,marginBottom:12},
+  tripChip:{paddingHorizontal:12,paddingVertical:7,borderRadius:20,backgroundColor:'#F0F4F8',marginRight:8,borderWidth:1,borderColor:'#ddd'},
+  tripChipActive:{backgroundColor:'#1a2332',borderColor:'#1a2332'},
+  tripChipText:{fontSize:12,fontWeight:'600',color:'#666'},
+  reportCard:{backgroundColor:'#fff',borderRadius:14,padding:14,borderWidth:1,borderColor:'#e0e0e0',elevation:2,marginBottom:8},
+  printBtn:{flexDirection:'row',alignItems:'center',gap:5,backgroundColor:'#1a2332',paddingHorizontal:12,paddingVertical:7,borderRadius:10},
+  printBtnText:{color:'#fff',fontSize:12,fontWeight:'700'},
+  statusCard:{backgroundColor:'#fff',borderRadius:14,marginBottom:10,overflow:'hidden',borderWidth:1,borderColor:'#e0e0e0',elevation:2},
+  statusCardHeader:{flexDirection:'row',alignItems:'flex-start',padding:12,backgroundColor:'#1a2332'},
+  statusCardTitle:{fontSize:13,fontWeight:'800',color:'#fff'},
+  statusCardMeta:{fontSize:11,color:'#90CAF9',marginTop:2},
+  statusCardAmt:{fontSize:18,fontWeight:'900',color:'#00b7f3'},
+  expandBtn:{paddingHorizontal:8,paddingVertical:4,backgroundColor:'#fff',borderRadius:8,marginTop:4},
+  srCountsRow:{flexDirection:'row',paddingHorizontal:10,paddingVertical:8,gap:6,flexWrap:'wrap',borderBottomWidth:1,borderBottomColor:'#f0f0f0'},
+  srCountChip:{flexDirection:'row',alignItems:'center',gap:4,backgroundColor:'#F0F4F8',paddingHorizontal:10,paddingVertical:5,borderRadius:8},
+  srCountLabel:{fontSize:10,color:'#888',fontWeight:'700'},
+  srCountVal:{fontSize:14,fontWeight:'900',marginLeft:4},
+  srCollRow:{flexDirection:'row',alignItems:'center',paddingHorizontal:12,paddingVertical:10,borderBottomWidth:1,borderBottomColor:'#e8e8e8',backgroundColor:'#F7FAFC'},
+  srCollDivider:{width:1,backgroundColor:'#e0e0e0',height:32,marginHorizontal:8},
+  srCollLabel:{fontSize:10,color:'#888',fontWeight:'700'},
+  srCollVal:{fontSize:16,fontWeight:'900',color:'#1a2332',marginTop:2},
   srTableHdr:{flexDirection:'row',backgroundColor:'#E8EDF2',paddingVertical:6,paddingHorizontal:8},
   srTh:{flex:1,fontSize:9,fontWeight:'800',color:'#1a2332',textAlign:'center'},
   srTr:{flexDirection:'row',paddingVertical:6,paddingHorizontal:8},
   srTd:{flex:1,fontSize:10,color:'#333',textAlign:'center'},
-  srCountsRow:{flexDirection:'row',paddingHorizontal:10,paddingVertical:8,gap:6,borderTopWidth:1,borderTopColor:'#e8e8e8',flexWrap:'wrap'},
-  srCountChip:{flexDirection:'row',alignItems:'center',gap:4,backgroundColor:'#F0F4F8',paddingHorizontal:10,paddingVertical:5,borderRadius:8},
-  srCountLabel:{fontSize:10,color:'#888',fontWeight:'700'},
-  srCountVal:{fontSize:14,fontWeight:'900',marginLeft:4},
-  srCollRow:{flexDirection:'row',alignItems:'center',paddingHorizontal:12,paddingVertical:10,borderTopWidth:1,borderTopColor:'#e8e8e8',backgroundColor:'#F7FAFC'},
-  srCollDivider:{width:1,backgroundColor:'#e0e0e0',height:32,marginHorizontal:8},
-  srCollLabel:{fontSize:10,color:'#888',fontWeight:'700'},
-  srCollVal:{fontSize:16,fontWeight:'900',color:'#1a2332',marginTop:2},
   srPrintBtn:{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:6,margin:10,backgroundColor:'#1a2332',paddingVertical:10,borderRadius:9},
   srPrintBtnText:{color:'#fff',fontSize:13,fontWeight:'700'},
+  receiptCard:{backgroundColor:'#fff',borderRadius:14,padding:16,borderWidth:1.5,borderColor:'#1a2332',marginBottom:12},
+  receiptTitle:{fontSize:18,fontWeight:'900',color:'#1a2332',textAlign:'center',letterSpacing:1,marginBottom:4},
+  receiptMeta:{fontSize:12,color:'#444',textAlign:'center',marginBottom:2},
+  receiptDivider:{height:1,backgroundColor:'#ddd',marginVertical:8,borderStyle:'dashed'},
+  receiptTableRow:{flexDirection:'row',alignItems:'center',paddingVertical:5},
+  receiptTh:{fontSize:11,fontWeight:'800',color:'#1a2332',letterSpacing:.5},
+  receiptTd:{fontSize:13,color:'#333'},
+  receiptTotalRow:{flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingVertical:2},
+  receiptTotalLabel:{fontSize:13,fontWeight:'700',color:'#1a2332'},
+  receiptTotalVal:{fontSize:16,fontWeight:'900',color:'#1a2332'},
+  expenseRow:{flexDirection:'row',alignItems:'center',paddingVertical:4},
+  expenseLabel:{width:100,fontSize:13,color:'#444',fontWeight:'600'},
+  expenseColon:{width:20,fontSize:13,color:'#888',textAlign:'center'},
+  expenseInput:{flex:1,fontSize:13,color:'#1a2332',borderBottomWidth:1,borderBottomColor:'#ddd',paddingVertical:2,paddingHorizontal:4,textAlign:'right'},
+  printBtnLarge:{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8,backgroundColor:'#1a2332',paddingVertical:14,borderRadius:12,marginBottom:4},
+  printBtnLargeText:{color:'#fff',fontSize:15,fontWeight:'700'},
+});
+
+const ReportTab = ({dashboard,user,posHook}:{dashboard:any;user:any;posHook:ReturnType<typeof usePOSTickets>}) => {
+  const [activeSection,setActiveSection] = useState<'trip'|'status'|'collection'>('trip');
+
+  const stats = dashboard?.today_stats||{};
+  const posSummary = posHook.todaySummary();
+  const appOnlyCollection = Math.max(0,(stats.total_collection||0)-posSummary.total);
+  const appOnlyTickets    = Math.max(0,(stats.tickets_sold||0)-posSummary.rows);
+  const grandTodayTotal   = appOnlyCollection + posSummary.total;
+  const grandTodayTickets = appOnlyTickets    + posSummary.count;
+
+  const SECTIONS = [
+    {key:'trip'      as const, label:'Trip Sheet',    Icon:Receipt},
+    {key:'status'    as const, label:'Status Report', Icon:BarChart3},
+    {key:'collection'as const, label:'Collection',    Icon:DollarSign},
+  ];
+
+  return (
+    <ScrollView style={{flex:1}} contentContainerStyle={{padding:16,paddingBottom:40}} showsVerticalScrollIndicator={false}>
+      {user&&(
+        <View style={sh.conductorCard}>
+          <View style={sh.conductorAvatar}><BadgeCheck size={26} color="#00b7f3"/></View>
+          <View>
+            <Text style={{fontSize:16,fontWeight:'700',color:'#1a2332'}}>{user.name||'Conductor'}</Text>
+            <Text style={{fontSize:12,color:'#888',marginTop:2}}>ID: {user.conductor_id||user.id}{dashboard?.bus?` · 🚌 ${dashboard.bus.vehicle_number}`:''}</Text>
+          </View>
+        </View>
+      )}
+
+      <View style={sh.statsGrid}>
+        {[
+          {Icon:Bus,         label:'Trips',       val:stats.trips_completed??0,          color:'#9C27B0'},
+          {Icon:Ticket,      label:'App Tickets',  val:appOnlyTickets,                    color:'#00b7f3'},
+          {Icon:PrinterIcon, label:'POS Tickets',  val:posSummary.count,                 color:'#7B1FA2'},
+          {Icon:TrendingUp,  label:'Collection',   val:`₹${grandTodayTotal.toFixed(0)}`, color:'#4CAF50'},
+        ].map(i=>(
+          <View key={i.label} style={sh.statCard}>
+            <View style={[sh.statIconBg,{backgroundColor:i.color+'18'}]}><i.Icon size={20} color={i.color}/></View>
+            <Text style={[sh.statVal,{color:i.color}]}>{i.val}</Text>
+            <Text style={sh.statLabel}>{i.label}</Text>
+          </View>
+        ))}
+      </View>
+
+      <View style={rpt.sectionTabs}>
+        {SECTIONS.map(s=>(
+          <TouchableOpacity
+            key={s.key}
+            style={[rpt.sectionTab, activeSection===s.key&&rpt.sectionTabActive]}
+            onPress={()=>setActiveSection(s.key)}
+          >
+            <s.Icon size={14} color={activeSection===s.key?'#fff':'#666'}/>
+            <Text style={[rpt.sectionTabText, activeSection===s.key&&{color:'#fff'}]}>{s.label}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      <View style={{marginTop:4}}>
+        {activeSection==='trip'       && <TripReportSection   dashboard={dashboard} posHook={posHook}/>}
+        {activeSection==='status'     && <StatusReportSection  dashboard={dashboard} posHook={posHook}/>}
+        {activeSection==='collection' && <CollectionReportSection dashboard={dashboard} posHook={posHook}/>}
+      </View>
+    </ScrollView>
+  );
+};
+
+const rpt = StyleSheet.create({
+  sectionTabs:{flexDirection:'row',gap:6,marginTop:16,marginBottom:8,flexWrap:'wrap'},
+  sectionTab:{flexDirection:'row',alignItems:'center',gap:5,paddingHorizontal:12,paddingVertical:8,borderRadius:20,backgroundColor:'#F0F4F8',borderWidth:1,borderColor:'#ddd'},
+  sectionTabActive:{backgroundColor:'#1a2332',borderColor:'#1a2332'},
+  sectionTabText:{fontSize:12,fontWeight:'600',color:'#666'},
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Trip number helpers
 // ─────────────────────────────────────────────────────────────────────────────
 const IST_OFFSET_MINUTES = 330;
-
 const getIstDateKey = (d: Date = new Date()): string => {
   const istMs = d.getTime() + IST_OFFSET_MINUTES * 60 * 1000;
   return new Date(istMs).toISOString().slice(0, 10);
 };
-
-const getTripNumberKey = (busId: string): string => {
-  return `trip_num_${busId}_${getIstDateKey()}`;
-};
-
+const getTripNumberKey = (busId: string): string => `trip_num_${busId}_${getIstDateKey()}`;
 const getIstDayRangeIso = (d: Date = new Date()): {startIso: string; endIso: string} => {
   const offsetMs = IST_OFFSET_MINUTES * 60 * 1000;
   const istNow = new Date(d.getTime() + offsetMs);
-  const y = istNow.getUTCFullYear();
-  const m = istNow.getUTCMonth();
-  const day = istNow.getUTCDate();
+  const y = istNow.getUTCFullYear(), m = istNow.getUTCMonth(), day = istNow.getUTCDate();
   const startUtc = new Date(Date.UTC(y, m, day, 0, 0, 0) - offsetMs);
   const endUtc = new Date(Date.UTC(y, m, day + 1, 0, 0, 0) - offsetMs);
   return {startIso: startUtc.toISOString(), endIso: endUtc.toISOString()};
 };
-
 const loadTripNumber = async (busId: string): Promise<number> => {
   const fallback = async (): Promise<number> => {
-    try {
-      const val = await AsyncStorage.getItem(getTripNumberKey(busId));
-      return val ? parseInt(val, 10) : 0;
-    } catch { return 0; }
+    try { const val = await AsyncStorage.getItem(getTripNumberKey(busId)); return val ? parseInt(val, 10) : 0; }
+    catch { return 0; }
   };
-
   try {
     const { startIso, endIso } = getIstDayRangeIso();
-    const { data, error } = await supabase
-      .from('trips')
-      .select('trip_number')
-      .eq('bus_id', busId)
-      .not('trip_number', 'is', null)
-      .gte('start_time', startIso)
-      .lt('start_time', endIso)
-      .order('trip_number', { ascending: false })
-      .limit(1);
-
+    const { data, error } = await supabase.from('trips').select('trip_number').eq('bus_id', busId).not('trip_number', 'is', null).gte('start_time', startIso).lt('start_time', endIso).order('trip_number', { ascending: false }).limit(1);
     if (error) throw error;
     const num = Number(data?.[0]?.trip_number ?? 0);
     return Number.isFinite(num) && num > 0 ? num : await fallback();
-  } catch {
-    return fallback();
-  }
+  } catch { return fallback(); }
 };
-
 const incrementTripNumber = async (busId: string, tripId?: string | null): Promise<number> => {
   const { startIso, endIso } = getIstDayRangeIso();
-
   let latest = 0;
   try {
-    const { data, error } = await supabase
-      .from('trips')
-      .select('trip_number')
-      .eq('bus_id', busId)
-      .not('trip_number', 'is', null)
-      .gte('start_time', startIso)
-      .lt('start_time', endIso)
-      .order('trip_number', { ascending: false })
-      .limit(1);
-
+    const { data, error } = await supabase.from('trips').select('trip_number').eq('bus_id', busId).not('trip_number', 'is', null).gte('start_time', startIso).lt('start_time', endIso).order('trip_number', { ascending: false }).limit(1);
     if (error) throw error;
     const v = Number(data?.[0]?.trip_number ?? 0);
     latest = Number.isFinite(v) ? v : 0;
   } catch {
-    try {
-      const val = await AsyncStorage.getItem(getTripNumberKey(busId));
-      latest = val ? parseInt(val, 10) : 0;
-    } catch { latest = 0; }
+    try { const val = await AsyncStorage.getItem(getTripNumberKey(busId)); latest = val ? parseInt(val, 10) : 0; }
+    catch { latest = 0; }
   }
-
   const nextNum = latest + 1;
-
   if (tripId) {
-    try {
-      const { error } = await supabase
-        .from('trips')
-        .update({ trip_number: nextNum })
-        .eq('id', tripId);
-      if (error) console.warn('[TripNumber] DB update failed:', error.message);
-    } catch (e) {
-      console.warn('[TripNumber] Supabase update threw:', e);
-    }
+    try { const { error } = await supabase.from('trips').update({ trip_number: nextNum }).eq('id', tripId); if (error) console.warn('[TripNumber] DB update failed:', error.message); }
+    catch (e) { console.warn('[TripNumber] Supabase update threw:', e); }
   }
-
-  try {
-    await AsyncStorage.setItem(getTripNumberKey(busId), String(nextNum));
-  } catch { /* ignore */ }
-
+  try { await AsyncStorage.setItem(getTripNumberKey(busId), String(nextNum)); }
+  catch { /* ignore */ }
   return nextNum;
 };
 
@@ -2177,22 +2130,17 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
   useEffect(() => {
     const counterBusId = dashboard?.active_trip?.bus_id ?? dashboard?.bus?.id;
     if (!counterBusId) return;
-
     let cancelled = false;
     const offsetMs = IST_OFFSET_MINUTES * 60 * 1000;
     const nowIst = new Date(Date.now() + offsetMs);
-    const y = nowIst.getUTCFullYear();
-    const m = nowIst.getUTCMonth();
-    const day = nowIst.getUTCDate();
+    const y = nowIst.getUTCFullYear(), m = nowIst.getUTCMonth(), day = nowIst.getUTCDate();
     const nextMidnightUtc = new Date(Date.UTC(y, m, day + 1, 0, 0, 0) - offsetMs);
     const delay = Math.max(0, nextMidnightUtc.getTime() - Date.now());
-
     const t = setTimeout(async () => {
       if (cancelled) return;
       const num = await loadTripNumber(counterBusId);
       if (!cancelled) setLocalTripNumber(num);
     }, delay);
-
     return () => { cancelled = true; clearTimeout(t); };
   }, [dashboard?.active_trip?.bus_id, dashboard?.bus?.id]);
 
@@ -2201,10 +2149,7 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
       const r=await api.get('/conductor/dashboard');
       setDashboard(r.data);
       const busId = r.data?.active_trip?.bus_id ?? r.data?.bus?.id;
-      if(busId){
-        const num = await loadTripNumber(busId);
-        setLocalTripNumber(num);
-      }
+      if(busId){ const num = await loadTripNumber(busId); setLocalTripNumber(num); }
     }catch(e){console.error(e);}finally{setDashLoading(false);}
   };
 
@@ -2213,48 +2158,25 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
       if (started) {
         setDashboard((prev:any)=>{
           if (!prev || prev?.active_trip?.trip_id) return prev;
-          return {
-            ...prev,
-            active_trip: {
-              ...(prev.active_trip || {}),
-              trip_id: null,
-              route_name: started.route_name || prev?.active_trip?.route_name || '',
-              direction: started.direction,
-              start_time: started.start_time,
-              status: 'running',
-              bus_number: prev?.bus?.vehicle_number ?? prev?.active_trip?.bus_number,
-            },
-          };
+          return { ...prev, active_trip: { ...(prev.active_trip || {}), trip_id: null, route_name: started.route_name || prev?.active_trip?.route_name || '', direction: started.direction, start_time: started.start_time, status: 'running', bus_number: prev?.bus?.vehicle_number ?? prev?.active_trip?.bus_number, }, };
         });
       }
-
       let dash:any = null;
       for (let i = 0; i < 6; i++) {
-        const r = await api.get('/conductor/dashboard');
-        dash = r.data;
+        const r = await api.get('/conductor/dashboard'); dash = r.data;
         if (dash?.active_trip?.trip_id) break;
         await new Promise<void>((resolve) => setTimeout(() => resolve(), 700));
       }
       if (!dash) return;
       const busId = dash?.active_trip?.bus_id ?? dash?.bus?.id;
       const tripId = dash?.active_trip?.trip_id ?? dash?.active_trip?.id ?? null;
-
       let nextNum: number | null = null;
       if (busId) {
         const existingTripNumber = Number(dash?.active_trip?.trip_number ?? 0);
-        if (Number.isFinite(existingTripNumber) && existingTripNumber > 0) {
-          setLocalTripNumber(existingTripNumber);
-        } else {
-          nextNum = await incrementTripNumber(busId, tripId);
-          setLocalTripNumber(nextNum);
-        }
+        if (Number.isFinite(existingTripNumber) && existingTripNumber > 0) { setLocalTripNumber(existingTripNumber); }
+        else { nextNum = await incrementTripNumber(busId, tripId); setLocalTripNumber(nextNum); }
       }
-
-      setDashboard(
-        nextNum != null && dash?.active_trip
-          ? {...dash, active_trip: {...dash.active_trip, trip_number: nextNum}}
-          : dash,
-      );
+      setDashboard(nextNum != null && dash?.active_trip ? {...dash, active_trip: {...dash.active_trip, trip_number: nextNum}} : dash);
     } catch(e){ console.error(e); } finally { setDashLoading(false); }
   };
 
@@ -2274,7 +2196,7 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
       <ActivityIndicator size="large" color="#00b7f3"/><Text style={{marginTop:12,color:'#888'}}>Loading…</Text>
     </SafeAreaView>
   );
-
+  
   return (
     <SafeAreaView style={{flex:1,backgroundColor:'#F0F4F8'}}>
       <View style={sh.topBar}>
@@ -2297,10 +2219,7 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
           )}
           {posHook.todaySummary().unsynced > 0 && (
             <TouchableOpacity onPress={() => posHook.syncPending()} style={sh.unsyncedBadge}>
-              {posHook.syncing
-                ? <ActivityIndicator size="small" color="#F57F17" />
-                : <Text style={sh.unsyncedText}>⬆ {posHook.todaySummary().unsynced}</Text>
-              }
+              {posHook.syncing?<ActivityIndicator size="small" color="#F57F17"/>:<Text style={sh.unsyncedText}>⬆ {posHook.todaySummary().unsynced}</Text>}
             </TouchableOpacity>
           )}
           {busNum!=='N/A'&&<Text style={{fontSize:12,color:'#888'}}>🚌 {busNum}</Text>}
@@ -2428,6 +2347,7 @@ const sh=StyleSheet.create({
   periodTabText:{fontSize:11,color:'#666',fontWeight:'600'},
   periodTabTextActive:{color:'#fff'},
 });
+
 const tk=StyleSheet.create({
   scrollContent:{paddingTop:8},
   activePill:{flexDirection:'row',alignItems:'center',gap:8,marginHorizontal:16,marginBottom:8,backgroundColor:'#E8F5E9',borderRadius:20,paddingHorizontal:14,paddingVertical:7,alignSelf:'flex-start'},
@@ -2466,15 +2386,6 @@ const tk=StyleSheet.create({
   payMeta:{fontSize:16,color:'#777',fontWeight:'700'},
   ticketPrintBtn:{marginTop:10,backgroundColor:'#f39c12',borderRadius:8,paddingVertical:13,alignItems:'center'},
   ticketPrintText:{fontSize:20,fontWeight:'800',color:'#fff'},
-  section:{marginBottom:24,paddingHorizontal:20},
-  sectionTitle:{fontSize:20,fontWeight:'700',color:'#1a1a1a',marginBottom:4},
-  sectionSub:{fontSize:14,color:'#666',lineHeight:20,marginBottom:16},
-  placesWrap:{position:'relative',marginBottom:20},
-  selHeader:{backgroundColor:'#fff',borderRadius:12,padding:16,borderWidth:1,borderColor:'#eee',marginBottom:8},
-  selHeaderActive:{borderColor:'#00b7f3',backgroundColor:'#f0f9ff'},
-  selLabel:{fontSize:12,color:'#666',marginBottom:4,fontWeight:'500'},
-  selValue:{fontSize:18,color:'#1a1a1a',fontWeight:'600'},
-  selPlaceholder:{color:'#999',fontWeight:'400'},
   placesGrid:{marginBottom:14,backgroundColor:'#fff',borderRadius:10,borderWidth:1,borderColor:'#e2e8f0',overflow:'hidden'},
   chip:{paddingVertical:11,paddingHorizontal:12,borderBottomWidth:1,borderBottomColor:'#eef2f7',backgroundColor:'#fff'},
   chipSel:{backgroundColor:'#E8F7FF'},
@@ -2482,38 +2393,10 @@ const tk=StyleSheet.create({
   chipText:{fontSize:14,color:'#334155',fontWeight:'600'},
   chipTextSel:{color:'#0284c7'},
   chipTextDis:{color:'#999'},
-  revBtn:{position:'absolute',right:16,top:36,backgroundColor:'#fff',borderRadius:24,width:48,height:48,justifyContent:'center',alignItems:'center',elevation:6,zIndex:10,borderWidth:2,borderColor:'#f0f0f0'},
-  revBtnDis:{backgroundColor:'#f8f8f8',borderColor:'#eaeaea'},
-  countWrap:{backgroundColor:'#fff',borderRadius:12,padding:16,flexDirection:'row',alignItems:'center',justifyContent:'space-between',borderWidth:1,borderColor:'#eee',marginTop:12},
-  countLabel:{fontSize:16,color:'#1a1a1a',fontWeight:'600'},
-  countCtrl:{flexDirection:'row',alignItems:'center',backgroundColor:'#f8f9fa',borderRadius:24,borderWidth:1,borderColor:'#eee'},
-  countBtn:{padding:8,borderRadius:20,backgroundColor:'#fff'},
-  countBtnDis:{backgroundColor:'#f5f5f5'},
-  countNum:{fontSize:18,fontWeight:'700',color:'#1a1a1a',paddingHorizontal:16,minWidth:40,textAlign:'center'},
-  fareCard:{backgroundColor:'#fff',borderRadius:16,padding:20,elevation:4,borderWidth:1,borderColor:'#f0f0f0'},
-  fareHdr:{flexDirection:'row',alignItems:'center',marginBottom:16},
-  fareTitle:{fontSize:18,fontWeight:'700',color:'#1a1a1a',marginLeft:12},
-  fareRow:{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:8},
-  fareLabel:{fontSize:14,color:'#666',fontWeight:'500'},
-  fareVal:{fontSize:14,color:'#1a1a1a',fontWeight:'600'},
   fareDivider:{height:1,backgroundColor:'#e0e0e0',marginVertical:8},
   fareTotalLabel:{fontSize:16,color:'#1a1a1a',fontWeight:'700'},
   fareTotalVal:{fontSize:18,color:'#00b7f3',fontWeight:'700'},
-  printBar:{backgroundColor:'#F2F2F2',paddingTop:16,paddingHorizontal:20,paddingBottom:Platform.OS==='ios'?34:20,borderTopWidth:1,borderTopColor:'#e0e0e0',elevation:10},
-  printBtn:{backgroundColor:'#00b7f3',borderRadius:16,padding:16,alignItems:'center',justifyContent:'center',elevation:6},
-  printBtnText:{color:'#fff',fontSize:18,fontWeight:'700',marginBottom:4},
-  printBtnAmt:{color:'#e6f7fd',fontSize:16,fontWeight:'600'},
   detailRow:{flexDirection:'row',justifyContent:'space-between',paddingVertical:8},
-  ticketTypeWrap:{backgroundColor:'#fff',borderRadius:14,padding:16,borderWidth:1,borderColor:'#eee',marginTop:4},
-  ticketTypeRow:{flexDirection:'row',alignItems:'center',justifyContent:'space-between'},
-  ticketTypeLabelWrap:{flexDirection:'row',alignItems:'center',gap:10,flex:1},
-  langWrap:{marginTop:12,paddingTop:12,borderTopWidth:1,borderTopColor:'#f0f0f0'},
-  langTitle:{fontSize:13,color:'#666',fontWeight:'600',marginBottom:8},
-  luggageInput:{backgroundColor:'#F7FAFC',borderWidth:1,borderColor:'#dfe7ef',borderRadius:10,paddingVertical:9,paddingHorizontal:12,fontSize:14,color:'#1a2332'},
-  typeBadge:{paddingHorizontal:8,paddingVertical:3,borderRadius:8,marginRight:2},
-  typeBadgeText:{fontSize:10,fontWeight:'900',letterSpacing:0.5},
-  typeLabel:{fontSize:14,fontWeight:'600',color:'#1a1a1a'},
-  typePrice:{fontSize:12,color:'#888',marginTop:1},
   detailLabel:{fontSize:15,color:'#666',fontWeight:'500'},
   detailVal:{fontSize:15,color:'#1a1a1a',fontWeight:'600',flex:1,textAlign:'right',marginLeft:16},
 });
