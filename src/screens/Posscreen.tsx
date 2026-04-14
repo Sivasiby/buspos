@@ -135,7 +135,29 @@ const StartTripModal = ({visible,onClose,onStarted}:{visible:boolean;onClose:()=
   const [dir,setDir]=useState('up');
   const [loading,setLoading]=useState(false);
   const [fetching,setFetching]=useState(false);
-  useEffect(()=>{if(visible){setSel(null);(async()=>{setFetching(true);try{const r=await api.get('/conductor/routes');setRoutes(r.data?.routes||[]);}catch{setRoutes([]);}finally{setFetching(false);}})();}}, [visible]);
+  useEffect(()=>{
+    if(visible){
+      setSel(null);
+      (async()=>{
+        setFetching(true);
+        try{
+          const r=await api.get('/conductor/routes');
+          const list=r.data?.routes||[];
+          setRoutes(list);
+          if(list.length>0) setSel(list[0].id);
+        }catch{setRoutes([]);}
+        finally{setFetching(false);}
+      })();
+    }
+  }, [visible]);
+
+  const selectedRoute = routes.find((x:any)=>x.id===sel);
+  const routeParts = selectedRoute?.name
+    ? selectedRoute.name.split(/\s*(?:->|→|-)\s*/).map((p:string)=>p.trim()).filter(Boolean)
+    : [];
+  const fwdLabel = routeParts.length>=2 ? `${routeParts[0]} → ${routeParts[1]}` : 'Forward (UP)';
+  const retLabel = routeParts.length>=2 ? `${routeParts[1]} → ${routeParts[0]}` : 'Return (DN)';
+
   const start=async()=>{
     if(!sel){Alert.alert('Select Route','Please select a route first.');return;}
     setLoading(true);
@@ -143,7 +165,6 @@ const StartTripModal = ({visible,onClose,onStarted}:{visible:boolean;onClose:()=
       const r=await api.post('/conductor/trip/start',{route_id:sel,direction:dir});
       if(r.data?.success){
         showToast('Trip started!');
-        const selectedRoute = routes.find((x:any)=>x.id===sel);
         onStarted({direction:dir, route_name:selectedRoute?.name, start_time:new Date().toISOString()});
         onClose();
       }
@@ -169,11 +190,12 @@ const StartTripModal = ({visible,onClose,onStarted}:{visible:boolean;onClose:()=
         )}
         <Text style={[sh.inputLabel,{marginTop:16}]}>Direction</Text>
         <View style={sh.dirRow}>
-          {[{key:'up',label:'Forward (UP)'},{key:'dn',label:'Return (DN)'}].map(d=>(
-            <TouchableOpacity key={d.key} style={[sh.dirBtn,dir===d.key&&sh.dirBtnActive]} onPress={()=>setDir(d.key)}>
-              <Text style={[sh.dirBtnText,dir===d.key&&{color:'#fff'}]}>{d.label}</Text>
-            </TouchableOpacity>
-          ))}
+          <TouchableOpacity style={[sh.dirBtn,dir==='up'&&sh.dirBtnActive]} onPress={()=>setDir('up')}>
+            <Text style={[sh.dirBtnText,dir==='up'&&{color:'#fff'}]}>{fwdLabel}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[sh.dirBtn,dir==='dn'&&sh.dirBtnActive]} onPress={()=>setDir('dn')}>
+            <Text style={[sh.dirBtnText,dir==='dn'&&{color:'#fff'}]}>{retLabel}</Text>
+          </TouchableOpacity>
         </View>
         <TouchableOpacity style={[sh.primaryBtn,loading&&{opacity:.6}]} onPress={start} disabled={loading}>
           {loading?<ActivityIndicator color="#fff"/>:<><Play size={18} color="#fff"/><Text style={sh.primaryBtnText}>Start Trip</Text></>}
@@ -324,54 +346,91 @@ const TripReportModal = ({visible,tripId,onClose,posHook}:{visible:boolean;tripI
   const totalLuggage = appLuggage + posLuggage;
 
   const handlePrint=async()=>{
-    if(Platform.OS!=='android'||!NyxPrinter){Alert.alert('Notice','Printer only on Android.');return;}
     setPrinting(true);
     try{
-      const ret=await NyxPrinter.getPrinterStatus();
-      if(ret!==PrinterStatus.SDK_OK){Alert.alert('Printer Error',PrinterStatus.msg(ret));return;}
       const fmt=(n:number)=>n%1===0?`${n}`:n.toFixed(2);
       const busNum=report?.bus_number??tripPOSTix[0]?.bus_number??'N/A';
       const dir=(report?.direction??tripPOSTix[0]?.direction??'').toUpperCase();
       const today=new Date().toLocaleDateString('en-GB').replace(/\//g,'-');
 
-      await NyxPrinter.printText('SPS - ZYRAP',{textSize:28,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('TRIP REPORT',{textSize:24,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`${report?.route_name||''}`,{textSize:22,align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`Date : ${today}  Bus : ${busNum}`,{textSize:18});
-      await NyxPrinter.printText(`Dir  : ${dir}  Status : ${(report?.status||'').toUpperCase()}`,{textSize:18});
-      await NyxPrinter.printText(`Time : ${formatTime(report?.start_time)}${report?.end_time?` - ${formatTime(report.end_time)}`:'- ongoing'}`,{textSize:18});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`App Full : ${appFullCnt}   Half : ${appHalfCnt}   Free : ${appFreeCnt}   Lugg : ${appLuggageCnt}`,{textSize:18});
-      if(posCnt>0){
-        await NyxPrinter.printText(`POS Full : ${posFullCnt}   Half : ${posHalfCnt}   Lugg : ${posLuggageCnt}   Rs.${fmt(posAmt)}`,{textSize:18});
-      }
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`Total Tickets : ${grandPassengers}`,{textSize:20});
-      await NyxPrinter.printText(`Rs. ${fmt(grandCollection)}`,{textSize:36,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      if(cleanBreakdown.length>0){
-        await NyxPrinter.printText('App Stage-wise:',{textSize:18});
-        for(const rb of cleanBreakdown){
-          await NyxPrinter.printText(
-            `${englishStop(rb.from)} -> ${englishStop(rb.to)}\n  F:${rb.full_count||0} H:${rb.half_count||0} FR:${rb.free_count||0}  Rs.${fmt(Number(rb.total_fare??rb.revenue??0))}`,
-            {textSize:17}
-          );
-          await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});
+      if(__DEV__){
+        // DEV: log trip report to console instead of physical printer
+        console.log('[PRINT] SPS - ZYRAP');
+        console.log('[PRINT] TRIP REPORT');
+        console.log('[PRINT] --------------------------------');
+        console.log(`[PRINT] ${report?.route_name||''}`);
+        console.log(`[PRINT] Date : ${today}  Bus : ${busNum}`);
+        console.log(`[PRINT] Dir  : ${dir}  Status : ${(report?.status||'').toUpperCase()}`);
+        console.log(`[PRINT] Time : ${formatTime(report?.start_time)}${report?.end_time?` - ${formatTime(report.end_time)}`:'- ongoing'}`);
+        console.log('[PRINT] --------------------------------');
+        console.log(`[PRINT] App Full : ${appFullCnt}   Half : ${appHalfCnt}   Free : ${appFreeCnt}   Lugg : ${appLuggageCnt}`);
+        if(posCnt>0){
+          console.log(`[PRINT] POS Full : ${posFullCnt}   Half : ${posHalfCnt}   Lugg : ${posLuggageCnt}   Rs.${fmt(posAmt)}`);
         }
-      }
-      if(posBreakdownRows.length>0){
-        await NyxPrinter.printText('POS Stage-wise:',{textSize:18});
-        for(const rb of posBreakdownRows){
-          await NyxPrinter.printText(
-            `${rb.from} -> ${rb.to}\n  Tickets:${rb.count}  Rs.${fmt(rb.fare)}`,
-            {textSize:17}
-          );
-          await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});
+        console.log('[PRINT] --------------------------------');
+        console.log(`[PRINT] Total Tickets : ${grandPassengers}`);
+        console.log(`[PRINT] Rs. ${fmt(grandCollection)}`);
+        console.log('[PRINT] --------------------------------');
+        if(cleanBreakdown.length>0){
+          console.log('[PRINT] App Stage-wise:');
+          for(const rb of cleanBreakdown){
+            console.log(`[PRINT] ${englishStop(rb.from)} -> ${englishStop(rb.to)}\n  F:${rb.full_count||0} H:${rb.half_count||0} FR:${rb.free_count||0}  Rs.${fmt(Number(rb.total_fare??rb.revenue??0))}`);
+            console.log('[PRINT] - - - - - - - - - - - - - - - -');
+          }
         }
+        if(posBreakdownRows.length>0){
+          console.log('[PRINT] POS Stage-wise:');
+          for(const rb of posBreakdownRows){
+            console.log(`[PRINT] ${rb.from} -> ${rb.to}\n  Tickets:${rb.count}  Rs.${fmt(rb.fare)}`);
+            console.log('[PRINT] - - - - - - - - - - - - - - - -');
+          }
+        }
+        console.log('[PRINT] ** Safe Journey **');
+        console.log('[PRINT] --- END OF PRINT ---');
+      }else{
+        // PROD: use physical printer
+        if(Platform.OS!=='android'||!NyxPrinter){Alert.alert('Notice','Printer only on Android.');return;}
+        const ret=await NyxPrinter.getPrinterStatus();
+        if(ret!==PrinterStatus.SDK_OK){Alert.alert('Printer Error',PrinterStatus.msg(ret));return;}
+        await NyxPrinter.printText('SPS - ZYRAP',{textSize:28,align:PrintAlign.CENTER});
+        await NyxPrinter.printText('TRIP REPORT',{textSize:24,align:PrintAlign.CENTER});
+        await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
+        await NyxPrinter.printText(`${report?.route_name||''}`,{textSize:22,align:PrintAlign.CENTER});
+        await NyxPrinter.printText(`Date : ${today}  Bus : ${busNum}`,{textSize:18});
+        await NyxPrinter.printText(`Dir  : ${dir}  Status : ${(report?.status||'').toUpperCase()}`,{textSize:18});
+        await NyxPrinter.printText(`Time : ${formatTime(report?.start_time)}${report?.end_time?` - ${formatTime(report.end_time)}`:'- ongoing'}`,{textSize:18});
+        await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
+        await NyxPrinter.printText(`App Full : ${appFullCnt}   Half : ${appHalfCnt}   Free : ${appFreeCnt}   Lugg : ${appLuggageCnt}`,{textSize:18});
+        if(posCnt>0){
+          await NyxPrinter.printText(`POS Full : ${posFullCnt}   Half : ${posHalfCnt}   Lugg : ${posLuggageCnt}   Rs.${fmt(posAmt)}`,{textSize:18});
+        }
+        await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
+        await NyxPrinter.printText(`Total Tickets : ${grandPassengers}`,{textSize:20});
+        await NyxPrinter.printText(`Rs. ${fmt(grandCollection)}`,{textSize:36,align:PrintAlign.CENTER});
+        await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
+        if(cleanBreakdown.length>0){
+          await NyxPrinter.printText('App Stage-wise:',{textSize:18});
+          for(const rb of cleanBreakdown){
+            await NyxPrinter.printText(
+              `${englishStop(rb.from)} -> ${englishStop(rb.to)}\n  F:${rb.full_count||0} H:${rb.half_count||0} FR:${rb.free_count||0}  Rs.${fmt(Number(rb.total_fare??rb.revenue??0))}`,
+              {textSize:17}
+            );
+            await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});
+          }
+        }
+        if(posBreakdownRows.length>0){
+          await NyxPrinter.printText('POS Stage-wise:',{textSize:18});
+          for(const rb of posBreakdownRows){
+            await NyxPrinter.printText(
+              `${rb.from} -> ${rb.to}\n  Tickets:${rb.count}  Rs.${fmt(rb.fare)}`,
+              {textSize:17}
+            );
+            await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});
+          }
+        }
+        await NyxPrinter.printText('** Safe Journey **',{align:PrintAlign.CENTER});
+        await NyxPrinter.printEndAutoOut();
       }
-      await NyxPrinter.printText('** Safe Journey **',{align:PrintAlign.CENTER});
-      await NyxPrinter.printEndAutoOut();
       showToast('Trip report printed!');
     }catch(e:any){Alert.alert('Print Error',e.message||'Unknown');}
     finally{setPrinting(false);}
@@ -832,17 +891,19 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
   );
 
   const handlePrint = async () => {
-    if (Platform.OS !== 'android') {
+    if (!__DEV__ && Platform.OS !== 'android') {
       Alert.alert('Notice', 'Printer only on Android.');
       setShowConfirm(false);
       return;
     }
     setIssuing(true);
     try {
-      const ret = await NyxPrinter.getPrinterStatus();
-      if (ret !== PrinterStatus.SDK_OK) {
-        Alert.alert('Printer Error', PrinterStatus.msg(ret));
-        return;
+      if (!__DEV__) {
+        const ret = await NyxPrinter.getPrinterStatus();
+        if (ret !== PrinterStatus.SDK_OK) {
+          Alert.alert('Printer Error', PrinterStatus.msg(ret));
+          return;
+        }
       }
       const now = new Date();
       const dp = now.toLocaleDateString('en-GB').replace(/\//g, '-');
@@ -870,39 +931,62 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
       const luggageTicketOnFull = luggageOnFull > 0 ? 1 : 0;
       const luggageTicketOnHalf = luggageOnHalf > 0 ? 1 : 0;
 
-      await NyxPrinter.printText('SPS - ZYRAP', { textSize: 28, align: PrintAlign.CENTER });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
       const numLine = [
         fullTicketNum  ? `#${fullTicketNum}`  : null,
         halfTicketNum  ? `#${halfTicketNum}`  : null,
       ].filter(Boolean).join(' / ');
-      if (numLine) {
-        await NyxPrinter.printText(`Ticket: ${numLine}`, { textSize: 20, align: PrintAlign.CENTER });
+
+      if (__DEV__) {
+        // DEV: log ticket to console instead of physical printer
+        console.log('[PRINT] SPS - ZYRAP');
+        console.log('[PRINT] --------------------------------');
+        if (numLine) console.log(`[PRINT] Ticket: ${numLine}`);
+        console.log(`[PRINT] ${dp}   ${tp}`);
+        console.log(`[PRINT] Bus: ${busNumber}          CASH`);
+        if (luggageAmount > 0) console.log(`[PRINT] Luggage: Rs ${fareStr(luggageAmount)}`);
+        console.log('[PRINT] --------------------------------');
+        console.log(`[PRINT] ${fnum}-${fn}`);
+        console.log(`[PRINT] ${tnum}-${tn}`);
+        console.log('[PRINT] --------------------------------');
+        if (fullCount > 0) console.log(`[PRINT] ADULT(S): ${fullCount} * ${fareStr(baseFullFare)} = ${fareStr(fullTotal)}`);
+        if (halfCount > 0) console.log(`[PRINT] CHILD(S): ${halfCount} * ${fareStr(baseHalfFare)} = ${fareStr(halfTotal)}`);
+        if (luggageAmount > 0) console.log(`[PRINT] LUGGAGE : Rs ${fareStr(luggageAmount)}`);
+        console.log(`[PRINT] Rs : ${fareStr(grandTotal)}`);
+        console.log('[PRINT] --------------------------------');
+        console.log(`[PRINT] ${fortune}`);
+        console.log('[PRINT] --- END OF PRINT ---');
+      } else {
+        // PROD: use physical printer
+        await NyxPrinter.printText('SPS - ZYRAP', { textSize: 28, align: PrintAlign.CENTER });
+        await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+        if (numLine) {
+          await NyxPrinter.printText(`Ticket: ${numLine}`, { textSize: 20, align: PrintAlign.CENTER });
+        }
+        await NyxPrinter.printText(`${dp}   ${tp}`, { textSize: 22, align: PrintAlign.CENTER });
+        await NyxPrinter.printText(`Bus: ${busNumber}          CASH`, { textSize: 22 });
+        if (luggageAmount > 0) await NyxPrinter.printText(`Luggage: Rs ${fareStr(luggageAmount)}`, { textSize: 20 });
+        await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+        await NyxPrinter.printText(`${fnum}-${fn}`, { textSize: 24 });
+        await NyxPrinter.printText(`${tnum}-${tn}`, { textSize: 24 });
+        await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+        if (fullCount > 0)
+          await NyxPrinter.printText(
+            `ADULT(S): ${fullCount} * ${fareStr(baseFullFare)} = ${fareStr(fullTotal)}`,
+            { textSize: 22 },
+          );
+        if (halfCount > 0)
+          await NyxPrinter.printText(
+            `CHILD(S): ${halfCount} * ${fareStr(baseHalfFare)} = ${fareStr(halfTotal)}`,
+            { textSize: 22 },
+          );
+        if (luggageAmount > 0) {
+          await NyxPrinter.printText(`LUGGAGE : Rs ${fareStr(luggageAmount)}`, { textSize: 22 });
+        }
+        await NyxPrinter.printText(`Rs : ${fareStr(grandTotal)}`, { textSize: 36, align: PrintAlign.CENTER });
+        await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+        await NyxPrinter.printText(fortune, { textSize: 18, align: PrintAlign.CENTER });
+        await NyxPrinter.printEndAutoOut();
       }
-      await NyxPrinter.printText(`${dp}   ${tp}`, { textSize: 22, align: PrintAlign.CENTER });
-      await NyxPrinter.printText(`Bus: ${busNumber}          CASH`, { textSize: 22 });
-      if (luggageAmount > 0) await NyxPrinter.printText(`Luggage: Rs ${fareStr(luggageAmount)}`, { textSize: 20 });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      await NyxPrinter.printText(`${fnum}-${fn}`, { textSize: 24 });
-      await NyxPrinter.printText(`${tnum}-${tn}`, { textSize: 24 });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      if (fullCount > 0)
-        await NyxPrinter.printText(
-          `ADULT(S): ${fullCount} * ${fareStr(baseFullFare)} = ${fareStr(fullTotal)}`,
-          { textSize: 22 },
-        );
-      if (halfCount > 0)
-        await NyxPrinter.printText(
-          `CHILD(S): ${halfCount} * ${fareStr(baseHalfFare)} = ${fareStr(halfTotal)}`,
-          { textSize: 22 },
-        );
-      if (luggageAmount > 0) {
-        await NyxPrinter.printText(`LUGGAGE : Rs ${fareStr(luggageAmount)}`, { textSize: 22 });
-      }
-      await NyxPrinter.printText(`Rs : ${fareStr(grandTotal)}`, { textSize: 36, align: PrintAlign.CENTER });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      await NyxPrinter.printText(fortune, { textSize: 18, align: PrintAlign.CENTER });
-      await NyxPrinter.printEndAutoOut();
 
       if (fullCount > 0 || isLuggageOnlyTicket) {
         const t: POSTicket = {
@@ -965,7 +1049,7 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
 
   return (
     <>
-      <ScrollView style={{flex:1}} contentContainerStyle={[tk.scrollContent,{paddingBottom:isReady?190:100}]} showsVerticalScrollIndicator={false}>
+      <ScrollView style={{flex:1}} contentContainerStyle={[tk.scrollContent,{paddingBottom:isReady?190:100}]} showsVerticalScrollIndicator={false} nestedScrollEnabled>
         {activeTrip?(
           <View style={tk.activePill}><Bus size={13} color="#2E7D32"/>
             <Text style={tk.activePillText}>
@@ -992,56 +1076,66 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
               {dirErr&&<View style={tk.dirErr}><AlertCircle size={14} color="#C62828"/><Text style={tk.dirErrText}>{dirErr}</Text></View>}
 
           <View style={tk.tripSelectorBar}>
-            <TouchableOpacity style={tk.tripSide} onPress={()=>setActiveDrop(p=>p==='start'?null:'start')}>
-              <Navigation size={15} color="#666"/>
-              <View style={tk.tripSideCol}>
-                <Text style={tk.tripSideHint}>Leaving From</Text>
-                <Text style={tk.tripSideText} numberOfLines={1} ellipsizeMode="tail">
-                  {selStart ? selStart.label.split('-').slice(2).join(' ') || selStart.label.split('-').slice(1).join(' ') : 'Select start'}
-                </Text>
-              </View>
+            <TouchableOpacity style={[tk.tripSide,selStart?tk.tripSideFrom:activeDrop==='start'?tk.tripSideFromActive:null]} onPress={()=>setActiveDrop(p=>p==='start'?null:'start')}>
+              <Text style={[tk.tripSideHint,selStart&&tk.tripSideHintFrom]}>FROM</Text>
+              {selStart ? (
+                <View style={tk.tripSideRow}>
+                  <Text style={[tk.tripStopNum,tk.tripStopNumFrom]}>{selStart.label.split('-')[1]}</Text>
+                  <Text style={tk.tripStopName} numberOfLines={1} ellipsizeMode="tail">{selStart.label.split('-').slice(2).join(' ') || selStart.label.split('-').slice(1).join(' ')}</Text>
+                </View>
+              ) : (
+                <Text style={tk.tripSidePlaceholder}>Tap to select</Text>
+              )}
             </TouchableOpacity>
             <TouchableOpacity
               style={[tk.swapBtn,(!selStart||!selDest)&&{opacity:.4}]}
               onPress={()=>{if(selStart&&selDest){const t=selStart;setSelStart(selDest);setSelDest(t);}}}
               disabled={!selStart||!selDest}
             >
-              <ArrowUpDown size={15} color="#4B5563"/>
+              <ArrowUpDown size={16} color="#4B5563"/>
             </TouchableOpacity>
-            <TouchableOpacity style={tk.tripSide} onPress={()=>setActiveDrop(p=>p==='destination'?null:'destination')}>
-              <Navigation size={15} color="#666"/>
-              <View style={tk.tripSideCol}>
-                <Text style={tk.tripSideHint}>Going To</Text>
-                <Text style={tk.tripSideText} numberOfLines={1} ellipsizeMode="tail">
-                  {selDest ? selDest.label.split('-').slice(2).join(' ') || selDest.label.split('-').slice(1).join(' ') : 'Select destination'}
-                </Text>
-              </View>
+            <TouchableOpacity style={[tk.tripSide,selDest?tk.tripSideTo:activeDrop==='destination'?tk.tripSideToActive:null]} onPress={()=>setActiveDrop(p=>p==='destination'?null:'destination')}>
+              <Text style={[tk.tripSideHint,selDest&&tk.tripSideHintTo]}>TO</Text>
+              {selDest ? (
+                <View style={tk.tripSideRow}>
+                  <Text style={[tk.tripStopNum,tk.tripStopNumTo]}>{selDest.label.split('-')[1]}</Text>
+                  <Text style={tk.tripStopName} numberOfLines={1} ellipsizeMode="tail">{selDest.label.split('-').slice(2).join(' ') || selDest.label.split('-').slice(1).join(' ')}</Text>
+                </View>
+              ) : (
+                <Text style={tk.tripSidePlaceholder}>Tap to select</Text>
+              )}
             </TouchableOpacity>
           </View>
           {activeDrop==='start'&&(
-            <View style={tk.placesGrid}>
+            <ScrollView style={[tk.placesGrid,tk.placesGridFrom,tk.placesGridScroll]} nestedScrollEnabled showsVerticalScrollIndicator={false}>
+              <View style={tk.chipGrid}>
               {getPlaces().map((p:any)=>{
                 const dis=selDest?.key===p.key,sel=selStart?.key===p.key;
                 return(
-                  <TouchableOpacity key={`s-${p.key}`} style={[tk.chip,sel&&tk.chipSel,dis&&tk.chipDis]} disabled={dis} onPress={()=>{setSelStart(p);setActiveDrop('destination');}}>
-                    <Text style={[tk.chipText,sel&&tk.chipTextSel,dis&&tk.chipTextDis]}>{p.label.split('-')[1]} {p.label.split('-')[2]}</Text>
+                  <TouchableOpacity key={`s-${p.key}`} style={[tk.chip2,sel&&tk.chipSelFrom,dis&&tk.chipDis]} disabled={dis} onPress={()=>{setSelStart(p);setActiveDrop('destination');}}>
+                    <Text style={[tk.chipNum,sel&&tk.chipNumSelFrom,dis&&tk.chipTextDis]}>{p.label.split('-')[1]}</Text>
+                    <Text style={[tk.chipText,sel&&tk.chipTextSelFrom,dis&&tk.chipTextDis]} numberOfLines={1} ellipsizeMode="tail">{p.label.split('-')[2]}</Text>
                   </TouchableOpacity>
                 );
               })}
-            </View>
+              </View>
+            </ScrollView>
           )}
 
           {activeDrop==='destination'&&(
-            <View style={tk.placesGrid}>
+            <ScrollView style={[tk.placesGrid,tk.placesGridTo,tk.placesGridScroll]} nestedScrollEnabled showsVerticalScrollIndicator={false}>
+              <View style={tk.chipGrid}>
               {getPlaces().filter((_:any,idx:number)=>{if(!selStart)return true;const si=getPlaces().findIndex((p:any)=>p.key===selStart.key);return idx>si;}).map((p:any)=>{
                 const dis=selStart?.key===p.key,sel=selDest?.key===p.key;
                 return(
-                  <TouchableOpacity key={`d-${p.key}`} style={[tk.chip,sel&&tk.chipSel,dis&&tk.chipDis]} disabled={dis} onPress={()=>{setSelDest(p);setActiveDrop(null);}}>
-                    <Text style={[tk.chipText,sel&&tk.chipTextSel,dis&&tk.chipTextDis]}>{p.label.split('-')[1]} {p.label.split('-')[2]}</Text>
+                  <TouchableOpacity key={`d-${p.key}`} style={[tk.chip2,sel&&tk.chipSelTo,dis&&tk.chipDis]} disabled={dis} onPress={()=>{setSelDest(p);setActiveDrop(null);}}>
+                    <Text style={[tk.chipNum,sel&&tk.chipNumSelTo,dis&&tk.chipTextDis]}>{p.label.split('-')[1]}</Text>
+                    <Text style={[tk.chipText,sel&&tk.chipTextSelTo,dis&&tk.chipTextDis]} numberOfLines={1} ellipsizeMode="tail">{p.label.split('-')[2]}</Text>
                   </TouchableOpacity>
                 );
               })}
-            </View>
+              </View>
+            </ScrollView>
           )}
 
           <View style={tk.countHeaderRow}>
@@ -1073,7 +1167,6 @@ const TicketTab = ({activeTrip,user,busNumber,onTicketIssued,tripNumber}:{active
           <TextInput style={tk.fieldInput} keyboardType="numeric" value={luggageInput} onChangeText={setLuggageInput} placeholder="0" placeholderTextColor="#9AA7B5"/>
 
           <View style={tk.payWrap}>
-            <Text style={tk.payLabel}>Pay</Text>
             <Text style={tk.payValue}>₹{fareStr(grandTotal)}</Text>
             <Text style={tk.payMeta}>Total Tickets : {totalTickets}</Text>
           </View>
@@ -1171,33 +1264,62 @@ const TripTab = ({dashboard,onRefresh,pendingRequests,verifyingTicket,onVerifyTi
     if(!at)return;
     Alert.alert('Confirm',s==='completed'?'End this trip?':s==='paused'?'Pause?':'Resume?',[{text:'Cancel',style:'cancel'},{text:'Yes',onPress:async()=>{
       setChanging(true);
-      try{await api.post(`/conductor/trip/${at.trip_id}/status`,{status:s});showToast(s==='completed'?'Trip ended!':s==='paused'?'Trip paused':'Trip resumed');onRefresh();}
+      try{
+        await api.post(`/conductor/trip/${at.trip_id}/status`,{status:s});
+        showToast(s==='completed'?'Trip ended!':s==='paused'?'Trip paused':'Trip resumed');
+        if(s==='completed'){setStartModal(true);onRefresh();}else{await onRefresh();}
+      }
       catch(e:any){Alert.alert('Error',e?.response?.data?.error||'Could not change status.');}
       finally{setChanging(false);}
     }}]);
   };
 
   const printStage=async(data:any)=>{
-    if(Platform.OS!=='android'||!NyxPrinter){Alert.alert('Notice','Printer only on Android.');return;}
     try{
-      const ret=await NyxPrinter.getPrinterStatus();if(ret!==PrinterStatus.SDK_OK){Alert.alert('Printer Error',PrinterStatus.msg(ret));return;}
       const bn=at?.bus_number??dashboard?.bus?.vehicle_number??'N/A';
       const fmt=(n:number)=>n%1===0?`${n}`:n.toFixed(2);
       const fE=data.fromStop?englishStop(data.fromStop.name):'All',fL=data.fromStop?shortStop(data.fromStop.name):'';
       const tE=data.toStop?englishStop(data.toStop.name):'All',tL=data.toStop?shortStop(data.toStop.name):'';
-      await NyxPrinter.printText('SPS - ZYRAP',{textSize:32,align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`${new Date().toLocaleString()}  Bus: ${bn}`,{textSize:20});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText('STAGE REPORT',{textSize:26,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`From : ${fE}${fL?' ('+fL+')':''}\nTo   : ${tE}${tL?' ('+tL+')':''}`,{});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      await NyxPrinter.printText(`Tickets: ${data.tickets}  F:${data.full??0} H:${data.half??0} FR:${data.free??0}`,{});
-      await NyxPrinter.printText(`Rs. ${fmt(Number(data.collection))}`,{textSize:32,align:PrintAlign.CENTER});
-      await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
-      if(data.breakdown?.length>0){await NyxPrinter.printText('Stage-wise:',{});for(const rb of data.breakdown){await NyxPrinter.printText(`${englishStop(rb.from)} -> ${englishStop(rb.to)}\n  F:${rb.full_count??0} H:${rb.half_count??0} FR:${rb.free_count??0}  Rs.${fmt(Number(rb.total_fare??rb.revenue??0))}`,{});await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});}}
-      await NyxPrinter.printText('** Safe Journey **',{align:PrintAlign.CENTER});
-      await NyxPrinter.printEndAutoOut();showToast('Stage report printed!');
+      if(__DEV__){
+        // DEV: log stage report to console instead of physical printer
+        console.log('[PRINT] SPS - ZYRAP');
+        console.log(`[PRINT] ${new Date().toLocaleString()}  Bus: ${bn}`);
+        console.log('[PRINT] --------------------------------');
+        console.log('[PRINT] STAGE REPORT');
+        console.log('[PRINT] --------------------------------');
+        console.log(`[PRINT] From : ${fE}${fL?' ('+fL+')':''}\nTo   : ${tE}${tL?' ('+tL+')':''}`);
+        console.log('[PRINT] --------------------------------');
+        console.log(`[PRINT] Tickets: ${data.tickets}  F:${data.full??0} H:${data.half??0} FR:${data.free??0}`);
+        console.log(`[PRINT] Rs. ${fmt(Number(data.collection))}`);
+        console.log('[PRINT] --------------------------------');
+        if(data.breakdown?.length>0){
+          console.log('[PRINT] Stage-wise:');
+          for(const rb of data.breakdown){
+            console.log(`[PRINT] ${englishStop(rb.from)} -> ${englishStop(rb.to)}\n  F:${rb.full_count??0} H:${rb.half_count??0} FR:${rb.free_count??0}  Rs.${fmt(Number(rb.total_fare??rb.revenue??0))}`);
+            console.log('[PRINT] - - - - - - - - - - - - - - - -');
+          }
+        }
+        console.log('[PRINT] ** Safe Journey **');
+        console.log('[PRINT] --- END OF PRINT ---');
+        showToast('Stage report printed!');
+      }else{
+        // PROD: use physical printer
+        if(Platform.OS!=='android'||!NyxPrinter){Alert.alert('Notice','Printer only on Android.');return;}
+        const ret=await NyxPrinter.getPrinterStatus();if(ret!==PrinterStatus.SDK_OK){Alert.alert('Printer Error',PrinterStatus.msg(ret));return;}
+        await NyxPrinter.printText('SPS - ZYRAP',{textSize:32,align:PrintAlign.CENTER});
+        await NyxPrinter.printText(`${new Date().toLocaleString()}  Bus: ${bn}`,{textSize:20});
+        await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
+        await NyxPrinter.printText('STAGE REPORT',{textSize:26,align:PrintAlign.CENTER});
+        await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
+        await NyxPrinter.printText(`From : ${fE}${fL?' ('+fL+')':''}\nTo   : ${tE}${tL?' ('+tL+')':''}`,{});
+        await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
+        await NyxPrinter.printText(`Tickets: ${data.tickets}  F:${data.full??0} H:${data.half??0} FR:${data.free??0}`,{});
+        await NyxPrinter.printText(`Rs. ${fmt(Number(data.collection))}`,{textSize:32,align:PrintAlign.CENTER});
+        await NyxPrinter.printText('--------------------------------',{align:PrintAlign.CENTER});
+        if(data.breakdown?.length>0){await NyxPrinter.printText('Stage-wise:',{});for(const rb of data.breakdown){await NyxPrinter.printText(`${englishStop(rb.from)} -> ${englishStop(rb.to)}\n  F:${rb.full_count??0} H:${rb.half_count??0} FR:${rb.free_count??0}  Rs.${fmt(Number(rb.total_fare??rb.revenue??0))}`,{});await NyxPrinter.printText('- - - - - - - - - - - - - - - -',{align:PrintAlign.CENTER});}}
+        await NyxPrinter.printText('** Safe Journey **',{align:PrintAlign.CENTER});
+        await NyxPrinter.printEndAutoOut();showToast('Stage report printed!');
+      }
     }catch(e:any){Alert.alert('Print Error',e.message||'Unknown');}
   };
 
@@ -2279,9 +2401,9 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
     <SafeAreaView style={{flex:1,backgroundColor:'#F0F4F8'}}>
       <View style={sh.topBar}>
         <View>
-          <View style={sh.conductorBadge}><BadgeCheck size={11} color="#fff"/><Text style={sh.conductorBadgeText}>CONDUCTOR</Text></View>
+          {/* <View style={sh.conductorBadge}><BadgeCheck size={11} color="#fff"/><Text style={sh.conductorBadgeText}>CONDUCTOR</Text></View> */}
           <View style={{flexDirection:'row',alignItems:'center',gap:6}}>
-            <Text style={sh.topBarTitle}>BusPOS</Text>
+            {/* <Text style={sh.topBarTitle}>BusPOS</Text> */}
             {displayTripNumber>0&&(
               <View style={sh.tripNumBadge}>
                 <Text style={sh.tripNumText}>Trip #{displayTripNumber}</Text>
@@ -2304,7 +2426,7 @@ const POSScreen = ({user,onLogout}:{user:any;onLogout?:()=>void}) => {
             </TouchableOpacity>
           )}
           {busNum!=='N/A'&&<Text style={{fontSize:12,color:'#888'}}>🚌 {busNum}</Text>}
-          {onLogout&&<TouchableOpacity onPress={onLogout} style={{padding:6}}><LogOut size={20} color="#999"/></TouchableOpacity>}
+          {onLogout&&<TouchableOpacity onPress={()=>Alert.alert('Logout','Are you sure you want to logout?',[{text:'Cancel',style:'cancel'},{text:'Logout',style:'destructive',onPress:onLogout}])} style={{padding:6}}><LogOut size={20} color="#999"/></TouchableOpacity>}
         </View>
       </View>
 
@@ -2343,7 +2465,7 @@ const sh=StyleSheet.create({
   conductorBadgeText:{color:'#fff',fontSize:9,fontWeight:'800',letterSpacing:1},
   topBarTitle:{fontSize:22,fontWeight:'900',color:'#1a2332'},
   tripNumBadge:{backgroundColor:'#E3F2FD',paddingHorizontal:8,paddingVertical:2,borderRadius:8,borderWidth:1,borderColor:'#90CAF9'},
-  tripNumText:{fontSize:11,color:'#1565C0',fontWeight:'700'},
+  tripNumText:{fontSize:15,color:'#1565C0',fontWeight:'700'},
   tabBar:{flexDirection:'row',backgroundColor:'#fff',borderTopWidth:1,borderTopColor:'#eee',paddingBottom:Platform.OS==='ios'?16:6,paddingTop:6,elevation:10},
   tabItem:{flex:1,alignItems:'center'},
   tabIconWrap:{padding:6,borderRadius:12,position:'relative'},
@@ -2440,16 +2562,29 @@ const tk=StyleSheet.create({
   busPillText:{fontSize:12,color:'#1565C0',fontWeight:'600'},
   dirErr:{flexDirection:'row',alignItems:'flex-start',gap:8,backgroundColor:'#FFEBEE',borderRadius:10,padding:10,marginBottom:12,borderWidth:1,borderColor:'#FFCDD2'},
   dirErrText:{fontSize:13,color:'#C62828',flex:1,lineHeight:18},
-  ticketCard:{marginHorizontal:16,marginBottom:16,backgroundColor:'#fff',borderRadius:12,padding:14,borderWidth:1,borderColor:'#e7e7e7'},
+  ticketCard:{marginHorizontal:10,marginBottom:16,backgroundColor:'#fff',borderRadius:12,padding:10,borderWidth:1,borderColor:'#e7e7e7'},
   startTripPrompt:{alignItems:'center',justifyContent:'center',paddingVertical:18,paddingHorizontal:8},
   startTripPromptTitle:{fontSize:18,fontWeight:'700',color:'#1a2332',marginTop:8},
   startTripPromptText:{fontSize:13,color:'#6B7280',textAlign:'center',marginTop:6,lineHeight:18},
-  tripSelectorBar:{flexDirection:'row',alignItems:'center',backgroundColor:'#F1F1F3',borderRadius:18,paddingVertical:10,paddingHorizontal:10,marginBottom:12},
-  tripSide:{flex:1,flexDirection:'row',alignItems:'center',gap:6,minWidth:0},
+  tripSelectorBar:{flexDirection:'row',alignItems:'stretch',backgroundColor:'#F1F1F3',borderRadius:14,paddingVertical:0,paddingHorizontal:0,marginBottom:10,overflow:'hidden'},
+  tripSide:{flex:1,flexDirection:'column',alignItems:'flex-start',justifyContent:'center',paddingVertical:10,paddingHorizontal:10,minWidth:0},
+  tripSideActive:{backgroundColor:'#E8F7FF'},
+  tripSideFromActive:{backgroundColor:'#EFF6FF'},
+  tripSideFrom:{backgroundColor:'#EFF6FF'},
+  tripSideToActive:{backgroundColor:'#FFF7ED'},
+  tripSideTo:{backgroundColor:'#FFF7ED'},
+  tripSideHintFrom:{color:'#0284c7'},
+  tripSideHintTo:{color:'#c2410c'},
+  tripStopNumFrom:{color:'#0284c7'},
+  tripStopNumTo:{color:'#ea580c'},
+  tripSideRow:{flexDirection:'row',alignItems:'baseline',gap:4,flexShrink:1,maxWidth:'100%'},
+  tripSideHint:{fontSize:10,color:'#6B7280',fontWeight:'800',letterSpacing:0.5,marginBottom:2},
+  tripSidePlaceholder:{fontSize:14,color:'#9CA3AF',fontWeight:'500'},
+  tripStopNum:{fontSize:26,fontWeight:'900',color:'#0284c7',lineHeight:30},
+  tripStopName:{fontSize:13,fontWeight:'600',color:'#374151',flexShrink:1},
   tripSideCol:{flex:1,minWidth:0},
-  tripSideHint:{fontSize:11,color:'#6B7280',fontWeight:'600'},
   tripSideText:{fontSize:15,fontWeight:'700',color:'#374151'},
-  swapBtn:{width:36,height:36,borderRadius:18,backgroundColor:'#fff',borderWidth:1,borderColor:'#d8d8dc',justifyContent:'center',alignItems:'center',marginHorizontal:10},
+  swapBtn:{width:36,alignSelf:'stretch',backgroundColor:'#fff',borderLeftWidth:1,borderRightWidth:1,borderColor:'#d8d8dc',justifyContent:'center',alignItems:'center'},
   fieldLabel:{fontSize:14,fontWeight:'600',color:'#333',marginBottom:6,marginTop:6},
   fieldInput:{backgroundColor:'#f8f8f8',borderRadius:6,borderWidth:1,borderColor:'#ddd',paddingHorizontal:10,paddingVertical:10,marginBottom:8,color:'#1a1a1a'},
   fieldInputText:{fontSize:15,color:'#444'},
@@ -2475,13 +2610,26 @@ const tk=StyleSheet.create({
   selLabel:{fontSize:12,color:'#666',marginBottom:4,fontWeight:'500'},
   selValue:{fontSize:18,color:'#1a1a1a',fontWeight:'600'},
   selPlaceholder:{color:'#999',fontWeight:'400'},
-  placesGrid:{marginBottom:14,backgroundColor:'#fff',borderRadius:10,borderWidth:1,borderColor:'#e2e8f0',overflow:'hidden'},
-  chip:{paddingVertical:11,paddingHorizontal:12,borderBottomWidth:1,borderBottomColor:'#eef2f7',backgroundColor:'#fff'},
-  chipSel:{backgroundColor:'#E8F7FF'},
-  chipDis:{backgroundColor:'#f8fafc',opacity:.55},
-  chipText:{fontSize:14,color:'#334155',fontWeight:'600'},
+  placesGrid:{marginBottom:10,backgroundColor:'#fff',borderRadius:10,borderWidth:1,borderColor:'#e2e8f0',overflow:'hidden'},
+  placesGridScroll:{maxHeight:220},
+  chipGrid:{flexDirection:'row',flexWrap:'wrap'},
+  chip:{paddingVertical:13,paddingHorizontal:12,borderBottomWidth:1,borderBottomColor:'#eef2f7',backgroundColor:'#fff',flexDirection:'row',alignItems:'center',gap:10},
+  chip2:{width:'50%',paddingVertical:12,paddingHorizontal:10,borderBottomWidth:1,borderBottomColor:'#eef2f7',borderRightWidth:1,borderRightColor:'#eef2f7',backgroundColor:'#fff',flexDirection:'row',alignItems:'center',gap:6},
+  chipSel:{backgroundColor:'#E8F7FF',borderLeftWidth:3,borderLeftColor:'#0284c7'},
+  chipSelFrom:{backgroundColor:'#EFF6FF',borderLeftWidth:3,borderLeftColor:'#0284c7'},
+  chipSelTo:{backgroundColor:'#FFF7ED',borderLeftWidth:3,borderLeftColor:'#ea580c'},
+  chipDis:{backgroundColor:'#f8fafc',opacity:.45},
+  chipNum:{fontSize:22,fontWeight:'900',color:'#1e3a5f',minWidth:32,textAlign:'center'},
+  chipNumSel:{color:'#0284c7'},
+  chipNumSelFrom:{color:'#0284c7'},
+  chipNumSelTo:{color:'#ea580c'},
+  chipText:{fontSize:14,color:'#334155',fontWeight:'600',flex:1},
   chipTextSel:{color:'#0284c7'},
-  chipTextDis:{color:'#999'},
+  chipTextSelFrom:{color:'#0284c7'},
+  chipTextSelTo:{color:'#ea580c'},
+  chipTextDis:{color:'#bbb'},
+  placesGridFrom:{borderColor:'#bfdbfe'},
+  placesGridTo:{borderColor:'#fed7aa'},
   revBtn:{position:'absolute',right:16,top:36,backgroundColor:'#fff',borderRadius:24,width:48,height:48,justifyContent:'center',alignItems:'center',elevation:6,zIndex:10,borderWidth:2,borderColor:'#f0f0f0'},
   revBtnDis:{backgroundColor:'#f8f8f8',borderColor:'#eaeaea'},
   countWrap:{backgroundColor:'#fff',borderRadius:12,padding:16,flexDirection:'row',alignItems:'center',justifyContent:'space-between',borderWidth:1,borderColor:'#eee',marginTop:12},
