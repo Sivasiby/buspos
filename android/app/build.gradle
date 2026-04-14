@@ -84,6 +84,13 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        
+        // Enable C++20 for native modules
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++20"
+            }
+        }
     }
    signingConfigs {
         release {

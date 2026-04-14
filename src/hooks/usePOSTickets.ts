@@ -136,7 +136,9 @@ async function insertToSupabase(ticket: POSTicket): Promise<boolean> {
     if (error) {
       // Backward compatibility: if DB does not yet have `luggage_amount`, retry without it.
       if ((error.message || '').toLowerCase().includes('luggage_amount')) {
-        const { luggage_amount: _luggage, ...payloadWithoutLuggage } = payload as any;
+        const payloadWithoutLuggage = Object.fromEntries(
+          Object.entries(payload as any).filter(([key]) => key !== 'luggage_amount')
+        );
         const { error: retryError } = await supabase.from('tickets').insert({
           ...payloadWithoutLuggage,
         });
@@ -182,6 +184,48 @@ export function usePOSTickets() {
           }));
           console.log(`[POS] Migrated ${parsed.length} tickets from v1 to v2`);
         }
+      }
+
+      // Migrate old HomeScreen format tickets (from, to, full_count, half_count) to new format
+      const needsMigration = parsed.some(t => 
+        'from' in t && 'to' in t && !('from_stop' in t)
+      );
+      if (needsMigration) {
+        parsed = parsed.map((t: any) => {
+          // If already in new format, return as-is
+          if ('from_stop' in t && 'to_stop' in t) return t;
+          
+          // Convert old HomeScreen format to new format
+          const fullCount = Number(t.full_count ?? 0);
+          const halfCount = Number(t.half_count ?? 0);
+          const luggage = Number(t.luggage ?? 0);
+          const totalTickets = fullCount + halfCount + (luggage > 0 ? 1 : 0);
+          
+          // Determine ticket_type based on counts
+          let ticketType: 'full' | 'half' = 'full';
+          if (halfCount > 0 && fullCount === 0) ticketType = 'half';
+          
+          return {
+            id: t.id,
+            trip_id: t.trip_id ?? null,
+            from_stop: t.from || '?',
+            to_stop: t.to || '?',
+            from_key: t.from_key || 'unknown',
+            to_key: t.to_key || 'unknown',
+            ticket_count: totalTickets,
+            fare: Number(t.total ?? 0),
+            unit_fare: totalTickets > 0 ? Number(t.total ?? 0) / totalTickets : 0,
+            ticket_type: ticketType,
+            luggage_amount: luggage,
+            ticket_number: t.ticket_nums ? parseInt(t.ticket_nums.replace('#', ''), 10) : null,
+            bus_number: t.bus_number || 'N/A',
+            direction: t.direction || 'up',
+            issued_at: t.issued_at || new Date().toISOString(),
+            synced: false, // Mark as unsynced since format changed
+          } as POSTicket;
+        });
+        console.log(`[POS] Migrated ${parsed.length} tickets from HomeScreen format to hook format`);
+        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
       }
 
       // ── Auto-cleanup: remove tickets older than 48 hours ────────────────
@@ -369,6 +413,10 @@ export function usePOSTickets() {
 
   const clearAll = useCallback(async () => { await persist([]); }, []);
 
+  const reload = useCallback(async () => {
+    await load();
+  }, []);
+
   return {
     tickets,
     syncing,
@@ -381,5 +429,6 @@ export function usePOSTickets() {
     todaySummary,
     tripSummary,
     clearAll,
+    reload,
   };
 }
