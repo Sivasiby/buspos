@@ -136,7 +136,8 @@ async function insertToSupabase(ticket: POSTicket): Promise<boolean> {
     if (error) {
       // Backward compatibility: if DB does not yet have `luggage_amount`, retry without it.
       if ((error.message || '').toLowerCase().includes('luggage_amount')) {
-        const { luggage_amount: _luggage, ...payloadWithoutLuggage } = payload as any;
+        const payloadWithoutLuggage = { ...payload } as any;
+        delete payloadWithoutLuggage.luggage_amount;
         const { error: retryError } = await supabase.from('tickets').insert({
           ...payloadWithoutLuggage,
         });
@@ -168,6 +169,64 @@ export function usePOSTickets() {
     try {
       const raw = await AsyncStorage.getItem(STORAGE_KEY);
       let parsed: POSTicket[] = raw ? JSON.parse(raw) : [];
+
+      // Migrate incorrectly saved v2 tickets from HomeScreen back to the correct format
+      parsed = parsed.flatMap((t: any) => {
+        if (t.from && !t.from_stop) {
+          // This is a ticket saved with the incorrect schema
+          const migratedTickets: POSTicket[] = [];
+          
+          if (t.full_count > 0) {
+            migratedTickets.push({
+              ...t,
+              id: t.id + '_f',
+              from_stop: t.from,
+              to_stop: t.to,
+              ticket_count: t.full_count,
+              fare: (t.total || 0) * (t.full_count / (t.full_count + (t.half_count || 0) + (t.luggage ? 1 : 0) || 1)),
+              unit_fare: 0,
+              ticket_type: 'full',
+              luggage_amount: t.luggage,
+              synced: false
+            });
+            t.luggage = 0; // only attach luggage once
+          }
+          
+          if (t.half_count > 0) {
+            migratedTickets.push({
+              ...t,
+              id: t.id + '_h',
+              from_stop: t.from,
+              to_stop: t.to,
+              ticket_count: t.half_count,
+              fare: (t.total || 0) * (t.half_count / ((t.full_count || 0) + t.half_count + (t.luggage ? 1 : 0) || 1)),
+              unit_fare: 0,
+              ticket_type: 'half',
+              luggage_amount: t.luggage,
+              synced: false
+            });
+            t.luggage = 0;
+          }
+          
+          if (!t.full_count && !t.half_count && t.luggage > 0) {
+             migratedTickets.push({
+              ...t,
+              id: t.id + '_l',
+              from_stop: t.from,
+              to_stop: t.to,
+              ticket_count: 0,
+              fare: t.luggage,
+              unit_fare: 0,
+              ticket_type: 'full',
+              luggage_amount: t.luggage,
+              synced: false
+            });
+          }
+          
+          return migratedTickets;
+        }
+        return [t];
+      });
 
       // Migrate old pos_tickets_v1 records if v2 is empty
       if (parsed.length === 0) {
@@ -314,7 +373,7 @@ export function usePOSTickets() {
         map[key].fullCount += t.ticket_count;
       }
       map[key].count += t.ticket_count;
-      map[key].fare  += t.fare;
+      map[key].fare  += Number(t.fare || 0);
     }
     return Object.values(map).sort((a, b) => b.fare - a.fare);
   }, []);
@@ -335,12 +394,12 @@ export function usePOSTickets() {
     const luggage  = today.reduce((s, t) => s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0), 0);
     const full     = today
       .filter(t => (t.ticket_type ?? 'full') === 'full')
-      .reduce((s, t) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
+      .reduce((s, t) => s + Math.max(0, Number(t.ticket_count || 1) - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
     const half     = today
       .filter(t => t.ticket_type === 'half')
-      .reduce((s, t) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
+      .reduce((s, t) => s + Math.max(0, Number(t.ticket_count || 1) - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
     const count    = full + half + luggage;
-    const total    = today.reduce((s, t) => s + t.fare, 0);
+    const total    = today.reduce((s, t) => s + Number(t.fare || 0), 0);
     const unsynced = today.filter(t => !t.synced).length;
     return {trips, rows, count, full, half, luggage, total, unsynced};
   }, [todayTickets]);
@@ -353,17 +412,17 @@ export function usePOSTickets() {
     const luggage = list.reduce((s, t) => s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0), 0);
     const full  = list
       .filter(t => (t.ticket_type ?? 'full') === 'full')
-      .reduce((s, t) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
+      .reduce((s, t) => s + Math.max(0, Number(t.ticket_count || 1) - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
     const half  = list
       .filter(t => t.ticket_type === 'half')
-      .reduce((s, t) => s + Math.max(0, t.ticket_count - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
+      .reduce((s, t) => s + Math.max(0, Number(t.ticket_count || 1) - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
     return {
       rows:  list.length,
       count: full + half + luggage,
       full,
       half,
       luggage,
-      total: list.reduce((s, t) => s + t.fare, 0),
+      total: list.reduce((s, t) => s + Number(t.fare || 0), 0),
     };
   }, [tickets]);
 
@@ -374,6 +433,7 @@ export function usePOSTickets() {
     syncing,
     saveTicket,
     syncPending,
+    reload: load,
     todayTickets,
     ticketsForTrip,
     todayByTrip,

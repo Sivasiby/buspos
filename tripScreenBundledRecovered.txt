@@ -1,0 +1,517 @@
+ var TripScreen = () => {
+    var _useState3 = (0, _react.useState)(null),
+      _useState4 = (0, _slicedToArray2.default)(_useState3, 2),
+      dashboard = _useState4[0],
+      setDashboard = _useState4[1];
+    var _useState5 = (0, _react.useState)(true),
+      _useState6 = (0, _slicedToArray2.default)(_useState5, 2),
+      dashLoading = _useState6[0],
+      setDashLoading = _useState6[1];
+    var _useState7 = (0, _react.useState)(false),
+      _useState8 = (0, _slicedToArray2.default)(_useState7, 2),
+      changing = _useState8[0],
+      setChanging = _useState8[1];
+    var _useState9 = (0, _react.useState)(''),
+      _useState0 = (0, _slicedToArray2.default)(_useState9, 2),
+      changingMessage = _useState0[0],
+      setChangingMessage = _useState0[1];
+    var _useState1 = (0, _react.useState)(false),
+      _useState10 = (0, _slicedToArray2.default)(_useState1, 2),
+      startingReturn = _useState10[0],
+      setStartingReturn = _useState10[1];
+    var _useState11 = (0, _react.useState)([]),
+      _useState12 = (0, _slicedToArray2.default)(_useState11, 2),
+      routes = _useState12[0],
+      setRoutes = _useState12[1];
+    var _useState13 = (0, _react.useState)(null),
+      _useState14 = (0, _slicedToArray2.default)(_useState13, 2),
+      verifyingTicket = _useState14[0],
+      setVerifyingTicket = _useState14[1];
+    var _useState15 = (0, _react.useState)(0),
+      _useState16 = (0, _slicedToArray2.default)(_useState15, 2),
+      appOnlyTickets = _useState16[0],
+      setAppOnlyTickets = _useState16[1];
+    var _useState17 = (0, _react.useState)(0),
+      _useState18 = (0, _slicedToArray2.default)(_useState17, 2),
+      appOnlyFare = _useState18[0],
+      setAppOnlyFare = _useState18[1];
+    var _useState19 = (0, _react.useState)(false),
+      _useState20 = (0, _slicedToArray2.default)(_useState19, 2),
+      appTripLoading = _useState20[0],
+      setAppTripLoading = _useState20[1];
+    var _useState21 = (0, _react.useState)(0),
+      _useState22 = (0, _slicedToArray2.default)(_useState21, 2),
+      localTripNumber = _useState22[0],
+      setLocalTripNumber = _useState22[1];
+    var _useState23 = (0, _react.useState)(false),
+      _useState24 = (0, _slicedToArray2.default)(_useState23, 2),
+      refreshing = _useState24[0],
+      setRefreshing = _useState24[1];
+    var posHook = (0, _$$_REQUIRE(_dependencyMap[9], "../hooks/usePOSTickets").usePOSTickets)();
+    var at = dashboard?.active_trip;
+    var _useVerificationRealt = (0, _$$_REQUIRE(_dependencyMap[10], "../hooks/useVerificationRealtime").useVerificationRealtime)(at?.trip_id, at?.status),
+      pendingRequests = _useVerificationRealt.pendingRequests,
+      clearTicket = _useVerificationRealt.clearTicket;
+    var activePOSTix = posHook.tickets.filter(t => t.trip_id === at?.trip_id);
+    var activePOSCount = activePOSTix.reduce((s, t) => s + Number(t.ticket_count ?? 0), 0);
+    var activePOSFare = activePOSTix.reduce((s, t) => s + Number(t.fare ?? 0), 0);
+    var totalFare = appOnlyFare + activePOSFare;
+    (0, _react.useEffect)(() => {
+      fetchDashboard();
+    }, []);
+    (0, _react.useEffect)(() => {
+      _api.default.get('/conductor/routes').then(r => setRoutes(r.data?.routes || [])).catch(() => {});
+    }, []);
+    (0, _react.useEffect)(() => {
+      var tid = at?.trip_id;
+      if (!tid) {
+        setAppOnlyTickets(0);
+        setAppOnlyFare(0);
+        return;
+      }
+      var cancelled = false;
+      setAppTripLoading(true);
+      (0, _asyncToGenerator2.default)(function* () {
+        try {
+          var _yield$supabase$from$3 = yield _$$_REQUIRE(_dependencyMap[6], "../../lib/supabase").supabase.from('tickets').select('ticket_count,total_fare,fare').eq('trip_id', tid).neq('payment_method', 'pos'),
+            data = _yield$supabase$from$3.data,
+            error = _yield$supabase$from$3.error;
+          if (error) throw error;
+          var rows = data || [];
+          var count = rows.reduce((s, r) => s + Number(r.ticket_count ?? 1), 0);
+          var total = rows.reduce((s, r) => {
+            var cnt = Number(r.ticket_count ?? 1);
+            var unit = Number(r.fare ?? 0);
+            return s + (r.total_fare != null ? Number(r.total_fare) : unit * cnt);
+          }, 0);
+          if (!cancelled) {
+            setAppOnlyTickets(count);
+            setAppOnlyFare(total);
+          }
+        } catch {
+          if (!cancelled) {
+            setAppOnlyTickets(0);
+            setAppOnlyFare(0);
+          }
+        } finally {
+          if (!cancelled) setAppTripLoading(false);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, [at?.trip_id]);
+    var fetchDashboard = /*#__PURE__*/function () {
+      var _ref5 = (0, _asyncToGenerator2.default)(function* () {
+        try {
+          var r = yield _api.default.get('/conductor/dashboard');
+          setDashboard(r.data);
+          var conductorId = r.data?.active_trip?.conductor_id ?? r.data?.conductor?.id;
+          var tripId = r.data?.active_trip?.trip_id;
+          var dbTripNumber = Number(r.data?.active_trip?.trip_number ?? 0);
+          if (dbTripNumber > 0) {
+            setLocalTripNumber(dbTripNumber);
+          } else if (conductorId && tripId) {
+            // trip_number is null — assign one now
+            var nextNum = yield assignTripNumber(tripId, conductorId);
+            setLocalTripNumber(nextNum);
+          }
+        } catch (e) {
+          console.error(e);
+        } finally {
+          setDashLoading(false);
+        }
+      });
+      return function fetchDashboard() {
+        return _ref5.apply(this, arguments);
+      };
+    }();
+    var onRefresh = (0, _react.useCallback)(/*#__PURE__*/(0, _asyncToGenerator2.default)(function* () {
+      setRefreshing(true);
+      try {
+        // Fetch dashboard
+        yield fetchDashboard();
+        // Fetch routes
+        var r = yield _api.default.get('/conductor/routes');
+        setRoutes(r.data?.routes || []);
+        // Reload POS tickets
+        yield posHook.reload();
+        // App-only tickets will be refetched by the existing useEffect when dashboard updates
+      } catch (e) {
+        console.error('[TripScreen] Refresh failed:', e);
+      } finally {
+        setRefreshing(false);
+      }
+    }), [posHook]);
+    var handleTripStarted = /*#__PURE__*/function () {
+      var _ref7 = (0, _asyncToGenerator2.default)(function* (started) {
+        try {
+          if (started) {
+            setDashboard(prev => {
+              if (!prev || prev?.active_trip?.trip_id) return prev;
+              return {
+                ...prev,
+                active_trip: {
+                  ...(prev.active_trip || {}),
+                  trip_id: null,
+                  route_name: started.route_name || prev?.active_trip?.route_name || '',
+                  direction: started.direction,
+                  start_time: started.start_time,
+                  status: 'running',
+                  bus_number: prev?.bus?.vehicle_number ?? prev?.active_trip?.bus_number
+                }
+              };
+            });
+          }
+          var dash = null;
+          for (var i = 0; i < 6; i++) {
+            var r = yield _api.default.get('/conductor/dashboard');
+            dash = r.data;
+            if (dash?.active_trip?.trip_id) break;
+            yield new Promise(res => setTimeout(res, 700));
+          }
+          if (dash) {
+            setDashboard(dash);
+            var conductorId = dash?.active_trip?.conductor_id ?? dash?.conductor?.id;
+            var tripId = dash?.active_trip?.trip_id ?? dash?.active_trip?.id;
+            var dbTripNumber = Number(dash?.active_trip?.trip_number ?? 0);
+            if (dbTripNumber > 0) {
+              setLocalTripNumber(dbTripNumber);
+            } else if (conductorId && tripId) {
+              var nextNum = yield assignTripNumber(tripId, conductorId);
+              setLocalTripNumber(nextNum);
+            }
+          }
+        } catch (e) {
+          console.error(e);
+        } finally {
+          setDashLoading(false);
+        }
+      });
+      return function handleTripStarted(_x5) {
+        return _ref7.apply(this, arguments);
+      };
+    }();
+
+    // One-tap: end current trip + immediately start return
+    var handleStartReturn = /*#__PURE__*/function () {
+      var _ref8 = (0, _asyncToGenerator2.default)(function* (dir) {
+        if (!at) return;
+        _reactNative.Alert.alert('Start return trip?', `This will end the current trip and start ${routeLabel(at.route_name, dir)}.`, [{
+          text: 'Cancel',
+          style: 'cancel'
+        }, {
+          text: 'Start',
+          onPress: function () {
+            var _ref9 = (0, _asyncToGenerator2.default)(function* () {
+              setStartingReturn(true);
+              setChanging(true);
+              setChangingMessage('Ending current trip…');
+              try {
+                yield _api.default.post(`/conductor/trip/${at.trip_id}/status`, {
+                  status: 'completed'
+                });
+                setChangingMessage('Starting return trip…');
+                var route = routes.find(r => r.name === at.route_name) ?? routes[0];
+                if (!route) throw new Error('Route not found');
+                var r = yield _api.default.post('/conductor/trip/start', {
+                  route_id: route.id,
+                  direction: dir
+                });
+                if (r.data?.success) {
+                  showToast('Return trip started!');
+                  yield handleTripStarted({
+                    direction: dir,
+                    route_name: route.name,
+                    start_time: new Date().toISOString()
+                  });
+                }
+              } catch (e) {
+                _reactNative.Alert.alert('Error', e?.response?.data?.error || 'Could not switch trip.');
+              } finally {
+                setChanging(false);
+                setChangingMessage('');
+                setStartingReturn(false);
+              }
+            });
+            return function onPress() {
+              return _ref9.apply(this, arguments);
+            };
+          }()
+        }]);
+      });
+      return function handleStartReturn(_x6) {
+        return _ref8.apply(this, arguments);
+      };
+    }();
+    var changeStatus = /*#__PURE__*/function () {
+      var _ref0 = (0, _asyncToGenerator2.default)(function* (s) {
+        if (!at) return;
+        var labels = {
+          completed: 'End this trip?',
+          paused: 'Pause trip?',
+          running: 'Resume trip?'
+        };
+        var toastLabels = {
+          completed: 'Trip ended',
+          paused: 'Trip paused',
+          running: 'Trip resumed'
+        };
+        var loadingLabels = {
+          completed: 'Ending trip…',
+          paused: 'Pausing…',
+          running: 'Resuming…'
+        };
+        _reactNative.Alert.alert('Confirm', labels[s] || 'Continue?', [{
+          text: 'Cancel',
+          style: 'cancel'
+        }, {
+          text: 'Yes',
+          onPress: function () {
+            var _ref1 = (0, _asyncToGenerator2.default)(function* () {
+              setChanging(true);
+              setChangingMessage(loadingLabels[s] || 'Please wait…');
+              try {
+                yield _api.default.post(`/conductor/trip/${at.trip_id}/status`, {
+                  status: s
+                });
+                showToast(toastLabels[s] || 'Done');
+                yield handleTripStarted();
+              } catch (e) {
+                _reactNative.Alert.alert('Error', e?.response?.data?.error || 'Could not change status.');
+              } finally {
+                setChanging(false);
+                setChangingMessage('');
+              }
+            });
+            return function onPress() {
+              return _ref1.apply(this, arguments);
+            };
+          }()
+        }]);
+      });
+      return function changeStatus(_x7) {
+        return _ref0.apply(this, arguments);
+      };
+    }();
+    var handleVerify = /*#__PURE__*/function () {
+      var _ref10 = (0, _asyncToGenerator2.default)(function* (id) {
+        setVerifyingTicket(id);
+        try {
+          yield _api.default.post(`/conductor/ticket/${id}/verify`);
+          clearTicket(id);
+          showToast('Ticket verified ✓');
+          fetchDashboard();
+        } catch (e) {
+          _reactNative.Alert.alert('Error', e?.response?.data?.error || 'Could not verify ticket.');
+        } finally {
+          setVerifyingTicket(null);
+        }
+      });
+      return function handleVerify(_x8) {
+        return _ref10.apply(this, arguments);
+      };
+    }();
+    if (dashLoading) {
+      return (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+        className: "flex-1 justify-center items-center bg-zinc-950",
+        children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.ActivityIndicator, {
+          size: "large",
+          color: "#0ea5e9"
+        }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+          className: "text-zinc-400 mt-3 text-sm",
+          children: "Loading\u2026"
+        })]
+      });
+    }
+    var tripDisplay = at ? routeLabel(at.route_name, at.direction) : null;
+    return (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_$$_REQUIRE(_dependencyMap[11], "react-native-safe-area-context").SafeAreaView, {
+      className: "flex-1 bg-zinc-950",
+      children: [changing && (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(BlockingOverlay, {
+        message: changingMessage
+      }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.ScrollView, {
+        className: "flex-1",
+        contentContainerStyle: {
+          padding: 16,
+          paddingBottom: 32
+        },
+        showsVerticalScrollIndicator: false,
+        refreshControl: (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.RefreshControl, {
+          refreshing: refreshing,
+          onRefresh: onRefresh,
+          tintColor: "#0ea5e9",
+          colors: ['#0ea5e9']
+        }),
+        children: [pendingRequests.length > 0 && (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+          className: "bg-amber-950/40 border border-amber-500/30 rounded-2xl p-4 mb-4",
+          children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+            className: "flex-row justify-between items-center mb-1",
+            children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+              className: "flex-row items-center gap-2",
+              children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                className: "text-amber-400 text-sm font-bold",
+                children: "Verification Requests"
+              }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.View, {
+                className: "bg-amber-500 rounded-full w-5 h-5 justify-center items-center",
+                children: (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-white text-[10px] font-black",
+                  children: pendingRequests.length
+                })
+              })]
+            }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+              className: "text-amber-500 text-[11px] font-bold",
+              children: "\u25CF LIVE"
+            })]
+          }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+            className: "text-zinc-500 text-xs mb-3",
+            children: "Tap verify to confirm passenger ticket"
+          }), pendingRequests.map(i => (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(PendingVerifyRow, {
+            item: i,
+            onVerify: handleVerify,
+            verifying: verifyingTicket
+          }, i.ticket_id))]
+        }), at ? (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").Fragment, {
+          children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+            className: "bg-zinc-900 rounded-2xl p-5 border border-zinc-800 mb-4",
+            children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+              className: "flex-row justify-between items-start mb-4",
+              children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+                className: "flex-1 mr-3 flex-row items-center",
+                children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-white text-2xl font-bold tracking-widest mb-1",
+                  children: localTripNumber > 0 ? `#${localTripNumber} - ` : ''
+                }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-white text-2xl font-black leading-tight",
+                  children: tripDisplay
+                })]
+              }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(StatusBadge, {
+                status: at.status
+              })]
+            }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+              className: "flex-row gap-4 mb-4 flex-wrap",
+              children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+                className: "flex-row items-center gap-1.5",
+                children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_$$_REQUIRE(_dependencyMap[8], "lucide-react-native").Clock, {
+                  size: 12,
+                  color: "#71717a"
+                }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.Text, {
+                  className: "text-zinc-400 text-xs",
+                  children: ["Started ", formatTime(at.start_time)]
+                })]
+              }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+                className: "flex-row items-center gap-1.5",
+                children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_$$_REQUIRE(_dependencyMap[8], "lucide-react-native").Timer, {
+                  size: 12,
+                  color: "#71717a"
+                }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-zinc-400 text-xs",
+                  children: formatDuration(at.start_time)
+                })]
+              }), (at.bus_number || dashboard?.bus?.vehicle_number) && (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+                className: "flex-row items-center gap-1.5",
+                children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_$$_REQUIRE(_dependencyMap[8], "lucide-react-native").Bus, {
+                  size: 12,
+                  color: "#71717a"
+                }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-zinc-400 text-xs",
+                  children: at.bus_number ?? dashboard?.bus?.vehicle_number
+                })]
+              })]
+            }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+              className: "flex-row bg-zinc-800/60 rounded-xl p-4 mb-4",
+              children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+                className: "flex-1 items-center",
+                children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-sky-400 text-2xl font-black",
+                  children: appTripLoading ? '…' : appOnlyTickets
+                }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-zinc-500 text-[10px] font-semibold mt-0.5",
+                  children: "APP TICKETS"
+                })]
+              }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.View, {
+                className: "w-px bg-zinc-700 mx-2"
+              }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+                className: "flex-1 items-center",
+                children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-violet-400 text-2xl font-black",
+                  children: activePOSCount
+                }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-zinc-500 text-[10px] font-semibold mt-0.5",
+                  children: "POS TICKETS"
+                })]
+              }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.View, {
+                className: "w-px bg-zinc-700 mx-2"
+              }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+                className: "flex-1 items-center",
+                children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.Text, {
+                  className: "text-emerald-400 text-2xl font-black",
+                  children: ["\u20B9", appTripLoading ? '…' : Number(totalFare).toFixed(0)]
+                }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-zinc-500 text-[10px] font-semibold mt-0.5",
+                  children: "TOTAL"
+                })]
+              }), pendingRequests.length > 0 && (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").Fragment, {
+                children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.View, {
+                  className: "w-px bg-zinc-700 mx-2"
+                }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+                  className: "flex-1 items-center",
+                  children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                    className: "text-amber-400 text-2xl font-black",
+                    children: pendingRequests.length
+                  }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                    className: "text-zinc-500 text-[10px] font-semibold mt-0.5",
+                    children: "PENDING"
+                  })]
+                })]
+              })]
+            }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.View, {
+              className: "flex-row gap-2",
+              children: [at.status === 'running' && (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.TouchableOpacity, {
+                className: "flex-1 flex-row items-center justify-center gap-2 bg-amber-500/10 border border-amber-500/30 py-3 rounded-xl",
+                onPress: () => changeStatus('paused'),
+                disabled: changing,
+                children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_$$_REQUIRE(_dependencyMap[8], "lucide-react-native").Pause, {
+                  size: 16,
+                  color: "#f59e0b"
+                }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-amber-400 text-sm font-bold",
+                  children: "Pause"
+                })]
+              }), at.status === 'paused' && (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.TouchableOpacity, {
+                className: "flex-1 flex-row items-center justify-center gap-2 bg-emerald-500/10 border border-emerald-500/30 py-3 rounded-xl",
+                onPress: () => changeStatus('running'),
+                disabled: changing,
+                children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_$$_REQUIRE(_dependencyMap[8], "lucide-react-native").Play, {
+                  size: 16,
+                  color: "#10b981"
+                }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-emerald-400 text-sm font-bold",
+                  children: "Resume"
+                })]
+              }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsxs)(_reactNative.TouchableOpacity, {
+                className: "flex-1 flex-row items-center justify-center gap-2 bg-red-500/10 border border-red-500/30 py-3 rounded-xl",
+                onPress: () => changeStatus('completed'),
+                disabled: changing,
+                children: [(0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_$$_REQUIRE(_dependencyMap[8], "lucide-react-native").Square, {
+                  size: 16,
+                  color: "#f87171"
+                }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(_reactNative.Text, {
+                  className: "text-red-400 text-sm font-bold",
+                  children: "End Trip"
+                })]
+              })]
+            })]
+          }), (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(DirectionToggle, {
+            routeName: at.route_name,
+            currentDirection: at.direction,
+            onStartReturn: handleStartReturn,
+            starting: startingReturn
+          })]
+        }) : /* ── No Trip: Direct Start Buttons ── */
+        (0, _$$_REQUIRE(_dependencyMap[7], "react-native-css-interop/jsx-runtime").jsx)(StartTripButtons, {
+          routes: routes,
+          onStarted: handleTripStarted
+        })]
+      })]
+    });
+  };
