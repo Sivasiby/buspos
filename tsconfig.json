@@ -12,6 +12,6 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*", "index.js", "App.tsx"],
+  "include": ["src/**/*", "index.js", "App.tsx", "nativewind-env.d.ts"],
   "exclude": ["node_modules", "android", "ios", "__tests__"]
 }

@@ -1,24 +1,89 @@
 /**
  * App.tsx — root entry point
  *
- * Flow:  splash → (check AsyncStorage) → LoginScreen or POSScreen
- *
- * No react-navigation needed — we just swap components via state.
+ * Flow:  splash → (check AsyncStorage) → LoginScreen or Tab Navigator (Home, Trip, Tickets)
  */
 
 import React, {useState, useEffect} from 'react';
-import {ActivityIndicator, View, StyleSheet} from 'react-native';
+import {ActivityIndicator, StyleSheet} from 'react-native';
+import {SafeAreaView} from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import {NavigationContainer} from '@react-navigation/native';
+import {createBottomTabNavigator} from '@react-navigation/bottom-tabs';
+import {Home, Bus, Ticket, Settings} from 'lucide-react-native';
+
+
+import "./global.css";
 
 import LoginScreen from './src/screens/LoginScreen';
-import POSScreen   from './src/screens/Posscreen';
+import HomeScreen  from './src/screens/HomeScreen';
+import TripScreen  from './src/screens/TripScreen';
+import TicketScreen from './src/screens/TicketScreen';
+import ReportScreen from './src/components/ReportScreen';
+import SettingsScreen from './src/screens/SettingsScreen';
 
-// ─── Adjust the import paths above if your folder layout differs ──────────────
-//   e.g. if App.tsx sits inside src/, use:
-//     import LoginScreen from './screens/LoginScreen';
-//     import POSScreen   from './screens/POSScreen';
+const Tab = createBottomTabNavigator();
 
 const STORAGE_KEY = 'conductor_user';
+
+// Icon components for tabs
+const HomeIcon = ({color, size}: {color: string; size: number}) => <Home size={size} color={color} />;
+const BusIcon = ({color, size}: {color: string; size: number}) => <Bus size={size} color={color} />;
+const TicketIcon = ({color, size}: {color: string; size: number}) => <Ticket size={size} color={color} />;
+const SettingsIcon = ({color, size}: {color: string; size: number}) => <Settings size={size} color={color} />;
+
+// Tab Navigator Component
+function TabNavigator() {
+  return (
+    <Tab.Navigator
+      id="main-tabs"
+      screenOptions={{
+        tabBarActiveTintColor: '#00b7f3',
+        tabBarInactiveTintColor: '#999',
+        tabBarStyle: {
+          backgroundColor: '#000000',
+          borderTopWidth: 1,
+          borderTopColor: '#333',
+          paddingBottom: 5,
+          height: 60,
+        },
+        headerShown: false,
+      }}>
+      <Tab.Screen
+        name="Home"
+        component={HomeScreen}
+        options={{
+          tabBarLabel: 'Home',
+          tabBarIcon: HomeIcon,
+        }}
+      />
+      <Tab.Screen
+        name="Trip"
+        component={TripScreen}
+        options={{
+          tabBarLabel: 'Trip',
+          tabBarIcon: BusIcon,
+        }}
+      />
+      <Tab.Screen
+        name="Report"
+        component={ReportScreen}
+        options={{
+          tabBarLabel: 'Report',
+          tabBarIcon: TicketIcon,
+        }}
+      />
+      <Tab.Screen
+        name="Settings"
+        component={SettingsScreen}
+        options={{
+          tabBarLabel: 'Settings',
+          tabBarIcon: SettingsIcon,
+        }}
+      />
+    </Tab.Navigator>
+  );
+}
 
 export default function App() {
   const [user, setUser]         = useState<any>(null);
@@ -39,19 +104,12 @@ export default function App() {
     setUser(userData);
   };
 
-  const handleLogout = async () => {
-    try {
-      await AsyncStorage.removeItem(STORAGE_KEY);
-    } catch {}
-    setUser(null);
-  };
-
   // Splash / checking state
   if (checking) {
     return (
-      <View style={styles.splash}>
+      <SafeAreaView style={styles.splash}>
         <ActivityIndicator size="large" color="#00b7f3" />
-      </View>
+      </SafeAreaView>
     );
   }
 
@@ -59,7 +117,13 @@ export default function App() {
     return <LoginScreen onLoginSuccess={handleLoginSuccess} />;
   }
 
-  return <POSScreen user={user} onLogout={handleLogout} />;
+  return (
+    <SafeAreaView style={{flex: 1, backgroundColor: '#000000'}}>
+      <NavigationContainer>
+        <TabNavigator />
+      </NavigationContainer>
+    </SafeAreaView>
+  );
 }
 
 const styles = StyleSheet.create({
@@ -67,6 +131,6 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: '#0d1b2e',
+    backgroundColor: '#000000',
   },
 });
