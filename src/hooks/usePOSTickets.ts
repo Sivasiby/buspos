@@ -269,33 +269,40 @@ export function usePOSTickets() {
     catch { /* silent */ }
   };
 
-  // ── saveTicket ─────────────────────────────────────────────────────────────
-  // Called immediately after a successful print.
-  // 1. Saves to AsyncStorage instantly (works offline)
-  // 2. Fires Supabase insert in background (retried via syncPending if offline)
-  // NOTE: this is the ONLY place that writes to Supabase.
-  //       Do NOT call supabase.from('tickets').insert() elsewhere in the screen.
-  const saveTicket = useCallback(async (ticket: Omit<POSTicket, 'synced'> & {ticket_type: 'full'|'half'}) => {
-    const newTicket: POSTicket = {...ticket, synced: false};
-
-    // 1. Local save — always instant
-    const updated = [...tickets, newTicket];
-    await persist(updated);
-
-    // 2. Background Supabase insert
+  // ── syncToDb ────────────────────────────────────────────────────────────────
+  // Flushes all unsynced tickets to Supabase in the background.
+  // Safe to call at any time — silently skips if nothing pending or already syncing.
+  const syncToDb = useCallback(async (list?: POSTicket[]) => {
+    const raw = await AsyncStorage.getItem(STORAGE_KEY);
+    const latest: POSTicket[] = raw ? JSON.parse(raw) : (list ?? []);
+    const unsynced = latest.filter(t => !t.synced);
+    if (unsynced.length === 0) return;
     setSyncing(true);
+    let updated = [...latest];
     try {
-      const ok = await insertToSupabase(newTicket);
-      if (ok) {
-        const synced = updated.map(t =>
-          t.id === newTicket.id ? {...t, synced: true} : t,
-        );
-        await persist(synced);
+      for (const t of unsynced) {
+        const ok = await insertToSupabase(t);
+        if (ok) updated = updated.map(x => x.id === t.id ? {...x, synced: true} : x);
       }
+      await persist(updated);
     } finally {
       setSyncing(false);
     }
-  }, [tickets]);
+  }, []);
+
+  // ── saveTicket ─────────────────────────────────────────────────────────────
+  // Writes only to AsyncStorage (instant, non-blocking).
+  // Auto-triggers syncToDb in the background when unsynced count hits 10.
+  const saveTicket = useCallback(async (ticket: Omit<POSTicket, 'synced'> & {ticket_type: 'full'|'half'}) => {
+    const newTicket: POSTicket = {...ticket, synced: false};
+    const updated = [...tickets, newTicket];
+    await persist(updated);
+
+    const unsyncedCount = updated.filter(t => !t.synced).length;
+    if (unsyncedCount >= 10) {
+      syncToDb(updated);
+    }
+  }, [tickets, syncToDb]);
 
   // ── syncPending — retries all unsynced tickets ────────────────────────────
   const syncPending = useCallback(async () => {
@@ -428,10 +435,14 @@ export function usePOSTickets() {
 
   const clearAll = useCallback(async () => { await persist([]); }, []);
 
+  const unsyncedCount = tickets.filter(t => !t.synced).length;
+
   return {
     tickets,
     syncing,
+    unsyncedCount,
     saveTicket,
+    syncToDb,
     syncPending,
     reload: load,
     todayTickets,

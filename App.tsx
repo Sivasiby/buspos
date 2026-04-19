@@ -15,6 +15,7 @@ import {Home, Bus, Ticket, Settings} from 'lucide-react-native';
 import './global.css';
 
 import LoginScreen from './src/screens/LoginScreen';
+import {TripProvider} from './src/context/TripContext';
 import HomeScreen  from './src/screens/HomeScreen';
 import TripScreen  from './src/screens/TripScreen';
 import TicketScreen from './src/screens/TicketScreen';
@@ -117,11 +118,13 @@ export default function App() {
   }
 
   return (
-    <SafeAreaView style={{flex: 1, backgroundColor: '#000000'}}>
-      <NavigationContainer>
-        <TabNavigator />
-      </NavigationContainer>
-    </SafeAreaView>
+    <TripProvider>
+      <SafeAreaView style={{flex: 1, backgroundColor: '#000000'}}>
+        <NavigationContainer>
+          <TabNavigator />
+        </NavigationContainer>
+      </SafeAreaView>
+    </TripProvider>
   );
 }
 

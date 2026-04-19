@@ -537,6 +537,8 @@ const posTix = (posHook?.tickets ?? []).filter(
       const padL = (s, w) => String(s).padEnd(w, ' ');
       // Helper: pad string to fixed width (right-aligned)
       const padR = (s, w) => String(s).padStart(w, ' ');
+      // Helper: center string within fixed width
+      const padC = (s, w) => { const str = String(s); const tot = w - str.length; const l = Math.floor(tot / 2); return ' '.repeat(l) + str + ' '.repeat(tot - l); };
       // Amount formatting: always 2 decimal places
       const fmtAmt = n => Number(n).toFixed(2);
 
@@ -565,49 +567,44 @@ const posTix = (posHook?.tickets ?? []).filter(
       await NyxPrinter.printText('TRIP SHEET', { textSize: 26, align: PrintAlign.CENTER, bold: true });
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
-      // BUS No + WAY BILL No on one line
-      // await NyxPrinter.printText(
-      //   `BUS No:${busNo}  WAY BILL No: ${wayBill}`,
-      //   { textSize: 25 },
-      // );
-      // await NyxPrinter.printText(
-      //   `BUS No:${busNo}`,
-      //   { textSize: 25 },
-      // );
-      // // Date + Time centered
-      // await NyxPrinter.printText(`${dateStr}  ${timeStr}`, { textSize: 25, align: PrintAlign.CENTER });
-      // // Trip No centered
-      // await NyxPrinter.printText(`TRIP No. : ${tripNum}`, { textSize: 25, align: PrintAlign.CENTER });
-      // if (ticketRangeStr) {
-      //   await NyxPrinter.printText(`TICKETS : ${ticketRangeStr}`, { textSize: 20, align: PrintAlign.CENTER });
-      // }
+      await NyxPrinter.printText(`BUS:${busNo}  TRIP No.:${tripNum}`, { textSize: 24 });
+      await NyxPrinter.printText(`${dateStr} ${timeStr}${ticketRangeStr ? `  TKT:${ticketRangeStr}` : ''}`, { textSize: 22 });
       
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
-      // ── Column headers: SS  ES  F   H   L   P   AMT ────────────────────────
-      // widths: SS=3 ES=3 F=2 H=2 L=2 P=2 AMT=right
+      // ── Column headers: SS ES F H L P AMT ──────────────────────────────────
+      // textSize 26 fits ~24 chars. SS=3,ES=3,F=3,H=3,L=3,P=3,AMT=6 = 24
+     const COL = { 
+  ss:6, 
+  es:6, 
+  f:5, 
+  h:5, 
+  l:5, 
+  p:5, 
+  amt:8 
+};
       const hdr =
-  padL('SS', 6) +
-  padL('ES', 6) +
-  padL('F', 5) +
-  padL('H', 5) +
-  padL('L', 5) +
-  padL('P', 5) +
-  padR('AMT', 10);
+        padL('SS', COL.ss) +
+        padL('ES', COL.es) +
+        padC('F',  COL.f)  +
+        padC('H',  COL.h)  +
+        padC('L',  COL.l)  +
+        padC('P',  COL.p)  +
+        padR('AMT', COL.amt);
       await NyxPrinter.printText(hdr, { textSize: 26 });
       await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
 
       // ── Stage rows ───────────────────────────────────────────────────────────
       for (const r of stageRows) {
-       const row =
-  padL(r.ss, 6) +
-  padL(r.es, 6) +
-  padL(r.f, 5) +
-  padL(r.h, 5) +
-  padL(r.l, 5) +
-  padL(r.p ?? 0, 5) +
-  padR(fmtAmt(r.amt), 12);
-       await NyxPrinter.printText(row, { textSize: 26 });
+        const row =
+          padL(r.ss,          COL.ss)  +
+          padL(r.es,          COL.es)  +
+          padC(r.f,           COL.f)   +
+          padC(r.h,           COL.h)   +
+          padC(r.l,           COL.l)   +
+          padC(r.p ?? 0,      COL.p)   +
+          padR(fmtAmt(r.amt), COL.amt);
+        await NyxPrinter.printText(row, { textSize: 26 });
       }
       await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
 
@@ -619,14 +616,13 @@ const posTix = (posHook?.tickets ?? []).filter(
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
       // ── TRIP.COLL + TOT.COLL ────────────────────────────────────────────────
-      const tripCollStr = `TRIP.COLL Rs.:`;
-      const totCollStr  = `TOT.COLL Rs.: `;
+      // textSize 32 fits ~20 chars. label=12 + amount right-aligned in 8 = 20
       await NyxPrinter.printText(
-        `${padL(tripCollStr, 16)}${padR(fmtAmt(grandCollection), 10)}`,
+        `${padL('TRIP.COLL:', 12)}${padR(fmtAmt(grandCollection), 8)}`,
         { textSize: 32 },
       );
       await NyxPrinter.printText(
-        `${padL(totCollStr, 16)}${padR(fmtAmt(combinedTotal), 10)}`,
+        `${padL('TOT.COLL:', 12)}${padR(fmtAmt(combinedTotal), 8)}`,
         { textSize: 32 },
       );
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
@@ -1267,6 +1263,7 @@ useEffect(() => {
 
       const padL = (s, w) => String(s).padEnd(w, ' ');
       const padR = (s, w) => String(s).padStart(w, ' ');
+      const padC = (s, w) => { const str = String(s); const tot = w - str.length; const l = Math.floor(tot / 2); return ' '.repeat(l) + str + ' '.repeat(tot - l); };
       const fmtAmt = n => Number(n).toFixed(2);
 
       const DASH32 = '--------------------------------';
@@ -1276,12 +1273,21 @@ useEffect(() => {
       await NyxPrinter.printText('STATUS REPORT', { textSize: 26, align: PrintAlign.CENTER, bold: true });
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
-      const hdr = padL('SS', 6) + padL('ES', 6) + padL('F', 5) + padL('H', 5) + padL('L', 5) + padL('P', 5) + padR('AMT', 10);
+      const COL = { ss:6, es:6, f:5, h:5, l:5, p:5, amt:8 };
+      const hdr =
+        padL('SS', COL.ss) + padL('ES', COL.es) +
+        padC('F', COL.f)   + padC('H', COL.h) +
+        padC('L', COL.l)   + padC('P', COL.p) +
+        padR('AMT', COL.amt);
       await NyxPrinter.printText(hdr, { textSize: 26 });
       await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
 
       for (const r of filteredData.stageRows) {
-        const row = padL(r.ss, 6) + padL(r.es, 6) + padL(r.f, 5) + padL(r.h, 5) + padL(r.l, 5) + padL(r.p ?? 0, 5) + padR(fmtAmt(r.amt), 12);
+        const row =
+          padL(r.ss,          COL.ss) + padL(r.es,      COL.es) +
+          padC(r.f,           COL.f)  + padC(r.h,       COL.h)  +
+          padC(r.l,           COL.l)  + padC(r.p ?? 0,  COL.p)  +
+          padR(fmtAmt(r.amt), COL.amt);
         await NyxPrinter.printText(row, { textSize: 26 });
       }
       await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
@@ -1289,8 +1295,10 @@ useEffect(() => {
       await NyxPrinter.printText(`FULL : ${filteredData.grandFull}`, { textSize: 26, align: PrintAlign.CENTER });
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
-      const totCollStr = `TOT.COLL Rs.: `;
-      await NyxPrinter.printText(`${padL(totCollStr, 16)}${padR(fmtAmt(filteredData.grandCollection), 10)}`, { textSize: 32 });
+      await NyxPrinter.printText(
+        `${padL('TOT.COLL:', 12)}${padR(fmtAmt(filteredData.grandCollection), 8)}`,
+        { textSize: 32 },
+      );
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
       await NyxPrinter.printEndAutoOut();
@@ -1506,24 +1514,18 @@ const parseAmount = v => {
 };
 
 const EXPENSE_PRESETS = [
-  'Diesel',
-  'Driver',
-  'Conductor',
-  'Tollgate',
-  'Pooja',
-  'Others',
   'Maintenance',
   'Fuel',
   'Parking',
   'Food',
 ];
 
+const FIXED_EXPENSES = ['Diesel', 'Driver', 'Conductor', 'Tollgate', 'Pooja', 'Others'];
+
 const CollectionReportTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
-  const [expenses, setExpenses] = useState([
-    { id: '1', label: 'Diesel', amount: '0' },
-    { id: '2', label: 'Driver', amount: '0' },
-    { id: '3', label: 'Conductor', amount: '0' },
-  ]);
+  const [expenses, setExpenses] = useState(
+    FIXED_EXPENSES.map((label, i) => ({ id: String(i + 1), label, amount: '0', fixed: true }))
+  );
   const [showAddModal, setShowAddModal] = useState(false);
   const [customExpense, setCustomExpense] = useState('');
 
@@ -1561,11 +1563,15 @@ const CollectionReportTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
     const bt = backendTrip(tripId);
     const posTix = posByTrip[tripId] || [];
     const posAmt = posTix.reduce((s, t) => s + Number(t.fare || 0), 0);
-    const backendTotal = Number(bt?.collection ?? 0);
+    const appAmt = Number(bt?.collection ?? 0);
+    const total = appAmt + posAmt;
     return {
-      trip: idx + 1,
-      route: bt?.route_name?.split(' ')[0] || '—',
-      amount: Math.max(backendTotal, posAmt),
+      tripId,
+      trip: bt?.trip_number ?? idx + 1,
+      route: bt?.route_name || '—',
+      appAmt,
+      posAmt,
+      amount: total,
     };
   });
 
@@ -1611,46 +1617,84 @@ const CollectionReportTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
 
       const padL = (s, w) => String(s).padEnd(w, ' ');
       const padR = (s, w) => String(s).padStart(w, ' ');
+      const padC = (s, w) => { const str = String(s); const tot = Math.max(0, w - str.length); const l = Math.floor(tot / 2); return ' '.repeat(l) + str + ' '.repeat(tot - l); };
       const fmtAmt = n => Number(n).toFixed(2);
 
       const DASH32 = '--------------------------------';
       const DASH_LIGHT = '- - - - - - - - - - - - - - - -';
 
-      await NyxPrinter.printText('SPS TRANSPORT', { textSize: 22, align: PrintAlign.CENTER });
-      await NyxPrinter.printText('COLL REPORT', { textSize: 26, align: PrintAlign.CENTER, bold: true });
+      const now = new Date();
+      const dateStr = now.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: '2-digit' }).replace(/\//g, '/');
+      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+      const busNo = dashboard?.recent_trips?.[0]?.bus_number ?? dashboard?.bus?.vehicle_number ?? 'N/A';
+
+      // ── Header ──────────────────────────────────────────────────────────
+      await NyxPrinter.printText('விண்ணப்பம் அலுவலகம்', { textSize: 20, align: PrintAlign.CENTER });
+      await NyxPrinter.printText('COLLECTION REPORT', { textSize: 24, align: PrintAlign.CENTER, bold: true });
+      await NyxPrinter.printText(`${dateStr}  ${timeStr}`, { textSize: 22, align: PrintAlign.CENTER });
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(`BUS NUMBER:${busNo}`, { textSize: 22, align: PrintAlign.CENTER });
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
-      // Trips Header
-      const hdr = padL('TRIP', 8) + padL('ROUTE', 14) + padR('AMT', 10);
-      await NyxPrinter.printText(hdr, { textSize: 26 });
+      // ── Trips table ─────────────────────────────────────────────────────
+      // TripSheet uses textSize 26 with COL total = 40 (6+6+5+5+5+5+8).
+      // So textSize 26 on 55mm = 40 chars full width.
+      // TRIP(5) + ROUTE(7) + AMOUNT(28) = 40
+      const LINE = 40;
+      const C = { trip: 5, route: 7, amt: LINE - 5 - 7 }; // amt = 28
+      const hdr = padL('TRIP', C.trip) + padC('ROUTE', C.route) + padR('AMOUNT', C.amt);
+      await NyxPrinter.printText(hdr, { textSize: 26, bold: true });
       await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
 
       for (const r of tripRows) {
-        const routeName = (r.route || '').substring(0, 12);
-        const row = padL(`#${r.trip}`, 8) + padL(routeName, 14) + padR(fmtAmt(r.amount), 10);
+        const row =
+          padL(String(r.trip), C.trip) +
+          padC('01', C.route) +
+          padR(fmtAmt(r.amount), C.amt);
         await NyxPrinter.printText(row, { textSize: 26 });
       }
+
       await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
-      await NyxPrinter.printText(`TOT COLL: Rs. ${fmtAmt(totalCollection)}`, { textSize: 26, align: PrintAlign.LEFT });
+      // "TOTAL Rs.:" left + amount right = 40
+      await NyxPrinter.printText(
+        `${padL('TOTAL Rs.:', 16)}${padR(fmtAmt(totalCollection), 24)}`,
+        { textSize: 26, bold: true },
+      );
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
-      // Expenses Header
-      if (expenses.length > 0) {
-        await NyxPrinter.printText('EXPENSES', { textSize: 26, align: PrintAlign.CENTER, bold: true });
-        await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
-        for (const e of expenses) {
-          const amt = parseAmount(e.amount);
-          if (amt > 0) {
-            const expLabel = (e.label || '').substring(0, 20);
-            await NyxPrinter.printText(`${padL(expLabel, 22)}${padR(fmtAmt(amt), 10)}`, { textSize: 26 });
-          }
-        }
-        await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
-        await NyxPrinter.printText(`TOT EXP : Rs. ${fmtAmt(totalExpenses)}`, { textSize: 26, align: PrintAlign.LEFT });
-        await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
+      // ── Expenses ────────────────────────────────────────────────────────
+      await NyxPrinter.printText('EXPENSES', { textSize: 26, align: PrintAlign.CENTER, bold: true });
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
+
+      // label(12) + " : "(3) + amount right-aligned in 25 = 40
+      const expL = 12;
+      const expSep = ' : ';
+      const expA = LINE - expL - expSep.length; // 40 - 12 - 3 = 25
+      const fixedLabels = FIXED_EXPENSES;
+      for (const label of fixedLabels) {
+        const exp = expenses.find(e => e.label.toUpperCase() === label.toUpperCase());
+        const amt = exp ? parseAmount(exp.amount) : 0;
+        const lbl = label.toUpperCase().substring(0, expL);
+        await NyxPrinter.printText(
+          `${padL(lbl, expL)}${expSep}${padR(fmtAmt(amt), expA)}`,
+          { textSize: 26 },
+        );
+      }
+      // Any extra (non-fixed) expenses
+      for (const extraExp of expenses.filter(exp => !exp.fixed)) {
+        const amt = parseAmount(extraExp.amount);
+        const lbl = extraExp.label.toUpperCase().substring(0, expL);
+        await NyxPrinter.printText(
+          `${padL(lbl, expL)}${expSep}${padR(fmtAmt(amt), expA)}`,
+          { textSize: 26 },
+        );
       }
 
-      await NyxPrinter.printText(`NET TOTAL : Rs. ${fmtAmt(netTotal)}`, { textSize: 32, align: PrintAlign.CENTER });
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(
+        `${padL('TOTAL Rs.:', 16)}${padR(fmtAmt(totalExpenses), 24)}`,
+        { textSize: 26, bold: true },
+      );
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
       await NyxPrinter.printEndAutoOut();
@@ -1674,113 +1718,146 @@ const CollectionReportTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
         />
       }
     >
-      {/* Summary cards */}
-      <View className="flex-row gap-3 mb-4">
-        <View className="flex-1 bg-sky-500/10 border border-sky-500/20 rounded-2xl p-4">
-          <Text className="text-zinc-500 text-[10px] font-bold tracking-widest mb-1">
-            COLLECTION
+      {/* ── Receipt-style card ── */}
+      <View className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden mb-4">
+
+        {/* Receipt header */}
+        <View className="bg-zinc-800/60 px-4 py-4 items-center border-b border-zinc-700">
+          <Text className="text-zinc-300 text-base font-bold tracking-wide">
+            COLLECTION REPORT
           </Text>
-          <Text className="text-sky-400 text-2xl font-black">
-            ₹{totalCollection.toFixed(0)}
+          <Text className="text-zinc-500 text-xs mt-1">
+            {new Date().toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: '2-digit' }).replace(/\//g, '/')}{'  '}
+            {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}
           </Text>
-        </View>
-        <View className="flex-1 bg-amber-500/10 border border-amber-500/20 rounded-2xl p-4">
-          <Text className="text-zinc-500 text-[10px] font-bold tracking-widest mb-1">
-            EXPENSES
-          </Text>
-          <Text className="text-amber-400 text-2xl font-black">
-            ₹{totalExpenses.toFixed(0)}
+          <Text className="text-zinc-400 text-xs font-bold mt-1">
+            BUS: {dashboard?.recent_trips?.[0]?.bus_number ?? dashboard?.bus?.vehicle_number ?? 'N/A'}
           </Text>
         </View>
-      </View>
 
-      {/* Net total */}
-      <View
-        className={`rounded-2xl border p-4 mb-4 ${
-          netTotal >= 0
-            ? 'bg-emerald-500/10 border-emerald-500/20'
-            : 'bg-red-500/10 border-red-500/20'
-        }`}
-      >
-        <Text className="text-zinc-500 text-[10px] font-bold tracking-widest mb-1">
-          NET TOTAL
-        </Text>
-        <Text
-          className={`text-3xl font-black ${
-            netTotal >= 0 ? 'text-emerald-400' : 'text-red-400'
-          }`}
-        >
-          ₹{netTotal.toFixed(2)}
-        </Text>
-      </View>
-
-      {/* Expenses */}
-      <View className="flex-row items-center justify-between mb-3">
-        <Text className="text-zinc-500 text-[10px] font-bold tracking-widest">
-          EXPENSES ({expenses.length})
-        </Text>
-        <TouchableOpacity
-          onPress={() => setShowAddModal(true)}
-          className="bg-emerald-600 px-3 py-1.5 rounded-lg"
-          activeOpacity={0.8}
-        >
-          <Text className="text-white text-xs font-bold">+ Add</Text>
-        </TouchableOpacity>
-      </View>
-
-      {expenses.map((expense, i) => (
-        <TouchableOpacity
-          key={expense.id}
-          onLongPress={() => deleteExpense(expense.id)}
-          delayLongPress={500}
-          activeOpacity={1}
-          className={`flex-row items-center gap-3 bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 mb-2`}
-        >
-          <Text className="text-zinc-400 text-sm font-bold flex-1">
-            {expense.label}
-          </Text>
-          <TextInput
-            className="text-white text-sm font-bold text-right w-24"
-            keyboardType="numeric"
-            value={expense.amount}
-            onChangeText={v => updateExpense(expense.id, v)}
-            placeholder="0"
-            placeholderTextColor="#52525b"
-          />
-        </TouchableOpacity>
-      ))}
-
-      {/* Trips - compact */}
-      <Text className="text-zinc-500 text-[10px] font-bold tracking-widest mb-3 mt-4">
-        TRIPS ({tripRows.length})
-      </Text>
-
-      {tripRows.length === 0 ? (
-        <View className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 items-center">
-          <Text className="text-zinc-600 text-sm">No trips today</Text>
-        </View>
-      ) : (
-        tripRows.map((row, i) => (
-          <View
-            key={i}
-            className="flex-row items-center gap-3 bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-2.5 mb-2"
-          >
-            <Text className="text-zinc-600 text-xs font-bold w-8">
-              #{row.trip}
-            </Text>
-            <Text className="text-zinc-400 text-sm flex-1" numberOfLines={1}>
-              {row.route}
-            </Text>
-            <Text className="text-sky-400 text-sm font-bold">
-              ₹{row.amount.toFixed(0)}
-            </Text>
+        {/* Trips table */}
+        <View className="px-4 pt-3 pb-2">
+          {/* Table header */}
+          <View className="flex-row border-b border-zinc-700 pb-2 mb-1">
+            <Text className="text-zinc-500 text-[11px] font-black tracking-widest" style={{ flex: 1.2 }}>TRIP</Text>
+            <Text className="text-zinc-500 text-[11px] font-black tracking-widest text-center" style={{ flex: 1 }}>ROUTE</Text>
+            <Text className="text-zinc-500 text-[11px] font-black tracking-widest text-right" style={{ flex: 2 }}>AMOUNT</Text>
           </View>
-        ))
-      )}
+
+          {tripRows.length === 0 ? (
+            <View className="py-6 items-center">
+              <Text className="text-zinc-600 text-sm">No trips today</Text>
+            </View>
+          ) : (
+            tripRows.map((row, i) => (
+              <View key={i} className={`flex-row items-center py-2.5 ${i < tripRows.length - 1 ? 'border-b border-zinc-800/60' : ''}`}>
+                <View style={{ flex: 1.2 }}>
+                  <Text className="text-zinc-200 text-sm font-bold">{row.trip}</Text>
+                  {(row.appAmt > 0 || row.posAmt > 0) && (
+                    <View className="flex-row gap-2 mt-0.5">
+                      {row.appAmt > 0 && (
+                        <Text className="text-violet-400 text-[9px] font-bold">APP ₹{row.appAmt.toFixed(0)}</Text>
+                      )}
+                      {row.posAmt > 0 && (
+                        <Text className="text-amber-400 text-[9px] font-bold">POS ₹{row.posAmt.toFixed(0)}</Text>
+                      )}
+                    </View>
+                  )}
+                </View>
+                <Text className="text-zinc-400 text-sm font-bold text-center" style={{ flex: 1 }}>01</Text>
+                <Text className="text-zinc-100 text-sm font-black text-right" style={{ flex: 2 }}>
+                  {row.amount.toFixed(2)}
+                </Text>
+              </View>
+            ))
+          )}
+
+          {/* Total collection */}
+          <View className="flex-row items-center justify-between border-t border-zinc-700 pt-3 mt-2">
+            <Text className="text-zinc-400 text-sm font-black tracking-wide">TOTAL Rs.:</Text>
+            <Text className="text-sky-400 text-xl font-black">₹{totalCollection.toFixed(2)}</Text>
+          </View>
+        </View>
+
+        {/* Divider */}
+        <View className="mx-4 border-t border-dashed border-zinc-700 my-2" />
+
+        {/* Expenses section */}
+        <View className="px-4 pb-3">
+          <View className="flex-row items-center justify-between mb-3">
+            <Text className="text-zinc-400 text-sm font-black tracking-widest">EXPENSES</Text>
+            <TouchableOpacity
+              onPress={() => setShowAddModal(true)}
+              className="bg-zinc-800 border border-zinc-700 px-3 py-1 rounded-lg"
+              activeOpacity={0.8}
+            >
+              <Text className="text-zinc-400 text-xs font-bold">+ Add</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Fixed expenses — always shown */}
+          {expenses.filter(e => e.fixed).map(expense => (
+            <View key={expense.id} className="flex-row items-center py-2 border-b border-zinc-800/50">
+              <Text className="text-zinc-400 text-sm font-bold flex-1">
+                {expense.label.toUpperCase()}
+              </Text>
+              <Text className="text-zinc-500 text-sm mr-3">:</Text>
+              <TextInput
+                className="text-zinc-100 text-sm font-bold text-right w-24"
+                keyboardType="numeric"
+                value={expense.amount}
+                onChangeText={v => updateExpense(expense.id, v)}
+                placeholder="0.00"
+                placeholderTextColor="#52525b"
+              />
+            </View>
+          ))}
+
+          {/* Extra (non-fixed) expenses */}
+          {expenses.filter(e => !e.fixed).map(expense => (
+            <TouchableOpacity
+              key={expense.id}
+              onLongPress={() => deleteExpense(expense.id)}
+              delayLongPress={500}
+              activeOpacity={1}
+              className="flex-row items-center py-2 border-b border-zinc-800/50"
+            >
+              <Text className="text-amber-400 text-sm font-bold flex-1">
+                {expense.label.toUpperCase()}
+              </Text>
+              <Text className="text-zinc-500 text-sm mr-3">:</Text>
+              <TextInput
+                className="text-zinc-100 text-sm font-bold text-right w-24"
+                keyboardType="numeric"
+                value={expense.amount}
+                onChangeText={v => updateExpense(expense.id, v)}
+                placeholder="0.00"
+                placeholderTextColor="#52525b"
+              />
+            </TouchableOpacity>
+          ))}
+
+          {/* Total expenses */}
+          <View className="flex-row items-center justify-between pt-3 mt-1">
+            <Text className="text-zinc-400 text-sm font-black tracking-wide">TOTAL Rs.:</Text>
+            <Text className="text-amber-400 text-xl font-black">₹{totalExpenses.toFixed(2)}</Text>
+          </View>
+        </View>
+
+        {/* Net total band */}
+        <View className={`mx-4 mb-4 rounded-xl p-3 items-center ${
+          netTotal >= 0 ? 'bg-emerald-500/10 border border-emerald-500/20' : 'bg-red-500/10 border border-red-500/20'
+        }`}>
+          <Text className="text-zinc-500 text-[10px] font-black tracking-widest mb-0.5">NET TOTAL</Text>
+          <Text className={`text-2xl font-black ${
+            netTotal >= 0 ? 'text-emerald-400' : 'text-red-400'
+          }`}>₹{netTotal.toFixed(2)}</Text>
+        </View>
+      </View>
 
       {/* Print button */}
       <TouchableOpacity
-        className="flex-row items-center justify-center gap-2 bg-emerald-600 rounded-xl py-3.5 mt-4"
+        className="flex-row items-center justify-center gap-2 bg-emerald-600 rounded-xl py-3.5"
         activeOpacity={0.8}
         onPress={handlePrintCollectionReport}
       >
@@ -1800,7 +1877,7 @@ const CollectionReportTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
         <View className="flex-1 bg-black/60 justify-end">
           <View className="bg-zinc-900 rounded-t-3xl p-5 pb-8">
             <View className="flex-row items-center justify-between mb-4">
-              <Text className="text-white text-lg font-black">Add Expense</Text>
+              <Text className="text-white text-lg font-black">Add Extra Expense</Text>
               <TouchableOpacity onPress={() => setShowAddModal(false)}>
                 <Text className="text-zinc-500 text-lg">✕</Text>
               </TouchableOpacity>
@@ -1919,6 +1996,44 @@ const ReportScreen = () => {
 
   const at = dashboard?.active_trip;
   const posSummary = posHook.todaySummary();
+  const [todayAppCount, setTodayAppCount] = useState(null);
+
+  useEffect(() => {
+    if (!dashboard) return;
+    const todayTrips = [
+      ...(dashboard.active_trip?.trip_id ? [dashboard.active_trip] : []),
+      ...(dashboard.recent_trips ?? []),
+    ];
+    const todayStr = new Date().toLocaleDateString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+    const tripIds = todayTrips
+      .filter(t => {
+        if (!t.start_time) return false;
+        return new Date(t.start_time).toLocaleDateString('en-IN', {
+          timeZone: 'Asia/Kolkata',
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric',
+        }) === todayStr;
+      })
+      .map(t => t.trip_id)
+      .filter(Boolean);
+    const uniqueTripIds = [...new Set(tripIds)];
+    if (uniqueTripIds.length === 0) { setTodayAppCount(0); return; }
+    supabase
+      .from('tickets')
+      .select('ticket_count')
+      .in('trip_id', uniqueTripIds)
+      .neq('payment_method', 'pos')
+      .then(({ data, error }) => {
+        if (error || !data) { setTodayAppCount(0); return; }
+        setTodayAppCount(data.reduce((s, r) => s + Number(r.ticket_count ?? 1), 0));
+      });
+  }, [dashboard]);
 
   if (loading) {
     return (
@@ -1970,7 +2085,7 @@ const ReportScreen = () => {
           },
           {
             label: 'App Tickets',
-            val: dashboard?.today_stats?.tickets_sold ?? 0,
+            val: todayAppCount ?? 0,
             color: 'text-violet-400',
             bg: 'bg-violet-500/10 border-violet-500/20',
           },

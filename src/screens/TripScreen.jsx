@@ -6,12 +6,13 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   Bus, Play, Pause, Square,
-  UserCheck, CheckCircle, Clock, Timer, ArrowLeftRight,
+  UserCheck, CheckCircle, Clock, Timer, ArrowLeftRight, FileText,
 } from 'lucide-react-native';
+import { useNavigation } from '@react-navigation/native';
 import api from '../api/api';
 import { supabase } from '../../lib/supabase';
-import { usePOSTickets } from '../hooks/usePOSTickets';
 import { useVerificationRealtime } from '../hooks/useVerificationRealtime';
+import { useTripContext } from '../context/TripContext';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const showToast = (msg, dur = ToastAndroid.SHORT) => {
@@ -221,6 +222,8 @@ const StartTripButtons = ({ routes, onStarted }) => {
 
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 const TripScreen = () => {
+  const navigation = useNavigation();
+  const { setActiveTrip: setCtxTrip, setTripNumber: setCtxTripNumber, setBusNumber: setCtxBusNumber, posHook } = useTripContext();
   const [dashboard, setDashboard] = useState(null);
   const [dashLoading, setDashLoading] = useState(true);
   const [changing, setChanging] = useState(false);
@@ -234,7 +237,6 @@ const TripScreen = () => {
   const [localTripNumber, setLocalTripNumber] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
 
-  const posHook = usePOSTickets();
   const at = dashboard?.active_trip;
 
   const { pendingRequests, clearTicket } = useVerificationRealtime(at?.trip_id, at?.status);
@@ -293,6 +295,9 @@ const TripScreen = () => {
         const nextNum = await assignTripNumber(tripId, conductorId);
         setLocalTripNumber(nextNum);
       }
+      setCtxTrip(r.data?.active_trip ?? null);
+      setCtxTripNumber(dbTripNumber);
+      if (r.data?.bus?.vehicle_number) setCtxBusNumber(r.data.bus.vehicle_number);
     } catch (e) { console.error(e); }
     finally { setDashLoading(false); }
   };
@@ -346,6 +351,9 @@ const TripScreen = () => {
           const nextNum = await assignTripNumber(tripId, conductorId);
           setLocalTripNumber(nextNum);
         }
+        setCtxTrip(dash?.active_trip ?? null);
+        setCtxTripNumber(dbTripNumber);
+        if (dash?.bus?.vehicle_number) setCtxBusNumber(dash.bus.vehicle_number);
       }
     } catch (e) { console.error(e); }
     finally { setDashLoading(false); }
@@ -483,7 +491,16 @@ const TripScreen = () => {
                   )}
                   <Text className="text-white text-2xl font-black leading-tight">{tripDisplay}</Text>
                 </View>
-                <StatusBadge status={at.status} />
+                {at.status === 'running' ? (
+                  <TouchableOpacity
+                    onPress={() => navigation?.navigate?.('Reports')}
+                    className="flex-row items-center gap-1.5 bg-sky-500/10 border border-sky-500/30 px-3 py-1.5 rounded-full">
+                    <FileText size={13} color="#38bdf8" />
+                    <Text className="text-sky-400 text-[11px] font-bold">Print</Text>
+                  </TouchableOpacity>
+                ) : (
+                  <StatusBadge status={at.status} />
+                )}
               </View>
 
               {/* Meta row */}
