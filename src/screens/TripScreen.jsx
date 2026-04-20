@@ -1,12 +1,14 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Text, TouchableOpacity, View, ScrollView,
   Platform, Alert, ActivityIndicator, ToastAndroid, RefreshControl,
+  Animated,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   Bus, Play, Pause, Square,
   UserCheck, CheckCircle, Clock, Timer, ArrowLeftRight, FileText,
+  X, Bell, AlertCircle,
 } from 'lucide-react-native';
 import { useNavigation } from '@react-navigation/native';
 import api from '../api/api';
@@ -30,6 +32,14 @@ const formatDuration = (start) => {
 };
 
 const normalizeDir = (d) => (d ?? '').toString().trim().toLowerCase();
+
+const parseStopLabel = (name) => {
+  if (!name || name === '?') return { tamil: name || '?', tripNum: null };
+  const parts = name.split('-');
+  const tripNum = parts.length >= 2 ? parts[1].trim() : null;
+  const tamil = parts.length >= 3 ? parts.slice(2).join('-').trim() : parts[0].trim();
+  return { tamil: tamil || name, tripNum };
+};
 const isDown = (d) => ['dn', 'down', 'return'].includes(normalizeDir(d));
 
 const routeLabel = (name, dir) => {
@@ -87,29 +97,67 @@ const BlockingOverlay = ({ message }) => (
 );
 
 // ─── Pending Verify Row ───────────────────────────────────────────────────────
-const PendingVerifyRow = ({ item, onVerify, verifying }) => (
-  <View className="flex-row items-center justify-between bg-zinc-900 rounded-xl p-3 mb-2 border border-amber-500/30">
-    <View className="flex-row items-center flex-1 mr-3 gap-3">
-      <View className="w-9 h-9 rounded-full bg-amber-500/20 justify-center items-center">
-        <UserCheck size={17} color="#f59e0b" />
+const PendingVerifyRow = ({ item, onVerify, verifying }) => {
+  const pulse = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 0.55, duration: 750, useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 1,    duration: 750, useNativeDriver: true }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [pulse]);
+
+  const isBusy = verifying === item.ticket_id;
+
+  return (
+    <Animated.View style={{ opacity: pulse }}>
+      <View className="flex-row items-center justify-between bg-zinc-900 rounded-xl p-3 mb-2 border border-amber-500/30">
+        <View className="flex-row items-center flex-1 mr-3 gap-3">
+          <View className="w-10 h-10 rounded-full bg-amber-500/20 justify-center items-center">
+            <UserCheck size={18} color="#f59e0b" />
+          </View>
+          <View className="flex-1">
+            <View className="flex-row items-center gap-1 flex-wrap">
+              <Text className="text-white text-sm font-bold" numberOfLines={1}>
+                {parseStopLabel(item.from).tamil}
+              </Text>
+              <Text className="text-zinc-500 text-sm">→</Text>
+              <Text className="text-white text-sm font-bold" numberOfLines={1}>
+                {parseStopLabel(item.to).tamil}
+              </Text>
+            </View>
+            <View className="flex-row items-center gap-2 mt-0.5">
+              {(parseStopLabel(item.from).tripNum || parseStopLabel(item.to).tripNum) && (
+                <Text className="text-zinc-600 text-[10px] font-semibold">
+                  {parseStopLabel(item.from).tripNum} → {parseStopLabel(item.to).tripNum}
+                </Text>
+              )}
+              <Text className="text-zinc-400 text-xs">₹{item.fare ?? item.amount ?? 0}</Text>
+              {item.bus_number ? <Text className="text-zinc-500 text-xs">🚌 {item.bus_number}</Text> : null}
+            </View>
+          </View>
+        </View>
+        <TouchableOpacity
+          className={`flex-row items-center gap-1.5 px-3 py-2.5 rounded-xl ${
+            isBusy ? 'bg-emerald-700/50' : 'bg-emerald-600'
+          }`}
+          onPress={() => onVerify(item.ticket_id)}
+          disabled={isBusy}
+          activeOpacity={0.75}
+        >
+          {isBusy
+            ? <ActivityIndicator size="small" color="#fff" />
+            : <><CheckCircle size={14} color="#fff" /><Text className="text-white text-xs font-bold">Verify</Text></>
+          }
+        </TouchableOpacity>
       </View>
-      <View className="flex-1">
-        <Text className="text-white text-sm font-bold">{item.from || '?'} → {item.to || '?'}</Text>
-        <Text className="text-zinc-400 text-xs mt-0.5">₹{item.fare ?? 0}{item.bus_number ? `  ·  ${item.bus_number}` : ''}</Text>
-      </View>
-    </View>
-    <TouchableOpacity
-      className="flex-row items-center gap-1.5 bg-emerald-600 px-3 py-2 rounded-lg"
-      onPress={() => onVerify(item.ticket_id)}
-      disabled={verifying === item.ticket_id}
-    >
-      {verifying === item.ticket_id
-        ? <ActivityIndicator size="small" color="#fff" />
-        : <><CheckCircle size={13} color="#fff" /><Text className="text-white text-xs font-bold">Verify</Text></>
-      }
-    </TouchableOpacity>
-  </View>
-);
+    </Animated.View>
+  );
+};
 
 // ─── Direction Toggle ─────────────────────────────────────────────────────────
 const DirectionToggle = ({ routeName, currentDirection, onStartReturn, starting }) => {
@@ -231,6 +279,9 @@ const TripScreen = () => {
   const [startingReturn, setStartingReturn] = useState(false);
   const [routes, setRoutes] = useState([]);
   const [verifyingTicket, setVerifyingTicket] = useState(null);
+  const [showVerification, setShowVerification] = useState(true);
+  const prevVerifyCountRef = useRef(0);
+  const [ticketRefreshKey, setTicketRefreshKey] = useState(0);
   const [appOnlyTickets, setAppOnlyTickets] = useState(0);
   const [appOnlyFare, setAppOnlyFare] = useState(0);
   const [appTripLoading, setAppTripLoading] = useState(false);
@@ -249,6 +300,13 @@ const TripScreen = () => {
   useEffect(() => { fetchDashboard(); }, []);
 
   useEffect(() => {
+    if (pendingRequests.length > 0 && prevVerifyCountRef.current === 0) {
+      setShowVerification(true);
+    }
+    prevVerifyCountRef.current = pendingRequests.length;
+  }, [pendingRequests.length]);
+
+  useEffect(() => {
     api.get('/conductor/routes').then(r => setRoutes(r.data?.routes || [])).catch(() => {});
   }, []);
 
@@ -263,7 +321,7 @@ const TripScreen = () => {
           .from('tickets')
           .select('ticket_count,total_fare,fare')
           .eq('trip_id', tid)
-          .neq('payment_method', 'pos');
+          .or('payment_method.neq.pos,payment_method.is.null');
         if (error) throw error;
         const rows = data || [];
         const count = rows.reduce((s, r) => s + Number(r.ticket_count ?? 1), 0);
@@ -280,7 +338,7 @@ const TripScreen = () => {
       }
     })();
     return () => { cancelled = true; };
-  }, [at?.trip_id]);
+  }, [at?.trip_id, ticketRefreshKey]);
 
   const fetchDashboard = async () => {
     try {
@@ -309,6 +367,7 @@ const TripScreen = () => {
       const r = await api.get('/conductor/routes');
       setRoutes(r.data?.routes || []);
       if (posHook.reload) await posHook.reload();
+      setTicketRefreshKey(k => k + 1);
     } catch (e) { console.error('[TripScreen] Refresh failed:', e); }
     finally { setRefreshing(false); }
   }, [posHook]);
@@ -460,21 +519,46 @@ const TripScreen = () => {
       >
         {/* ── Pending Verification Requests ── */}
         {pendingRequests.length > 0 && (
-          <View className="bg-amber-950/40 border border-amber-500/30 rounded-2xl p-4 mb-4">
-            <View className="flex-row justify-between items-center mb-1">
-              <View className="flex-row items-center gap-2">
-                <Text className="text-amber-400 text-sm font-bold">Verification Requests</Text>
-                <View className="bg-amber-500 rounded-full w-5 h-5 justify-center items-center">
-                  <Text className="text-white text-[10px] font-black">{pendingRequests.length}</Text>
+          showVerification ? (
+            <View className="bg-amber-950/40 border border-amber-500/30 rounded-2xl p-4 mb-4">
+              {/* Header */}
+              <View className="flex-row items-center justify-between mb-1">
+                <View className="flex-row items-center gap-2 flex-1">
+                  <Bell size={14} color="#f59e0b" />
+                  <Text className="text-amber-400 text-sm font-bold">Verification Requests</Text>
+                  <View className="bg-amber-500 rounded-full w-5 h-5 justify-center items-center">
+                    <Text className="text-white text-[10px] font-black">{pendingRequests.length}</Text>
+                  </View>
+                  <Text className="text-amber-500 text-[11px] font-bold">● LIVE</Text>
                 </View>
+                <TouchableOpacity
+                  onPress={() => setShowVerification(false)}
+                  className="w-7 h-7 rounded-full bg-zinc-800 border border-zinc-700 justify-center items-center ml-2"
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <X size={14} color="#a1a1aa" />
+                </TouchableOpacity>
               </View>
-              <Text className="text-amber-500 text-[11px] font-bold">● LIVE</Text>
+              <Text className="text-zinc-500 text-xs mb-3">Tap verify to confirm a passenger ticket</Text>
+              {pendingRequests.map(i => (
+                <PendingVerifyRow key={i.ticket_id} item={i} onVerify={handleVerify} verifying={verifyingTicket} />
+              ))}
             </View>
-            <Text className="text-zinc-500 text-xs mb-3">Tap verify to confirm passenger ticket</Text>
-            {pendingRequests.map(i => (
-              <PendingVerifyRow key={i.ticket_id} item={i} onVerify={handleVerify} verifying={verifyingTicket} />
-            ))}
-          </View>
+          ) : (
+            <TouchableOpacity
+              onPress={() => setShowVerification(true)}
+              activeOpacity={0.75}
+              className="flex-row items-center justify-between bg-amber-950/40 border border-amber-500/40 rounded-2xl px-4 py-3 mb-4"
+            >
+              <View className="flex-row items-center gap-2">
+                <AlertCircle size={16} color="#f59e0b" />
+                <Text className="text-amber-400 text-sm font-semibold">
+                  {pendingRequests.length} awaiting verification
+                </Text>
+              </View>
+              <Text className="text-amber-500 text-xs font-bold">View →</Text>
+            </TouchableOpacity>
+          )
         )}
 
         {at ? (
