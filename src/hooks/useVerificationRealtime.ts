@@ -19,6 +19,7 @@ export function useVerificationRealtime(
   const [pendingRequests, setPendingRequests] = useState<PendingTicket[]>([]);
   const channelRef = useRef<any>(null);
   const tripIdRef = useRef(tripId);
+  const dismissedTicketsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     tripIdRef.current = tripId;
@@ -58,7 +59,7 @@ export function useVerificationRealtime(
 
       console.log('🧠 stopMap:', stopMap);
 
-      const mapped = mapRows(data || [], stopMap);
+      const mapped = mapRows(data || [], stopMap).filter(t => !dismissedTicketsRef.current.has(t.ticket_id));
 
       console.log('🧠 mapped:', mapped);
 
@@ -178,7 +179,14 @@ export function useVerificationRealtime(
     );
   }, []);
 
-  return {pendingRequests, clearTicket};
+  const dismissTicket = useCallback((ticketId: string) => {
+    dismissedTicketsRef.current.add(ticketId);
+    setPendingRequests(prev =>
+      prev.filter(p => p.ticket_id !== ticketId),
+    );
+  }, []);
+
+  return {pendingRequests, clearTicket, dismissTicket};
 }
 
 //

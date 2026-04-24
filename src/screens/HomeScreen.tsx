@@ -2,12 +2,12 @@ import React, {useState, useCallback, useEffect, useRef} from 'react';
 import {
   Text, TouchableOpacity, View, ScrollView,
   Platform, Alert, ActivityIndicator, ToastAndroid,
-  TextInput,
+  TextInput, Modal,
 } from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
 import {
   ArrowUpDown, Minus, Plus, Play,
-  Bus, AlertCircle, Download, MapPin, CloudOff,
+  Bus, AlertCircle, Download, MapPin, CloudOff, WifiOff,
 } from 'lucide-react-native';
 import {getRandomFortune} from '../utils/fortune';
 import {places} from '../utils/places';
@@ -15,6 +15,7 @@ import {fareMatrix} from '../utils/fareMatrix';
 import {supabase} from '../../lib/supabase';
 import api from '../api/api';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
 
 import { useTripContext } from '../context/TripContext';
 
@@ -109,6 +110,9 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
   const [luggageInput, setLuggageInput] = useState('0');
   const [fullCount, setFullCount] = useState(1);
   const [halfCount, setHalfCount] = useState(0);
+  const [showTicketModal, setShowTicketModal] = useState(false);
+  const [ticketData, setTicketData] = useState<any>(null);
+  const [isConnected, setIsConnected] = useState(true);
 
   const stopKey = (dir: string) => `ticket_stops_${dir}`;
 
@@ -119,6 +123,20 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
   }, []);
 
   const isFirstMount = useRef(true);
+
+  // Monitor network connectivity
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener(state => {
+      setIsConnected(state.isConnected ?? false);
+    });
+    
+    // Check initial state
+    NetInfo.fetch().then(state => {
+      setIsConnected(state.isConnected ?? false);
+    });
+
+    return () => unsubscribe();
+  }, []);
 
   useEffect(() => {
     const loadStops = async () => {
@@ -154,7 +172,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
   const grandTotal = fullTotal + halfTotal + luggageAmount;
   const totalTickets = fullCount + halfCount + (luggageAmount > 0 ? 1 : 0);
   const hasPassengerTickets = fullCount > 0 || halfCount > 0;
-  const isReady = !!(selStart && selDest && !dirErr && (luggageAmount > 0 || (hasPassengerTickets && baseFullFare > 0)));
+  const isReady = !!(selStart && selDest && !dirErr && (luggageAmount > 0 || (hasPassengerTickets && baseFullFare > 0)) && isConnected);
 
   useEffect(() => {
     setDirErr(null);
@@ -166,26 +184,32 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
   }, [selStart, selDest, tripDirection]);
 
   const handleIssue = async () => {
-    if (Platform.OS !== 'android' || !NyxPrinter) {
-      Alert.alert('Not supported', 'Printing is only available on Android.');
+    if (!isConnected) {
+      Alert.alert('No Internet', 'Please check your internet connection to issue tickets.');
       return;
     }
     setIssuing(true);
     try {
-      const statusRet = await NyxPrinter.getPrinterStatus();
-      if (statusRet !== PrinterStatus.SDK_OK) {
-        Alert.alert('Printer Error', PrinterStatus.msg(statusRet));
-        return;
+      // Check testing mode
+      const testingMode = await AsyncStorage.getItem('testing_mode');
+      const isTestingMode = testingMode === 'true';
+
+      if (!isTestingMode) {
+        if (Platform.OS !== 'android' || !NyxPrinter) {
+          Alert.alert('Not supported', 'Printing is only available on Android.');
+          setIssuing(false);
+          return;
+        }
+        const statusRet = await NyxPrinter.getPrinterStatus();
+        if (statusRet !== PrinterStatus.SDK_OK) {
+          Alert.alert('Printer Error', PrinterStatus.msg(statusRet));
+          setIssuing(false);
+          return;
+        }
       }
 
-      // Start fetching ticket number immediately so we don't block the printer from starting
-      const busId = activeTrip?.bus_id ?? null;
-      const ticketNumPromise = getNextTicketNumber(busId);
 
-      // Start printing the header immediately
-      await NyxPrinter.printText('SPS - ZYRAP', { textSize: 28, align: PrintAlign.CENTER });
-      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-
+      // Prepare ticket data
       const now = new Date();
       const dp = now.toLocaleDateString('en-GB').replace(/\//g, '-');
       const tp = now.toLocaleTimeString('en-GB', {hour12: false});
@@ -204,8 +228,11 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
       const cHalfTotal = cHalf * baseHalfFare;
       const cGrandTotal = cFullTotal + cHalfTotal + cLug;
 
-      // Await the ticket number here, after the printer has already started making noise
-      const firstTicketNum = await ticketNumPromise;
+      // Get ticket number — prefer selected_bus from AsyncStorage
+      const storedBusRaw = await AsyncStorage.getItem('selected_bus');
+      const storedBus = storedBusRaw ? JSON.parse(storedBusRaw) : null;
+      const busId = storedBus?.id ?? activeTrip?.bus_id ?? null;
+      const firstTicketNum = await getNextTicketNumber(busId);
       const isLuggageOnlyTicket = (cFull === 0 && cHalf === 0 && cLug > 0);
 
       let fullTicketNum = null;
@@ -224,19 +251,129 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
         halfTicketNum ? `#${halfTicketNum}` : null,
       ].filter(Boolean).join(' / ');
 
-      await NyxPrinter.printText(`Bus: ${busNumber}${numLine ? `   #${numLine.replace(/#/g, '')}` : ''}`, { textSize: 24, align: PrintAlign.CENTER });
-      await NyxPrinter.printText(`${dp}  ${tp}`, { textSize: 24, align: PrintAlign.CENTER });
+      // Prepare ticket data for modal or printing
+      const ticketInfo = {
+        header: 'SPS - ZYRAP',
+        ticketNumber: numLine ? `Ticket #: ${numLine.replace(/#/g, '')}` : null,
+        separator: '--------------------------------',
+        busInfo: `Bus: ${busNumber}`,
+        dateTime: `${dp}  ${tp}`,
+        route: `${fn}  to  ${tn}`,
+        fullFare: cFull > 0 ? `ADULT   Rs ${fareStr(cFullTotal)}` : null,
+        halfFare: cHalf > 0 ? `CHILD   Rs ${fareStr(cHalfTotal)}` : null,
+        luggageFare: cLug > 0 ? `LUGGAGE   Rs ${fareStr(cLug)}` : null,
+        fortune: fortune,
+        total: cGrandTotal,
+      };
+
+      if (isTestingMode) {
+        // Save locally — fire-and-forget, never blocks the UI
+        if (cFull > 0) {
+          posHook.saveTicket({
+            id: genId(),
+            trip_id: activeTrip?.trip_id ?? null,
+            from_stop: `${fnum}-${fn}`,
+            to_stop: `${tnum}-${tn}`,
+            from_key: selStart?.key || '',
+            to_key: selDest?.key || '',
+            ticket_count: cFull,
+            fare: cFullTotal,
+            unit_fare: baseFullFare,
+            ticket_type: 'full',
+            luggage_amount: cLug,
+            ticket_number: fullTicketNum,
+            bus_number: busNumber,
+            direction: tripDirection,
+            issued_at: now.toISOString()
+          });
+        }
+
+        if (cHalf > 0) {
+          posHook.saveTicket({
+            id: genId(),
+            trip_id: activeTrip?.trip_id ?? null,
+            from_stop: `${fnum}-${fn}`,
+            to_stop: `${tnum}-${tn}`,
+            from_key: selStart?.key || '',
+            to_key: selDest?.key || '',
+            ticket_count: cHalf,
+            fare: cHalfTotal,
+            unit_fare: baseHalfFare,
+            ticket_type: 'half',
+            luggage_amount: cFull === 0 ? cLug : 0,
+            ticket_number: halfTicketNum,
+            bus_number: busNumber,
+            direction: tripDirection,
+            issued_at: now.toISOString()
+          });
+        }
+
+        if (cFull === 0 && cHalf === 0 && cLug > 0) {
+           posHook.saveTicket({
+            id: genId(),
+            trip_id: activeTrip?.trip_id ?? null,
+            from_stop: `${fnum}-${fn}`,
+            to_stop: `${tnum}-${tn}`,
+            from_key: selStart?.key || '',
+            to_key: selDest?.key || '',
+            ticket_count: 0,
+            fare: cLug,
+            unit_fare: 0,
+            ticket_type: 'full',
+            luggage_amount: cLug,
+            ticket_number: fullTicketNum,
+            bus_number: busNumber,
+            direction: tripDirection,
+            issued_at: now.toISOString()
+          });
+        }
+
+        showToast(`Ticket issued · ₹${cGrandTotal}`);
+
+        const nextFull = fullCount - cFull;
+        const nextHalf = halfCount - cHalf;
+        const nextLug = luggageAmount - cLug;
+
+        if (nextFull === 0 && nextHalf === 0) {
+          setFullCount(1);
+          setHalfCount(0);
+        } else {
+          setFullCount(nextFull);
+          setHalfCount(nextHalf);
+        }
+        if (cLug > 0) setLuggageInput('0');
+
+        if (nextFull === 0 && nextHalf === 0 && nextLug === 0) {
+          setActiveDrop(null);
+        }
+
+        // Show modal instead of printing
+        setTicketData(ticketInfo);
+        setShowTicketModal(true);
+        setIssuing(false);
+        return;
+      }
+
+      // Start printing the header immediately
+      await NyxPrinter.printText('SPS - ZYRAP', { textSize: 28, align: PrintAlign.CENTER });
+      if (ticketInfo.ticketNumber) {
+        await NyxPrinter.printText(ticketInfo.ticketNumber, { textSize: 24, align: PrintAlign.CENTER });
+      }
       await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      await NyxPrinter.printText(`${fn}  to  ${tn}`, { textSize: 24, align: PrintAlign.CENTER });
+
+      await NyxPrinter.printText(ticketInfo.busInfo, { textSize: 24, align: PrintAlign.CENTER });
+      await NyxPrinter.printText(ticketInfo.dateTime, { textSize: 24, align: PrintAlign.CENTER });
       await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      if (cFull > 0)
-        await NyxPrinter.printText(`ADULT   Rs ${fareStr(cFullTotal)}`, { textSize: 24 });
-      if (cHalf > 0)
-        await NyxPrinter.printText(`CHILD   Rs ${fareStr(cHalfTotal)}`, { textSize: 24 });
-      if (cLug > 0)
-        await NyxPrinter.printText(`LUGGAGE   Rs ${fareStr(cLug)}`, { textSize: 24 });
+      await NyxPrinter.printText(ticketInfo.route, { textSize: 24, align: PrintAlign.CENTER });
       await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
-      await NyxPrinter.printText(fortune, { textSize: 18, align: PrintAlign.CENTER });
+      if (ticketInfo.fullFare)
+        await NyxPrinter.printText(ticketInfo.fullFare, { textSize: 24, align: PrintAlign.CENTER });
+      if (ticketInfo.halfFare)
+        await NyxPrinter.printText(ticketInfo.halfFare, { textSize: 24, align: PrintAlign.CENTER });
+      if (ticketInfo.luggageFare)
+        await NyxPrinter.printText(ticketInfo.luggageFare, { textSize: 24, align: PrintAlign.CENTER });
+      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(ticketInfo.fortune, { textSize: 18, align: PrintAlign.CENTER });
       await NyxPrinter.printEndAutoOut();
 
       // Save locally — fire-and-forget, never blocks the UI
@@ -336,6 +473,14 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
         className="flex-1 bg-black"
         contentContainerStyle={{padding: 16, paddingBottom: isReady ? 120 : 40}}
         showsVerticalScrollIndicator={false}>
+
+        {/* ── Offline Banner ── */}
+        {!isConnected && (
+          <View className="flex-row items-center gap-2 bg-red-950 border border-red-900 rounded-xl px-3 py-2.5 mb-4">
+            <WifiOff size={14} color="#ffffff" />
+            <Text className="text-white text-sm flex-1">No internet connection</Text>
+          </View>
+        )}
 
         {/* ── Trip Info Bar ── */}
         <View className="flex-row items-center gap-3 mb-5 px-1">
@@ -540,7 +685,127 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
         )}
       </ScrollView>
 
+      {/* Ticket Modal for Testing Mode */}
+      <Modal
+        visible={showTicketModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowTicketModal(false)}>
+        <View className="flex-1 bg-black/80 justify-center items-center px-4">
+          <View className="bg-zinc-900 rounded-2xl p-6 w-full max-w-sm border border-white/20">
+            <View className="flex-row justify-between items-center mb-4">
+              <Text className="text-white text-lg font-bold">Ticket Preview</Text>
+              <TouchableOpacity onPress={() => setShowTicketModal(false)}>
+                <Text className="text-sky-400 font-semibold">Close</Text>
+              </TouchableOpacity>
+            </View>
+            
+            {ticketData && (
+              <View className="bg-white rounded-xl p-4 mb-4">
+                <Text className="text-black text-center font-bold text-lg mb-2">{ticketData.header}</Text>
+                {ticketData.ticketNumber && <Text className="text-black text-center font-bold text-base mb-2">{ticketData.ticketNumber}</Text>}
+                <Text className="text-black text-center text-xs mb-2">{ticketData.separator}</Text>
+                <Text className="text-black text-center text-sm mb-1">{ticketData.busInfo}</Text>
+                <Text className="text-black text-center text-sm mb-1">{ticketData.dateTime}</Text>
+                <Text className="text-black text-center text-xs mb-2">{ticketData.separator}</Text>
+                <Text className="text-black text-center text-sm mb-1">{ticketData.route}</Text>
+                <Text className="text-black text-center text-xs mb-2">{ticketData.separator}</Text>
+                {ticketData.fullFare && <Text className="text-black text-center text-sm mb-1">{ticketData.fullFare}</Text>}
+                {ticketData.halfFare && <Text className="text-black text-center text-sm mb-1">{ticketData.halfFare}</Text>}
+                {ticketData.luggageFare && <Text className="text-black text-center text-sm mb-1">{ticketData.luggageFare}</Text>}
+                <Text className="text-black text-center text-xs mb-2">{ticketData.separator}</Text>
+                <Text className="text-black text-center text-xs italic">{ticketData.fortune}</Text>
+              </View>
+            )}
+
+            <TouchableOpacity
+              className="bg-sky-500 rounded-xl py-3 items-center"
+              onPress={() => setShowTicketModal(false)}>
+              <Text className="text-white font-bold">OK</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
     </>
+  );
+};
+
+// ─── Select Bus (Home) ──────────────────────────────────────────────────────────
+const SelectBusHome = ({ onSelected }: { onSelected: (bus: any) => void }) => {
+  const [buses, setBuses] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('buses')
+          .select('*')
+          .eq('is_active', true)
+          .order('bus_number');
+        if (!error) setBuses(data || []);
+      } catch (e) {
+        console.error('[SelectBus] Failed to load buses:', e);
+      } finally {
+        setLoading(false);
+      }
+    };
+    load();
+  }, []);
+
+  const handleSelect = async (bus: any) => {
+    setSaving(true);
+    try {
+      await AsyncStorage.setItem('selected_bus', JSON.stringify(bus));
+      onSelected(bus);
+    } catch (e) {
+      console.error('[SelectBus] Failed to save:', e);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <View className="flex-1 bg-black px-6">
+      <View className="pt-10 pb-6">
+        <Bus size={36} color="#3f3f46" />
+        <Text className="text-white text-xl font-bold mt-3">Select Your Bus</Text>
+        <Text className="text-zinc-500 text-sm mt-1">Choose the bus you are conducting today</Text>
+      </View>
+      {loading ? (
+        <View className="flex-1 items-center justify-center">
+          <ActivityIndicator color="#00b7f3" />
+        </View>
+      ) : buses.length === 0 ? (
+        <View className="flex-1 items-center justify-center gap-3">
+          <AlertCircle size={32} color="#71717a" />
+          <Text className="text-zinc-500 text-sm text-center">No active buses found.{`\n`}Contact your admin.</Text>
+        </View>
+      ) : (
+        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 40 }}>
+          {buses.map(bus => (
+            <TouchableOpacity
+              key={bus.id}
+              onPress={() => handleSelect(bus)}
+              disabled={saving}
+              className="flex-row items-center justify-between bg-zinc-900 border border-white/10 rounded-2xl px-5 py-4 mb-3">
+              <View className="flex-row items-center gap-4">
+                <View className="w-10 h-10 bg-sky-500/20 rounded-xl items-center justify-center">
+                  <Bus size={20} color="#38bdf8" />
+                </View>
+                <View>
+                  <Text className="text-white text-base font-bold">{bus.bus_number}</Text>
+                  {bus.bus_name ? <Text className="text-zinc-500 text-xs mt-0.5">{bus.bus_name}</Text> : null}
+                </View>
+              </View>
+              <ArrowUpDown size={16} color="#52525b" />
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+      )}
+    </View>
   );
 };
 
@@ -581,7 +846,7 @@ const StartTripHome = ({ onStarted }: { onStarted: (trip: any) => void }) => {
         <Text className="text-zinc-500 text-sm text-center">Start a trip to issue tickets</Text>
       </View>
       <View className="flex-row gap-3">
-        {[{ key: 'up', label: 'STY → CBE' }, { key: 'dn', label: 'CBE → STY' }].map(d => (
+        {[{ key: 'up', label: 'CBE → STY' }, { key: 'dn', label: 'STY → CBE' }].map(d => (
           <TouchableOpacity
             key={d.key}
             onPress={() => setDir(d.key)}
@@ -609,6 +874,13 @@ const StartTripHome = ({ onStarted }: { onStarted: (trip: any) => void }) => {
 export default function HomeScreen() {
   const { activeTrip, setActiveTrip, busNumber, setBusNumber, tripNumber, setTripNumber, posHook } = useTripContext();
   const [dashLoaded, setDashLoaded] = useState(false);
+  const [selectedBus, setSelectedBus] = useState<any>(null);
+
+  useEffect(() => {
+    AsyncStorage.getItem('selected_bus')
+      .then(raw => { if (raw) { const b = JSON.parse(raw); setSelectedBus(b); setBusNumber(b.bus_number ?? 'N/A'); } })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (dashLoaded) return;
@@ -629,7 +901,6 @@ export default function HomeScreen() {
               console.error('[HomeScreen] Auto-end failed:', e);
             }
             setActiveTrip(null);
-            if (dashboard?.bus?.vehicle_number) setBusNumber(dashboard.bus.vehicle_number);
             setDashLoaded(true);
             return;
           }
@@ -639,7 +910,6 @@ export default function HomeScreen() {
           setActiveTrip(trip);
           setTripNumber(Number(trip.trip_number ?? 0));
         }
-        if (dashboard?.bus?.vehicle_number) setBusNumber(dashboard.bus.vehicle_number);
       } catch (e) {
         console.error('[HomeScreen] Failed to fetch dashboard:', e);
       } finally {
@@ -653,6 +923,19 @@ export default function HomeScreen() {
     return (
       <SafeAreaView className="flex-1 bg-black" style={{justifyContent: 'center', alignItems: 'center'}}>
         <ActivityIndicator size="large" color="#00b7f3" />
+      </SafeAreaView>
+    );
+  }
+
+  if (!selectedBus) {
+    return (
+      <SafeAreaView className="flex-1 bg-black">
+        <SelectBusHome
+          onSelected={(bus) => {
+            setSelectedBus(bus);
+            setBusNumber(bus.bus_number ?? 'N/A');
+          }}
+        />
       </SafeAreaView>
     );
   }
@@ -674,7 +957,7 @@ export default function HomeScreen() {
     <SafeAreaView className="flex-1 bg-black">
       <TicketTab
         activeTrip={activeTrip}
-        busNumber={busNumber}
+        busNumber={selectedBus?.bus_number ?? busNumber}
         _onTicketIssued={() => {}}
         tripNumber={tripNumber}
         posHook={posHook}

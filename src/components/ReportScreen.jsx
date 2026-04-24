@@ -329,6 +329,15 @@ const TripSheetTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
       .map(t => ({ ...t, isActive: false })),
   ];
 
+  // Direction-aware place ordering (mirrors HomeScreen)
+  const selectedTripDir = (
+    trips.find(t => t.trip_id === selectedTripId)?.direction ??
+    at?.direction ??
+    'up'
+  );
+  const getFilterPlaces = () =>
+    isDownDirection(selectedTripDir) ? [...places].reverse() : places;
+
   // Load saved trip ID on mount
   useEffect(() => {
     const loadSavedTrip = async () => {
@@ -555,12 +564,17 @@ const posTix = (posHook?.tickets ?? []).filter(
       const wayBill = report.way_bill_number ?? report.waybill ?? selectedTrip?.way_bill_number ?? '—';
       const tripNum = report.trip_number ?? selectedTrip?.trip_number ?? '—';
 
-      const validTicketNums = posTix.map(t => Number(t.ticket_number)).filter(n => !isNaN(n) && n > 0);
-      const minTicketNum = validTicketNums.length > 0 ? Math.min(...validTicketNums) : null;
-      const maxTicketNum = validTicketNums.length > 0 ? Math.max(...validTicketNums) : null;
-      const ticketRangeStr = minTicketNum && maxTicketNum && minTicketNum !== maxTicketNum 
-        ? `${minTicketNum} - ${maxTicketNum}` 
-        : (minTicketNum || maxTicketNum || null);
+      const today = new Date().toDateString();
+      const todayAllTicketNums = (posHook?.tickets ?? [])
+        .filter(t => new Date(t.issued_at).toDateString() === today)
+        .map(t => Number(t.ticket_number))
+        .filter(n => !isNaN(n) && n > 0);
+      const currentTripTicketNums = posTix.map(t => Number(t.ticket_number)).filter(n => !isNaN(n) && n > 0);
+      const firstTicketNum = todayAllTicketNums.length > 0 ? Math.min(...todayAllTicketNums) : null;
+      const lastTicketNum = currentTripTicketNums.length > 0 ? Math.max(...currentTripTicketNums) : null;
+      const ticketRangeStr = firstTicketNum && lastTicketNum
+        ? `${firstTicketNum} - ${lastTicketNum}`
+        : (firstTicketNum || lastTicketNum || null);
 
       // ── Header ──────────────────────────────────────────────────────────────
       await NyxPrinter.printText('SPS TRANSPORT', { textSize: 22, align: PrintAlign.CENTER });
@@ -902,49 +916,79 @@ const posTix = (posHook?.tickets ?? []).filter(
                   </TouchableOpacity>
                 </View>
 
-                {/* Start dropdown */}
+                {/* Start grid */}
                 {showFilterStartDrop && (
                   <View className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden mb-3">
-                    {places.map(p => {
-                      const isSel = filterStart?.key === p.key;
-                      const isDis = filterEnd?.key === p.key;
-                      return (
-                        <TouchableOpacity
-                          key={`fs-${p.key}`}
-                          className={`px-4 py-3 border-b border-zinc-800 ${isSel ? 'bg-sky-500/20' : 'bg-zinc-900'} ${isDis ? 'opacity-40' : ''}`}
-                          onPress={() => { setFilterStart(p); setShowFilterStartDrop(false); setShowFilterEndDrop(true); }}
-                          disabled={isDis}
-                          activeOpacity={0.8}
-                        >
-                          <Text className={`text-sm font-bold ${isSel ? 'text-sky-400' : 'text-zinc-200'}`}>
-                            {p.label.split('-')[1]} {p.label.split('-')[2]}
-                          </Text>
-                        </TouchableOpacity>
-                      );
-                    })}
+                    <View className="flex-row flex-wrap">
+                      {getFilterPlaces().map((p, idx) => {
+                        const isSel = filterStart?.key === p.key;
+                        const isDis = filterEnd?.key === p.key;
+                        const isNotLastInRow = (idx + 1) % 3 !== 0;
+                        return (
+                          <TouchableOpacity
+                            key={`fs-${p.key}`}
+                            disabled={isDis}
+                            onPress={() => { setFilterStart(p); setShowFilterStartDrop(false); setShowFilterEndDrop(true); }}
+                            className={[
+                              'w-1/3 px-1 py-3 flex-col items-center justify-center gap-0.5',
+                              'border-b border-zinc-800',
+                              isNotLastInRow ? 'border-r border-zinc-800' : '',
+                              isSel ? 'bg-sky-500/20' : '',
+                              isDis ? 'opacity-40' : '',
+                            ].join(' ')}
+                            activeOpacity={0.8}
+                          >
+                            <Text
+                              numberOfLines={1}
+                              adjustsFontSizeToFit
+                              className={`text-2xl font-black text-center ${isSel ? 'text-sky-400' : 'text-white'}`}>
+                              {p.label.split('-')[1]}
+                            </Text>
+                            <Text className="text-[11px] font-medium text-center text-zinc-300 w-full px-1" numberOfLines={1}>
+                              {p.label.split('-')[2]}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
                   </View>
                 )}
 
-                {/* End dropdown */}
+                {/* End grid */}
                 {showFilterEndDrop && (
                   <View className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden mb-3">
-                    {places.map(p => {
-                      const isSel = filterEnd?.key === p.key;
-                      const isDis = filterStart?.key === p.key;
-                      return (
-                        <TouchableOpacity
-                          key={`fe-${p.key}`}
-                          className={`px-4 py-3 border-b border-zinc-800 ${isSel ? 'bg-sky-500/20' : 'bg-zinc-900'} ${isDis ? 'opacity-40' : ''}`}
-                          onPress={() => { setFilterEnd(p); setShowFilterEndDrop(false); }}
-                          disabled={isDis}
-                          activeOpacity={0.8}
-                        >
-                          <Text className={`text-sm font-bold ${isSel ? 'text-sky-400' : 'text-zinc-200'}`}>
-                            {p.label.split('-')[1]} {p.label.split('-')[2]}
-                          </Text>
-                        </TouchableOpacity>
-                      );
-                    })}
+                    <View className="flex-row flex-wrap">
+                      {getFilterPlaces().map((p, idx) => {
+                        const isSel = filterEnd?.key === p.key;
+                        const isDis = filterStart?.key === p.key;
+                        const isNotLastInRow = (idx + 1) % 3 !== 0;
+                        return (
+                          <TouchableOpacity
+                            key={`fe-${p.key}`}
+                            disabled={isDis}
+                            onPress={() => { setFilterEnd(p); setShowFilterEndDrop(false); }}
+                            className={[
+                              'w-1/3 px-1 py-3 flex-col items-center justify-center gap-0.5',
+                              'border-b border-zinc-800',
+                              isNotLastInRow ? 'border-r border-zinc-800' : '',
+                              isSel ? 'bg-violet-500/20' : '',
+                              isDis ? 'opacity-40' : '',
+                            ].join(' ')}
+                            activeOpacity={0.8}
+                          >
+                            <Text
+                              numberOfLines={1}
+                              adjustsFontSizeToFit
+                              className={`text-2xl font-black text-center ${isSel ? 'text-violet-400' : 'text-white'}`}>
+                              {p.label.split('-')[1]}
+                            </Text>
+                            <Text className="text-[11px] font-medium text-center text-zinc-300 w-full px-1" numberOfLines={1}>
+                              {p.label.split('-')[2]}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
                   </View>
                 )}
 
@@ -1237,7 +1281,8 @@ useEffect(() => {
     }
 }, [selStart, selDest, dashboard, posHook, autoStart]);
 
-  const getPlaces = () => places;
+  const getPlaces = () =>
+    isDownDirection(tripDir) ? [...places].reverse() : places;
 
   const getDisplayName = place => {
     if (!place) return '';
@@ -1375,49 +1420,79 @@ useEffect(() => {
         </TouchableOpacity>
       </View>
 
-      {/* Start override dropdown */}
+      {/* Start override grid */}
       {showStartDrop && (
         <View className="bg-zinc-900 rounded-2xl border border-zinc-800 overflow-hidden mb-4">
-          {places.map((p) => {
-            const isSelected = selStart?.key === p.key;
-            const isDisabled = selDest?.key === p.key;
-            return (
-              <TouchableOpacity
-                key={`s-${p.key}`}
-                className={`px-4 py-3 border-b border-zinc-800 ${isSelected ? 'bg-sky-500/20' : 'bg-zinc-900'} ${isDisabled ? 'opacity-50' : ''}`}
-                onPress={() => { setOverrideStart(p); setShowStartDrop(false); }}
-                disabled={isDisabled}
-                activeOpacity={0.8}
-              >
-                <Text className={`text-sm font-bold ${isSelected ? 'text-sky-400' : 'text-zinc-200'}`}>
-                  {p.label.split('-')[1]} {p.label.split('-')[2]}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
+          <View className="flex-row flex-wrap">
+            {getPlaces().map((p, idx) => {
+              const isSelected = selStart?.key === p.key;
+              const isDisabled = selDest?.key === p.key;
+              const isNotLastInRow = (idx + 1) % 3 !== 0;
+              return (
+                <TouchableOpacity
+                  key={`s-${p.key}`}
+                  disabled={isDisabled}
+                  onPress={() => { setOverrideStart(p); setShowStartDrop(false); }}
+                  className={[
+                    'w-1/3 px-1 py-3 flex-col items-center justify-center gap-0.5',
+                    'border-b border-zinc-800',
+                    isNotLastInRow ? 'border-r border-zinc-800' : '',
+                    isSelected ? 'bg-sky-500/20' : '',
+                    isDisabled ? 'opacity-50' : '',
+                  ].join(' ')}
+                  activeOpacity={0.8}
+                >
+                  <Text
+                    numberOfLines={1}
+                    adjustsFontSizeToFit
+                    className={`text-2xl font-black text-center ${isSelected ? 'text-sky-400' : 'text-white'}`}>
+                    {p.label.split('-')[1]}
+                  </Text>
+                  <Text className="text-[11px] font-medium text-center text-zinc-300 w-full px-1" numberOfLines={1}>
+                    {p.label.split('-')[2]}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
         </View>
       )}
 
-      {/* End place dropdown */}
+      {/* End place grid */}
       {showDestDrop && (
         <View className="bg-zinc-900 rounded-2xl border border-zinc-800 overflow-hidden mb-4">
-          {places.map((p) => {
-            const isSelected = selDest?.key === p.key;
-            const isDisabled = selStart?.key === p.key;
-            return (
-              <TouchableOpacity
-                key={`d-${p.key}`}
-                className={`px-4 py-3 border-b border-zinc-800 ${isSelected ? 'bg-sky-500/20' : 'bg-zinc-900'} ${isDisabled ? 'opacity-50' : ''}`}
-                onPress={() => { setSelDest(p); setShowDestDrop(false); }}
-                disabled={isDisabled}
-                activeOpacity={0.8}
-              >
-                <Text className={`text-sm font-bold ${isSelected ? 'text-sky-400' : 'text-zinc-200'}`}>
-                  {p.label.split('-')[1]} {p.label.split('-')[2]}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
+          <View className="flex-row flex-wrap">
+            {getPlaces().map((p, idx) => {
+              const isSelected = selDest?.key === p.key;
+              const isDisabled = selStart?.key === p.key;
+              const isNotLastInRow = (idx + 1) % 3 !== 0;
+              return (
+                <TouchableOpacity
+                  key={`d-${p.key}`}
+                  disabled={isDisabled}
+                  onPress={() => { setSelDest(p); setShowDestDrop(false); }}
+                  className={[
+                    'w-1/3 px-1 py-3 flex-col items-center justify-center gap-0.5',
+                    'border-b border-zinc-800',
+                    isNotLastInRow ? 'border-r border-zinc-800' : '',
+                    isSelected ? 'bg-sky-500/20' : '',
+                    isDisabled ? 'opacity-50' : '',
+                  ].join(' ')}
+                  activeOpacity={0.8}
+                >
+                  <Text
+                    numberOfLines={1}
+                    adjustsFontSizeToFit
+                    className={`text-2xl font-black text-center ${isSelected ? 'text-sky-400' : 'text-white'}`}>
+                    {p.label.split('-')[1]}
+                  </Text>
+                  <Text className="text-[11px] font-medium text-center text-zinc-300 w-full px-1" numberOfLines={1}>
+                    {p.label.split('-')[2]}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
         </View>
       )}
 
@@ -1573,6 +1648,10 @@ const CollectionReportTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
       posAmt,
       amount: total,
     };
+  }).sort((a, b) => {
+    const an = Number(a.trip), bn = Number(b.trip);
+    if (!isNaN(an) && !isNaN(bn)) return an - bn;
+    return String(a.trip).localeCompare(String(b.trip));
   });
 
   const totalCollection = tripRows.reduce((s, r) => s + r.amount, 0);

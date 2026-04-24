@@ -97,7 +97,7 @@ const BlockingOverlay = ({ message }) => (
 );
 
 // ─── Pending Verify Row ───────────────────────────────────────────────────────
-const PendingVerifyRow = ({ item, onVerify, verifying }) => {
+const PendingVerifyRow = ({ item, onVerify, onDismiss, verifying }) => {
   const pulse = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
@@ -141,19 +141,29 @@ const PendingVerifyRow = ({ item, onVerify, verifying }) => {
             </View>
           </View>
         </View>
-        <TouchableOpacity
-          className={`flex-row items-center gap-1.5 px-3 py-2.5 rounded-xl ${
-            isBusy ? 'bg-emerald-700/50' : 'bg-emerald-600'
-          }`}
-          onPress={() => onVerify(item.ticket_id)}
-          disabled={isBusy}
-          activeOpacity={0.75}
-        >
-          {isBusy
-            ? <ActivityIndicator size="small" color="#fff" />
-            : <><CheckCircle size={14} color="#fff" /><Text className="text-white text-xs font-bold">Verify</Text></>
-          }
-        </TouchableOpacity>
+        <View className="flex-row items-center gap-2">
+          <TouchableOpacity
+            className={`flex-row items-center gap-1.5 px-3 py-2.5 rounded-xl ${
+              isBusy ? 'bg-emerald-700/50' : 'bg-emerald-600'
+            }`}
+            onPress={() => onVerify(item.ticket_id)}
+            disabled={isBusy}
+            activeOpacity={0.75}
+          >
+            {isBusy
+              ? <ActivityIndicator size="small" color="#fff" />
+              : <><CheckCircle size={14} color="#fff" /><Text className="text-white text-xs font-bold">Verify</Text></>
+            }
+          </TouchableOpacity>
+          <TouchableOpacity
+            className="w-10 h-10 rounded-xl bg-red-500/10 border border-red-500/30 justify-center items-center"
+            onPress={() => onDismiss(item.ticket_id)}
+            disabled={isBusy}
+            activeOpacity={0.75}
+          >
+            <X size={16} color="#ef4444" />
+          </TouchableOpacity>
+        </View>
       </View>
     </Animated.View>
   );
@@ -290,7 +300,7 @@ const TripScreen = () => {
 
   const at = dashboard?.active_trip;
 
-  const { pendingRequests, clearTicket } = useVerificationRealtime(at?.trip_id, at?.status);
+  const { pendingRequests, clearTicket, dismissTicket } = useVerificationRealtime(at?.trip_id, at?.status);
 
   const activePOSTix = posHook.tickets.filter(t => t.trip_id === at?.trip_id);
   const activePOSCount = activePOSTix.reduce((s, t) => s + Number(t.ticket_count ?? 0), 0);
@@ -541,7 +551,7 @@ const TripScreen = () => {
               </View>
               <Text className="text-zinc-500 text-xs mb-3">Tap verify to confirm a passenger ticket</Text>
               {pendingRequests.map(i => (
-                <PendingVerifyRow key={i.ticket_id} item={i} onVerify={handleVerify} verifying={verifyingTicket} />
+                <PendingVerifyRow key={i.ticket_id} item={i} onVerify={handleVerify} onDismiss={dismissTicket} verifying={verifyingTicket} />
               ))}
             </View>
           ) : (
@@ -650,7 +660,7 @@ const TripScreen = () => {
                   <TouchableOpacity
                     className="flex-1 flex-row items-center justify-center gap-2 bg-emerald-500/10 border border-emerald-500/30 py-3 rounded-xl"
                     onPress={() => changeStatus('running')}
-                    disabled={changing}
+                    disabled={true}
                   >
                     <Play size={16} color="#10b981" />
                     <Text className="text-emerald-400 text-sm font-bold">Resume</Text>
@@ -659,7 +669,7 @@ const TripScreen = () => {
                 <TouchableOpacity
                   className="flex-1 flex-row items-center justify-center gap-2 bg-red-500/10 border border-red-500/30 py-3 rounded-xl"
                   onPress={() => changeStatus('completed')}
-                  disabled={changing}
+                  disabled={true}
                 >
                   <Square size={16} color="#f87171" />
                   <Text className="text-red-400 text-sm font-bold">End Trip</Text>
