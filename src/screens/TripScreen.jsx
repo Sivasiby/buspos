@@ -2,8 +2,9 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Text, TouchableOpacity, View, ScrollView,
   Platform, Alert, ActivityIndicator, ToastAndroid, RefreshControl,
-  Animated,
+  Animated, Modal, TextInput,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   Bus, Play, Pause, Square,
@@ -297,6 +298,10 @@ const TripScreen = () => {
   const [appTripLoading, setAppTripLoading] = useState(false);
   const [localTripNumber, setLocalTripNumber] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
+  const [showPasscodeModal, setShowPasscodeModal] = useState(false);
+  const [passcode, setPasscode] = useState('');
+  const [passcodeError, setPasscodeError] = useState('');
+  const [endingTrip, setEndingTrip] = useState(false);
 
   const at = dashboard?.active_trip;
 
@@ -491,6 +496,43 @@ const TripScreen = () => {
     ]);
   };
 
+  const handleEndTripConfirmed = async () => {
+    if (passcode !== '1212') {
+      setPasscodeError('Incorrect passcode. Try again.');
+      setPasscode('');
+      return;
+    }
+    setEndingTrip(true);
+    setShowPasscodeModal(false);
+    setPasscode('');
+    setPasscodeError('');
+    setChanging(true);
+    setChangingMessage('Ending trip…');
+    try {
+      await api.post(`/conductor/trip/${at.trip_id}/status`, { status: 'completed' });
+      await posHook.clearAll();
+      await AsyncStorage.multiRemove([
+        'pos_tickets_v2',
+        'pos_tickets_v1',
+        'selected_bus',
+        'ticket_stops_up',
+        'ticket_stops_dn',
+      ]);
+      setCtxTrip(null);
+      setCtxTripNumber(0);
+      setCtxBusNumber('N/A');
+      setLocalTripNumber(0);
+      showToast('Trip ended');
+      await handleTripStarted();
+    } catch (e) {
+      Alert.alert('Error', e?.response?.data?.error || 'Could not end trip.');
+    } finally {
+      setChanging(false);
+      setChangingMessage('');
+      setEndingTrip(false);
+    }
+  };
+
   const handleVerify = async (id) => {
     setVerifyingTicket(id);
     try {
@@ -668,8 +710,8 @@ const TripScreen = () => {
                 )}
                 <TouchableOpacity
                   className="flex-1 flex-row items-center justify-center gap-2 bg-red-500/10 border border-red-500/30 py-3 rounded-xl"
-                  onPress={() => changeStatus('completed')}
-                  disabled={true}
+                  onPress={() => { setPasscode(''); setPasscodeError(''); setShowPasscodeModal(true); }}
+                  disabled={changing || endingTrip}
                 >
                   <Square size={16} color="#f87171" />
                   <Text className="text-red-400 text-sm font-bold">End Trip</Text>
@@ -690,6 +732,72 @@ const TripScreen = () => {
           <StartTripButtons routes={routes} onStarted={handleTripStarted} />
         )}
       </ScrollView>
+
+      {/* ── End Trip Passcode Modal ── */}
+      <Modal
+        visible={showPasscodeModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowPasscodeModal(false)}
+      >
+        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.75)', justifyContent: 'center', alignItems: 'center', padding: 24 }}>
+          <View style={{ backgroundColor: '#18181b', borderRadius: 20, padding: 28, width: '100%', maxWidth: 360, borderWidth: 1, borderColor: '#3f3f46' }}>
+            <View style={{ alignItems: 'center', marginBottom: 20 }}>
+              <View style={{ backgroundColor: 'rgba(239,68,68,0.15)', borderRadius: 50, padding: 14, marginBottom: 12 }}>
+                <Square size={28} color="#f87171" />
+              </View>
+              <Text style={{ color: '#fff', fontSize: 18, fontWeight: '800' }}>End Trip</Text>
+              <Text style={{ color: '#71717a', fontSize: 13, marginTop: 6, textAlign: 'center' }}>Enter passcode to end and reset this trip</Text>
+            </View>
+
+            <TextInput
+              style={{
+                backgroundColor: '#27272a',
+                borderRadius: 12,
+                borderWidth: 1,
+                borderColor: passcodeError ? '#ef4444' : '#3f3f46',
+                color: '#fff',
+                fontSize: 28,
+                fontWeight: '800',
+                letterSpacing: 12,
+                textAlign: 'center',
+                paddingVertical: 14,
+                paddingHorizontal: 20,
+                marginBottom: 8,
+              }}
+              value={passcode}
+              onChangeText={(v) => { setPasscode(v); setPasscodeError(''); }}
+              keyboardType="number-pad"
+              maxLength={4}
+              // secureTextEntry
+              placeholder="----"
+              placeholderTextColor="#52525b"
+              autoFocus
+            />
+
+            {passcodeError ? (
+              <Text style={{ color: '#ef4444', fontSize: 12, textAlign: 'center', marginBottom: 12 }}>{passcodeError}</Text>
+            ) : (
+              <View style={{ height: 20 }} />
+            )}
+
+            <View style={{ flexDirection: 'row', gap: 10 }}>
+              <TouchableOpacity
+                onPress={() => { setShowPasscodeModal(false); setPasscode(''); setPasscodeError(''); }}
+                style={{ flex: 1, paddingVertical: 14, borderRadius: 12, backgroundColor: '#27272a', borderWidth: 1, borderColor: '#3f3f46', alignItems: 'center' }}
+              >
+                <Text style={{ color: '#a1a1aa', fontWeight: '700', fontSize: 14 }}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={handleEndTripConfirmed}
+                style={{ flex: 1, paddingVertical: 14, borderRadius: 12, backgroundColor: 'rgba(239,68,68,0.9)', alignItems: 'center' }}
+              >
+                <Text style={{ color: '#fff', fontWeight: '800', fontSize: 14 }}>Confirm</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 };

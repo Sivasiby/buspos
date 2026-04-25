@@ -68,26 +68,29 @@ const getNextTicketNumber = async (busId) => {
 };
 
 // ─── Counter Component ────────────────────────────────────────────────────────
-const Counter = ({label, sublabel, value, onChange}) => (
-  <View className="flex-1 bg-black rounded-xl p-3 border border-white/20">
-    <Text className="text-white text-xs font-medium mb-1 uppercase tracking-wider">{label}</Text>
-    {sublabel ? <Text className="text-white text-xs mb-2">{sublabel}</Text> : null}
-    <View className="flex-row items-center justify-between">
+const Counter = ({label, sublabel, value, onChange, accentColor = '#ffffff'}) => (
+  <View className="flex-1 items-center gap-1.5">
+    <Text className="text-zinc-500 text-[10px] font-bold tracking-widest uppercase">{label}</Text>
+    {sublabel ? <Text className="text-zinc-600 text-[10px]">{sublabel}</Text> : <View className="h-3.5" />}
+    <View className="flex-row items-center bg-zinc-900 rounded-2xl border border-white/10 overflow-hidden">
       <TouchableOpacity
         onPress={() => onChange(Math.max(0, value - 1))}
         disabled={value <= 0}
-        className={`w-8 h-8 rounded-lg items-center justify-center ${value <= 0 ? 'bg-black' : 'bg-black'}`}>
-        <Minus size={14} color={value <= 0 ? '#ffffff' : '#ffffff'} />
+        className="w-10 h-10 items-center justify-center bg-zinc-800"
+        activeOpacity={0.7}>
+        <Minus size={14} color={value <= 0 ? '#52525b' : '#ffffff'} />
       </TouchableOpacity>
       <TextInput
-        className="text-center text-xl font-bold text-white w-10"
+        style={{color: accentColor}}
+        className="text-center text-lg font-black w-10"
         keyboardType="numeric"
         value={String(value)}
         onChangeText={v => onChange(Math.max(0, Number(v.replace(/[^0-9]/g, '')) || 0))}
       />
       <TouchableOpacity
         onPress={() => onChange(value + 1)}
-        className="w-8 h-8 rounded-lg items-center justify-center bg-black">
+        className="w-10 h-10 items-center justify-center bg-zinc-800"
+        activeOpacity={0.7}>
         <Plus size={14} color="#ffffff" />
       </TouchableOpacity>
     </View>
@@ -113,6 +116,34 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
   const [showTicketModal, setShowTicketModal] = useState(false);
   const [ticketData, setTicketData] = useState<any>(null);
   const [isConnected, setIsConnected] = useState(true);
+  const [appTicketCount, setAppTicketCount] = useState(0);
+  const [appTicketFare, setAppTicketFare] = useState(0);
+
+  const tripId = activeTrip?.trip_id;
+
+  useEffect(() => {
+    if (!tripId) { setAppTicketCount(0); setAppTicketFare(0); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from('tickets')
+          .select('ticket_count,total_fare,fare')
+          .eq('trip_id', tripId)
+          .or('payment_method.neq.pos,payment_method.is.null');
+        if (error || cancelled) return;
+        const rows = data || [];
+        const count = rows.reduce((s, r) => s + Number(r.ticket_count ?? 1), 0);
+        const total = rows.reduce((s, r) => {
+          const cnt = Number(r.ticket_count ?? 1);
+          const unit = Number(r.fare ?? 0);
+          return s + (r.total_fare != null ? Number(r.total_fare) : unit * cnt);
+        }, 0);
+        if (!cancelled) { setAppTicketCount(count); setAppTicketFare(total); }
+      } catch { /* silent */ }
+    })();
+    return () => { cancelled = true; };
+  }, [tripId]);
 
   const stopKey = (dir: string) => `ticket_stops_${dir}`;
 
@@ -482,6 +513,38 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
           </View>
         )}
 
+        {/* ── Live Ticket Stats ── */}
+        {activeTrip && (() => {
+          const posTix = posHook.tickets.filter((t: any) => t.trip_id === tripId);
+          const posCount = posTix.reduce((s: number, t: any) => s + Number(t.ticket_count ?? 0), 0);
+          const posFare  = posTix.reduce((s: number, t: any) => s + Number(t.fare ?? 0), 0);
+          const totalCount = appTicketCount + posCount;
+          const totalFare  = appTicketFare  + posFare;
+          return (
+            <View className="flex-row bg-zinc-900 border border-white/10 rounded-2xl mb-4 overflow-hidden">
+              <View className="flex-1 items-center py-3">
+                <Text className="text-sky-400 text-xl font-black">{appTicketCount}</Text>
+                <Text className="text-zinc-500 text-[10px] font-bold tracking-wider mt-0.5">APP</Text>
+              </View>
+              <View className="w-px bg-white/10" />
+              <View className="flex-1 items-center py-3">
+                <Text className="text-violet-400 text-xl font-black">{posCount}</Text>
+                <Text className="text-zinc-500 text-[10px] font-bold tracking-wider mt-0.5">POS</Text>
+              </View>
+              <View className="w-px bg-white/10" />
+              <View className="flex-1 items-center py-3">
+                <Text className="text-white text-xl font-black">{totalCount}</Text>
+                <Text className="text-zinc-500 text-[10px] font-bold tracking-wider mt-0.5">TOTAL</Text>
+              </View>
+              <View className="w-px bg-white/10" />
+              <View className="flex-1 items-center py-3">
+                <Text className="text-emerald-400 text-xl font-black">₹{Number(totalFare).toFixed(0)}</Text>
+                <Text className="text-zinc-500 text-[10px] font-bold tracking-wider mt-0.5">FARE</Text>
+              </View>
+            </View>
+          );
+        })()}
+
         {/* ── Trip Info Bar ── */}
         <View className="flex-row items-center gap-3 mb-5 px-1">
           <View className="flex-row items-center gap-1.5">
@@ -637,33 +700,50 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
               </View>
             )}
 
-            {/* ── Passenger Counts ── */}
-            <View className="flex-row gap-3 mb-4">
+            {/* ── Passenger Counts + Luggage ── */}
+            <View className="flex-row gap-2 mb-6 px-1">
               <Counter
                 label="Full"
-                sublabel={baseFullFare > 0 ? `₹${fareStr(baseFullFare)} each` : null}
+                sublabel={baseFullFare > 0 ? `₹${fareStr(baseFullFare)}` : null}
                 value={fullCount}
                 onChange={setFullCount}
+                accentColor="#38bdf8"
               />
+              <View className="w-px bg-white/10 my-2" />
               <Counter
                 label="Half"
-                sublabel={baseHalfFare > 0 ? `₹${fareStr(baseHalfFare)} each` : null}
+                sublabel={baseHalfFare > 0 ? `₹${fareStr(baseHalfFare)}` : null}
                 value={halfCount}
                 onChange={setHalfCount}
+                accentColor="#a78bfa"
               />
-            </View>
-
-            {/* ── Luggage ── */}
-            <View className="bg-black rounded-xl border border-white/20 px-4 py-3 mb-6">
-              <Text className="text-white text-xs font-bold tracking-widest mb-2">LUGGAGE CHARGE (₹)</Text>
-              <TextInput
-                className="text-white text-lg font-semibold"
-                keyboardType="numeric"
-                value={luggageInput}
-                onChangeText={setLuggageInput}
-                placeholder="0"
-                placeholderTextColor="#ffffff"
-              />
+              <View className="w-px bg-white/10 my-2" />
+              <View className="flex-1 items-center gap-1.5">
+                <Text className="text-zinc-500 text-[10px] font-bold tracking-widest uppercase">Luggage</Text>
+                <Text className="text-zinc-600 text-[10px]">₹ charge</Text>
+                <View className="flex-row items-center bg-zinc-900 rounded-2xl border border-white/10 overflow-hidden">
+                  <TouchableOpacity
+                    onPress={() => setLuggageInput(v => String(Math.max(0, Number(v) - 10)))}   
+                    className="w-10 h-10 items-center justify-center bg-zinc-800"
+                    activeOpacity={0.7}>
+                    <Minus size={14} color={Number(luggageInput) <= 0 ? '#52525b' : '#ffffff'} />
+                  </TouchableOpacity>
+                  <TextInput
+                    className="text-center text-lg font-black text-emerald-400 w-10"
+                    keyboardType="numeric"
+                    value={luggageInput}
+                    onChangeText={setLuggageInput}
+                    placeholder="0"
+                    placeholderTextColor="#52525b"
+                  />
+                  <TouchableOpacity
+                    onPress={() => setLuggageInput(v => String(Number(v) + 10))}
+                    className="w-10 h-10 items-center justify-center bg-zinc-800"
+                    activeOpacity={0.7}>
+                    <Plus size={14} color="#ffffff" />
+                  </TouchableOpacity>
+                </View>
+              </View>
             </View>
 
             {/* ── Total ── */}
