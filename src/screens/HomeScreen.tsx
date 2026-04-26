@@ -30,32 +30,39 @@ if (Platform.OS === 'android') {
   PrintAlign = nyx.PrintAlign;
 }
 
-const showToast = (msg, dur = ToastAndroid.SHORT) => {
+const showToast = (msg: string, dur: number = ToastAndroid.SHORT) => {
   if (Platform.OS === 'android') ToastAndroid.show(msg, dur);
   else Alert.alert('', msg);
 };
 
-const normalizeDirection = (d) => (d ?? '').toString().trim().toLowerCase();
-const isDownDirection = (d) => ['dn', 'down', 'return'].includes(normalizeDirection(d));
-const parseAmount = (v) => { const n = Number(v); return !Number.isFinite(n) || n < 0 ? 0 : n; };
-const halfFare = (full) => Math.ceil(full / 2);
-const fareStr = (n) => n % 1 === 0 ? `${n}.00` : n.toFixed(2);
+type StopOption = {
+  key: string;
+  label: string;
+  lat?: number;
+  lon?: number;
+};
+
+const normalizeDirection = (d: unknown) => (d ?? '').toString().trim().toLowerCase();
+const isDownDirection = (d: unknown) => ['dn', 'down', 'return'].includes(normalizeDirection(d));
+const parseAmount = (v: string | number | null | undefined) => { const n = Number(v); return !Number.isFinite(n) || n < 0 ? 0 : n; };
+const halfFare = (full: number) => Math.ceil(full / 2);
+const fareStr = (n: number) => n % 1 === 0 ? `${n}.00` : n.toFixed(2);
 const genId = () => `pos_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
-const routeNameForDirection = (routeName, direction) => {
+const routeNameForDirection = (routeName: string | null | undefined, direction: unknown) => {
   if (!routeName) return '';
   if (!isDownDirection(direction)) return routeName;
-  const parts = routeName.split(/\s*(?:->|→|-)\s*/).map(p => p.trim()).filter(Boolean);
+  const parts = routeName.split(/\s*(?:->|→|-)\s*/).map((p: string) => p.trim()).filter(Boolean);
   return parts.length < 2 ? routeName : [...parts].reverse().join(' → ');
 };
 
-const formatDuration = (start, end) => {
+const formatDuration = (start: string | number | Date | null | undefined, end: string | number | Date | null | undefined) => {
   if (!start) return '—';
   const mins = Math.round(((end ? new Date(end) : new Date()).getTime() - new Date(start).getTime()) / 60000);
   return mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
 };
 
-const getNextTicketNumber = async (busId) => {
+const getNextTicketNumber = async (busId: string | number | null | undefined) => {
   if (!busId) return null;
   try {
     const {data, error} = await supabase.rpc('increment_ticket_number', {p_bus_id: busId});
@@ -68,7 +75,15 @@ const getNextTicketNumber = async (busId) => {
 };
 
 // ─── Counter Component ────────────────────────────────────────────────────────
-const Counter = ({label, sublabel, value, onChange, accentColor = '#ffffff'}) => (
+type CounterProps = {
+  label: string;
+  sublabel?: string | null;
+  value: number;
+  onChange: (value: number) => void;
+  accentColor?: string;
+};
+
+const Counter = ({label, sublabel, value, onChange, accentColor = '#ffffff'}: CounterProps) => (
   <View className="flex-1 items-center gap-1.5">
     <Text className="text-zinc-500 text-[10px] font-bold tracking-widest uppercase">{label}</Text>
     {sublabel ? <Text className="text-zinc-600 text-[10px]">{sublabel}</Text> : <View className="h-3.5" />}
@@ -98,17 +113,34 @@ const Counter = ({label, sublabel, value, onChange, accentColor = '#ffffff'}) =>
 );
 
 // ─── TicketTab ────────────────────────────────────────────────────────────────
-const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}) => {
+type TicketTabProps = {
+  activeTrip: any;
+  busNumber: any;
+  _onTicketIssued?: (...args: any[]) => void;
+  tripNumber?: any;
+  posHook: any;
+};
+
+const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}: TicketTabProps) => {
   const tripDirection = activeTrip?.direction ?? 'up';
+  const posTickets = Array.isArray(posHook?.tickets) ? posHook.tickets : [];
+  const unsyncedCount = Number(posHook?.unsyncedCount ?? 0);
+  const isSyncing = Boolean(posHook?.syncing);
+  const syncToDb = () => {
+    if (typeof posHook?.syncToDb === 'function') posHook.syncToDb();
+  };
+  const saveLocalTicket = (ticket: any) => {
+    if (typeof posHook?.saveTicket === 'function') posHook.saveTicket(ticket);
+  };
   const getPlaces = useCallback(
     () => isDownDirection(tripDirection) ? [...places].reverse() : places,
     [tripDirection],
   );
 
-  const [selStart, setSelStart] = useState<any>(null);
-  const [selDest, setSelDest] = useState<any>(null);
+  const [selStart, setSelStart] = useState<StopOption | null>(null);
+  const [selDest, setSelDest] = useState<StopOption | null>(null);
   const [activeDrop, setActiveDrop] = useState<string | null>('start');
-  const [dirErr, setDirErr] = useState(null);
+  const [dirErr, setDirErr] = useState<string | null>(null);
   const [issuing, setIssuing] = useState(false);
   const [luggageInput, setLuggageInput] = useState('0');
   const [fullCount, setFullCount] = useState(1);
@@ -147,7 +179,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
 
   const stopKey = (dir: string) => `ticket_stops_${dir}`;
 
-  const saveStops = useCallback(async (start: any, dest: any, dir: string) => {
+  const saveStops = useCallback(async (start: StopOption | null, dest: StopOption | null, dir: string) => {
     try {
       await AsyncStorage.setItem(stopKey(dir), JSON.stringify({ start, dest }));
     } catch {}
@@ -193,7 +225,10 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
     loadStops();
   }, [tripDirection]);
 
-  const getFare = useCallback((sk, ek) => fareMatrix?.[sk]?.[ek] ?? 0, []);
+  const getFare = useCallback((sk: string, ek: string) => {
+    const matrix = fareMatrix as Record<string, Record<string, number>>;
+    return matrix?.[sk]?.[ek] ?? 0;
+  }, []);
 
   const baseFullFare = selStart?.key && selDest?.key ? getFare(selStart.key, selDest.key) : 0;
   const baseHalfFare = halfFare(baseFullFare);
@@ -300,7 +335,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
       if (isTestingMode) {
         // Save locally — fire-and-forget, never blocks the UI
         if (cFull > 0) {
-          posHook.saveTicket({
+          saveLocalTicket({
             id: genId(),
             trip_id: activeTrip?.trip_id ?? null,
             from_stop: `${fnum}-${fn}`,
@@ -320,7 +355,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
         }
 
         if (cHalf > 0) {
-          posHook.saveTicket({
+          saveLocalTicket({
             id: genId(),
             trip_id: activeTrip?.trip_id ?? null,
             from_stop: `${fnum}-${fn}`,
@@ -340,7 +375,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
         }
 
         if (cFull === 0 && cHalf === 0 && cLug > 0) {
-           posHook.saveTicket({
+           saveLocalTicket({
             id: genId(),
             trip_id: activeTrip?.trip_id ?? null,
             from_stop: `${fnum}-${fn}`,
@@ -409,7 +444,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
 
       // Save locally — fire-and-forget, never blocks the UI
       if (cFull > 0) {
-        posHook.saveTicket({
+        saveLocalTicket({
           id: genId(),
           trip_id: activeTrip?.trip_id ?? null,
           from_stop: `${fnum}-${fn}`,
@@ -429,7 +464,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
       }
 
       if (cHalf > 0) {
-        posHook.saveTicket({
+        saveLocalTicket({
           id: genId(),
           trip_id: activeTrip?.trip_id ?? null,
           from_stop: `${fnum}-${fn}`,
@@ -449,7 +484,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
       }
 
       if (cFull === 0 && cHalf === 0 && cLug > 0) {
-         posHook.saveTicket({
+         saveLocalTicket({
           id: genId(),
           trip_id: activeTrip?.trip_id ?? null,
           from_stop: `${fnum}-${fn}`,
@@ -488,15 +523,15 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
       if (nextFull === 0 && nextHalf === 0 && nextLug === 0) {
         setActiveDrop(null);
       }
-    } catch (e) {
-      Alert.alert('Error', e.message || 'Unknown');
+    } catch (e: unknown) {
+      Alert.alert('Error', e instanceof Error ? e.message : 'Unknown');
     } finally {
       setIssuing(false);
     }
   };
 
-  const stopLabel = (p) => p.label.split('-')[2] ?? p.label.split('-').slice(1).join(' ');
-  const stopNum = (p) => p.label.split('-')[1];
+  const stopLabel = (p: StopOption) => p.label.split('-')[2] ?? p.label.split('-').slice(1).join(' ');
+  const stopNum = (p: StopOption) => p.label.split('-')[1];
 
   return (
     <>
@@ -515,7 +550,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
 
         {/* ── Live Ticket Stats ── */}
         {activeTrip && (() => {
-          const posTix = posHook.tickets.filter((t: any) => t.trip_id === tripId);
+          const posTix = posTickets.filter((t: any) => t.trip_id === tripId);
           const posCount = posTix.reduce((s: number, t: any) => s + Number(t.ticket_count ?? 0), 0);
           const posFare  = posTix.reduce((s: number, t: any) => s + Number(t.fare ?? 0), 0);
           const totalCount = appTicketCount + posCount;
@@ -569,15 +604,15 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
                   {activeTrip.status.toUpperCase()}
                 </Text>
               </View>
-              {posHook.unsyncedCount > 0 && (
+              {unsyncedCount > 0 && (
                 <TouchableOpacity
-                  onPress={() => posHook.syncToDb()}
-                  disabled={posHook.syncing}
+                  onPress={syncToDb}
+                  disabled={isSyncing}
                   className="flex-row items-center gap-1 bg-amber-500/20 border border-amber-500/40 px-2 py-0.5 rounded-full">
-                  {posHook.syncing
+                  {isSyncing
                     ? <ActivityIndicator size={10} color="#f59e0b" />
                     : <CloudOff size={10} color="#f59e0b" />}
-                  <Text className="text-amber-400 text-[10px] font-bold">{posHook.unsyncedCount}</Text>
+                  <Text className="text-amber-400 text-[10px] font-bold">{unsyncedCount}</Text>
                 </TouchableOpacity>
               )}
             </>

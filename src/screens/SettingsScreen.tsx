@@ -15,9 +15,17 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Printer, RotateCcw, QrCode, Bus, ChevronRight, Check } from 'lucide-react-native';
 import ImageResizer from '@bam.tech/react-native-image-resizer';
-import RNFS from 'react-native-fs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../../lib/supabase';
+
+// Load react-native-fs defensively: on some builds the native module may be unavailable.
+let RNFS: any = null;
+try {
+  const rnfsModule = require('react-native-fs');
+  RNFS = rnfsModule?.default ?? rnfsModule;
+} catch {
+  RNFS = null;
+}
 
 // ─── NYX imports (Android only) ───────────────────────────────────────────────
 let NyxPrinter: any = null;
@@ -91,7 +99,23 @@ const resized = await ImageResizer.createResizedImage(
     false,
     { mode: 'contain' },
   );
-  const base64 = await RNFS.readFile(resized.uri, 'base64');
+  if (RNFS?.readFile) {
+    return RNFS.readFile(resized.uri, 'base64');
+  }
+
+  // Fallback when react-native-fs native module is not linked.
+  const response = await fetch(resized.uri);
+  const blob = await response.blob();
+  const dataUrl: string = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(String(reader.result || ''));
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+  const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+  if (!base64) {
+    throw new Error('Unable to convert QR image to base64');
+  }
   return base64;
 };
 

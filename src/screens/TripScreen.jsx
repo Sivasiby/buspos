@@ -293,9 +293,20 @@ const TripScreen = () => {
   const [showVerification, setShowVerification] = useState(true);
   const prevVerifyCountRef = useRef(0);
   const [ticketRefreshKey, setTicketRefreshKey] = useState(0);
+
+  // ─── App-only ticket stats (payment_method != 'pos') ─────────────────────
   const [appOnlyTickets, setAppOnlyTickets] = useState(0);
   const [appOnlyFare, setAppOnlyFare] = useState(0);
   const [appTripLoading, setAppTripLoading] = useState(false);
+
+  // ─── POS ticket stats for current trip (payment_method = 'pos') ──────────
+  // Ticket numbers continue across trips (per bus counter), so we track
+  // both the count for this trip AND the number range printed so far.
+  const [posTripTickets, setPosTripTickets] = useState(0);
+  const [posTripFare, setPosTripFare] = useState(0);
+  const [posTicketRange, setPosTicketRange] = useState(null);
+  const [posTripLoading, setPosTripLoading] = useState(false);
+
   const [localTripNumber, setLocalTripNumber] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const [showPasscodeModal, setShowPasscodeModal] = useState(false);
@@ -307,10 +318,13 @@ const TripScreen = () => {
 
   const { pendingRequests, clearTicket, dismissTicket } = useVerificationRealtime(at?.trip_id, at?.status);
 
-  const activePOSTix = posHook.tickets.filter(t => t.trip_id === at?.trip_id);
+  // Legacy posHook totals (kept for backward compat with posHook.tickets)
+  const activePOSTix = (Array.isArray(posHook?.tickets) ? posHook.tickets : []).filter(t => t.trip_id === at?.trip_id);
   const activePOSCount = activePOSTix.reduce((s, t) => s + Number(t.ticket_count ?? 0), 0);
   const activePOSFare = activePOSTix.reduce((s, t) => s + Number(t.fare ?? 0), 0);
-  const totalFare = appOnlyFare + activePOSFare;
+
+  // Total fare = app tickets + POS tickets from DB for this trip
+  const totalFare = appOnlyFare + posTripFare;
 
   useEffect(() => { fetchDashboard(); }, []);
 
@@ -325,6 +339,7 @@ const TripScreen = () => {
     api.get('/conductor/routes').then(r => setRoutes(r.data?.routes || [])).catch(() => {});
   }, []);
 
+  // ─── Fetch app-only tickets for this trip ────────────────────────────────
   useEffect(() => {
     const tid = at?.trip_id;
     if (!tid) { setAppOnlyTickets(0); setAppOnlyFare(0); return; }
@@ -336,6 +351,7 @@ const TripScreen = () => {
           .from('tickets')
           .select('ticket_count,total_fare,fare')
           .eq('trip_id', tid)
+          // App tickets: payment_method is not 'pos' (null or other values like 'online', 'upi', etc.)
           .or('payment_method.neq.pos,payment_method.is.null');
         if (error) throw error;
         const rows = data || [];
@@ -350,6 +366,67 @@ const TripScreen = () => {
         if (!cancelled) { setAppOnlyTickets(0); setAppOnlyFare(0); }
       } finally {
         if (!cancelled) setAppTripLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [at?.trip_id, ticketRefreshKey]);
+
+  // ─── Fetch POS tickets for this trip (with ticket_number range) ──────────
+  // POS ticket numbers are assigned per-bus and continue across trips.
+  // When a trip changes, new POS tickets for the new trip_id start from
+  // wherever bus_ticket_counters left off — they do NOT reset to 1.
+  useEffect(() => {
+    const tid = at?.trip_id;
+    if (!tid) {
+      setPosTripTickets(0);
+      setPosTripFare(0);
+      setPosTicketRange(null);
+      return;
+    }
+    let cancelled = false;
+    setPosTripLoading(true);
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from('tickets')
+          .select('ticket_count,total_fare,fare,ticket_number')
+          .eq('trip_id', tid)
+          .eq('payment_method', 'pos')   // ← Only POS tickets have ticket_number
+          .order('ticket_number', { ascending: true });
+
+        if (error) throw error;
+        const rows = data || [];
+
+        const count = rows.reduce((s, r) => s + Number(r.ticket_count ?? 1), 0);
+        const total = rows.reduce((s, r) => {
+          const cnt = Number(r.ticket_count ?? 1);
+          const unit = Number(r.fare ?? 0);
+          return s + (r.total_fare != null ? Number(r.total_fare) : unit * cnt);
+        }, 0);
+
+        // Build the ticket number range for display (e.g. "#12 – #15")
+        const numbers = rows
+          .map(r => r.ticket_number)
+          .filter(n => n != null)
+          .map(Number);
+
+        const range = numbers.length > 0
+          ? { min: Math.min(...numbers), max: Math.max(...numbers) }
+          : null;
+
+        if (!cancelled) {
+          setPosTripTickets(count);
+          setPosTripFare(total);
+          setPosTicketRange(range);
+        }
+      } catch {
+        if (!cancelled) {
+          setPosTripTickets(0);
+          setPosTripFare(0);
+          setPosTicketRange(null);
+        }
+      } finally {
+        if (!cancelled) setPosTripLoading(false);
       }
     })();
     return () => { cancelled = true; };
@@ -428,6 +505,9 @@ const TripScreen = () => {
         setCtxTrip(dash?.active_trip ?? null);
         setCtxTripNumber(dbTripNumber);
         if (dash?.bus?.vehicle_number) setCtxBusNumber(dash.bus.vehicle_number);
+
+        // Reset trip-level stats; POS counter in DB continues from where it left off
+        setTicketRefreshKey(k => k + 1);
       }
     } catch (e) { console.error(e); }
     finally { setDashLoading(false); }
@@ -454,6 +534,8 @@ const TripScreen = () => {
               const r = await api.post('/conductor/trip/start', { route_id: route.id, direction: dir });
               if (r.data?.success) {
                 showToast('Return trip started!');
+                // POS ticket counter is per-bus, NOT reset between trips.
+                // The new trip's POS tickets continue from where the bus counter left off.
                 await handleTripStarted({ direction: dir, route_name: route.name, start_time: new Date().toISOString() });
               }
             } catch (e) {
@@ -522,6 +604,7 @@ const TripScreen = () => {
       setCtxTripNumber(0);
       setCtxBusNumber('N/A');
       setLocalTripNumber(0);
+      // NOTE: bus_ticket_counters is NOT reset — POS numbers continue across the day
       showToast('Trip ended');
       await handleTripStarted();
     } catch (e) {
@@ -558,6 +641,13 @@ const TripScreen = () => {
 
   const tripDisplay = at ? routeLabel(at.route_name, at.direction) : null;
 
+  // Format POS ticket range label: "#12" or "#12–#15" or "—"
+  const posRangeLabel = posTicketRange
+    ? posTicketRange.min === posTicketRange.max
+      ? `#${posTicketRange.min}`
+      : `#${posTicketRange.min}–#${posTicketRange.max}`
+    : null;
+
   return (
     <SafeAreaView className="flex-1 bg-zinc-950">
       {changing && <BlockingOverlay message={changingMessage} />}
@@ -573,7 +663,6 @@ const TripScreen = () => {
         {pendingRequests.length > 0 && (
           showVerification ? (
             <View className="bg-amber-950/40 border border-amber-500/30 rounded-2xl p-4 mb-4">
-              {/* Header */}
               <View className="flex-row items-center justify-between mb-1">
                 <View className="flex-row items-center gap-2 flex-1">
                   <Bell size={14} color="#f59e0b" />
@@ -617,7 +706,7 @@ const TripScreen = () => {
           <>
             {/* ── Active Trip Card ── */}
             <View className="bg-zinc-900 rounded-2xl p-5 border border-zinc-800 mb-4">
-              {/* Header: #N - ROUTE STATUS */}
+              {/* Header */}
               <View className="flex-row justify-between items-start mb-4">
                 <View className="flex-1 mr-3 flex-row items-center flex-wrap">
                   {localTripNumber > 0 && (
@@ -629,7 +718,7 @@ const TripScreen = () => {
                 </View>
                 {at.status === 'running' ? (
                   <TouchableOpacity
-                    onPress={() => navigation?.navigate?.('Reports')}
+                    onPress={() => navigation?.navigate?.('Report')}
                     className="flex-row items-center gap-1.5 bg-sky-500/10 border border-sky-500/30 px-3 py-1.5 rounded-full">
                     <FileText size={13} color="#38bdf8" />
                     <Text className="text-sky-400 text-[11px] font-bold">Print</Text>
@@ -657,33 +746,58 @@ const TripScreen = () => {
                 )}
               </View>
 
-              {/* Stats row */}
-              <View className="flex-row bg-zinc-800/60 rounded-xl p-4 mb-4">
-                <View className="flex-1 items-center">
-                  <Text className="text-sky-400 text-2xl font-black">{appTripLoading ? '…' : appOnlyTickets}</Text>
-                  <Text className="text-zinc-500 text-[10px] font-semibold mt-0.5">APP TICKETS</Text>
+              {/* ── Stats row ── 
+                  APP TICKETS  |  POS TICKETS  |  TOTAL FARE  |  PENDING?
+                  POS tickets show the ticket number range beneath the count.
+                  The counter is per-bus and does NOT reset when the trip changes.
+              */}
+              <View className="bg-zinc-800/60 rounded-xl p-4 mb-4">
+                <View className="flex-row">
+                  {/* App Tickets */}
+                  <View className="flex-1 items-center">
+                    <Text className="text-sky-400 text-2xl font-black">
+                      {appTripLoading ? '…' : appOnlyTickets}
+                    </Text>
+                    <Text className="text-zinc-500 text-[10px] font-semibold mt-0.5">APP TICKETS</Text>
+                  </View>
+
+                  <View className="w-px bg-zinc-700 mx-2" />
+
+                  {/* POS Tickets — with ticket number range */}
+                  <View className="flex-1 items-center">
+                    <Text className="text-violet-400 text-2xl font-black">
+                      {posTripLoading ? '…' : posTripTickets}
+                    </Text>
+                    <Text className="text-zinc-500 text-[10px] font-semibold mt-0.5">POS TICKETS</Text>
+                    {/* Show ticket number range only for POS tickets */}
+                    {posRangeLabel && (
+                      <Text className="text-violet-500/70 text-[9px] font-semibold mt-0.5">
+                        {posRangeLabel}
+                      </Text>
+                    )}
+                  </View>
+
+                  <View className="w-px bg-zinc-700 mx-2" />
+
+                  {/* Total Fare */}
+                  <View className="flex-1 items-center">
+                    <Text className="text-emerald-400 text-2xl font-black">
+                      ₹{appTripLoading || posTripLoading ? '…' : Number(totalFare).toFixed(0)}
+                    </Text>
+                    <Text className="text-zinc-500 text-[10px] font-semibold mt-0.5">TOTAL</Text>
+                  </View>
+
+                  {/* Pending Verifications */}
+                  {pendingRequests.length > 0 && (
+                    <>
+                      <View className="w-px bg-zinc-700 mx-2" />
+                      <View className="flex-1 items-center">
+                        <Text className="text-amber-400 text-2xl font-black">{pendingRequests.length}</Text>
+                        <Text className="text-zinc-500 text-[10px] font-semibold mt-0.5">PENDING</Text>
+                      </View>
+                    </>
+                  )}
                 </View>
-                <View className="w-px bg-zinc-700 mx-2" />
-                <View className="flex-1 items-center">
-                  <Text className="text-violet-400 text-2xl font-black">{activePOSCount}</Text>
-                  <Text className="text-zinc-500 text-[10px] font-semibold mt-0.5">POS TICKETS</Text>
-                </View>
-                <View className="w-px bg-zinc-700 mx-2" />
-                <View className="flex-1 items-center">
-                  <Text className="text-emerald-400 text-2xl font-black">
-                    ₹{appTripLoading ? '…' : Number(totalFare).toFixed(0)}
-                  </Text>
-                  <Text className="text-zinc-500 text-[10px] font-semibold mt-0.5">TOTAL</Text>
-                </View>
-                {pendingRequests.length > 0 && (
-                  <>
-                    <View className="w-px bg-zinc-700 mx-2" />
-                    <View className="flex-1 items-center">
-                      <Text className="text-amber-400 text-2xl font-black">{pendingRequests.length}</Text>
-                      <Text className="text-zinc-500 text-[10px] font-semibold mt-0.5">PENDING</Text>
-                    </View>
-                  </>
-                )}
               </View>
 
               {/* Trip Actions */}
@@ -728,7 +842,6 @@ const TripScreen = () => {
             />
           </>
         ) : (
-          /* ── No Trip: Direct Start Buttons ── */
           <StartTripButtons routes={routes} onStarted={handleTripStarted} />
         )}
       </ScrollView>
@@ -769,7 +882,6 @@ const TripScreen = () => {
               onChangeText={(v) => { setPasscode(v); setPasscodeError(''); }}
               keyboardType="number-pad"
               maxLength={4}
-              // secureTextEntry
               placeholder="----"
               placeholderTextColor="#52525b"
               autoFocus
