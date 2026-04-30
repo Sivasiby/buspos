@@ -13,7 +13,6 @@ import {getRandomFortune} from '../utils/fortune';
 import {places} from '../utils/places';
 import {fareMatrix} from '../utils/fareMatrix';
 import {supabase} from '../../lib/supabase';
-import api from '../api/api';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 
@@ -41,6 +40,203 @@ const parseAmount = (v) => { const n = Number(v); return !Number.isFinite(n) || 
 const halfFare = (full) => Math.ceil(full / 2);
 const fareStr = (n) => n % 1 === 0 ? `${n}.00` : n.toFixed(2);
 const genId = () => `pos_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+const jwtDecodePayload = (token: string): any => {
+  try {
+    const part = token.split('.')[1];
+    if (!part) return null;
+    const padded = part + '='.repeat((4 - (part.length % 4)) % 4);
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const std = padded.replace(/-/g, '+').replace(/_/g, '/');
+    let bytes = '';
+    for (let i = 0; i < std.length; i += 4) {
+      const c0 = chars.indexOf(std[i]);
+      const c1 = chars.indexOf(std[i + 1]);
+      const c2 = chars.indexOf(std[i + 2]);
+      const c3 = chars.indexOf(std[i + 3]);
+      bytes += String.fromCharCode((c0 << 2) | (c1 >> 4));
+      if (std[i + 2] !== '=') bytes += String.fromCharCode(((c1 & 15) << 4) | (c2 >> 2));
+      if (std[i + 3] !== '=') bytes += String.fromCharCode(((c2 & 3) << 6) | c3);
+    }
+    return JSON.parse(bytes);
+  } catch {
+    return null;
+  }
+};
+
+const getConductorIdFromStorage = async (): Promise<string | null> => {
+  try {
+    const raw = await AsyncStorage.getItem('conductor_user');
+    const stored = raw ? JSON.parse(raw) : null;
+    const direct = stored?.id ?? stored?.user_id ?? stored?.conductor_id ?? stored?.user?.id ?? null;
+    if (direct) return String(direct);
+
+    const token = stored?.access_token ?? await AsyncStorage.getItem('access_token');
+    const payload = token ? jwtDecodePayload(token) : null;
+    const fromToken = payload?.sub ?? payload?.user_id ?? payload?.id ?? null;
+    return fromToken ? String(fromToken) : null;
+  } catch {
+    return null;
+  }
+};
+
+const getSessionBaselineIso = async (): Promise<string> => {
+  try {
+    const saved = await AsyncStorage.getItem('trip_report_reset_after_iso');
+    if (saved) return saved;
+  } catch {}
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+};
+
+const updateTripStatusSupabase = async (tripId: string, status: string) => {
+  const payload = status === 'completed'
+    ? { status, expected_end_time: new Date().toISOString() }
+    : { status };
+  const { error } = await supabase.from('trips').update(payload).eq('id', tripId);
+  if (error) throw error;
+};
+
+const startTripFromSupabase = async ({ routeId, direction, busId = null }: { routeId: string; direction: string; busId?: string | null }) => {
+  const conductorId = await getConductorIdFromStorage();
+  if (!conductorId) throw new Error('No conductor session');
+
+  const { data: existing } = await supabase
+    .from('trips')
+    .select('id')
+    .eq('conductor_id', conductorId)
+    .in('status', ['scheduled', 'running', 'paused'])
+    .limit(1);
+  if (existing?.[0]?.id) throw new Error('You already have an active trip');
+
+  let resolvedBusId = busId;
+  if (!resolvedBusId) {
+    try {
+      const raw = await AsyncStorage.getItem('selected_bus');
+      if (raw) resolvedBusId = JSON.parse(raw)?.id ?? null;
+    } catch {}
+  }
+  if (!resolvedBusId) {
+    const { data: last } = await supabase
+      .from('trips')
+      .select('bus_id,start_time')
+      .eq('conductor_id', conductorId)
+      .not('bus_id', 'is', null)
+      .order('start_time', { ascending: false })
+      .limit(1);
+    resolvedBusId = last?.[0]?.bus_id ?? null;
+  }
+
+  const baselineIso = await getSessionBaselineIso();
+  const { count } = await supabase
+    .from('trips')
+    .select('id', { count: 'exact', head: true })
+    .eq('conductor_id', conductorId)
+    .gte('start_time', baselineIso);
+  const tripNumber = (count ?? 0) + 1;
+
+  const { data, error } = await supabase
+    .from('trips')
+    .insert({
+      route_id: routeId,
+      direction,
+      conductor_id: conductorId,
+      bus_id: resolvedBusId,
+      trip_number: tripNumber,
+      start_time: new Date().toISOString(),
+      status: 'running',
+    })
+    .select('id,bus_id,trip_number,start_time')
+    .limit(1);
+  if (error) throw error;
+  return { trip: data?.[0] ?? null, conductorId, tripNumber };
+};
+
+const fetchActiveTripFromSupabase = async () => {
+  const conductorId = await getConductorIdFromStorage();
+  if (!conductorId) return { conductor: null, active_trip: null, bus: null };
+
+  const { data: activeRows } = await supabase
+    .from('trips')
+    .select('id, bus_id, route_id, conductor_id, direction, start_time, expected_end_time, status, trip_number')
+    .eq('conductor_id', conductorId)
+    .in('status', ['scheduled', 'running', 'paused'])
+    .order('start_time', { ascending: false })
+    .limit(1);
+
+  const activeRow = activeRows?.[0] ?? null;
+  const routeNameMap = await getRouteNameMap([activeRow?.route_id]);
+  let active_trip: any = null;
+  if (activeRow) {
+    active_trip = {
+      trip_id:      activeRow.id,
+      trip_number:  (activeRow as any).trip_number,
+      route_id:     (activeRow as any).route_id,
+      route_name:   routeNameMap[String((activeRow as any).route_id)] ?? 'Unknown',
+      direction:    (activeRow as any).direction,
+      status:       (activeRow as any).status,
+      start_time:   (activeRow as any).start_time,
+      end_time:     (activeRow as any).expected_end_time ?? null,
+      bus_id:       (activeRow as any).bus_id ?? null,
+      conductor_id: (activeRow as any).conductor_id,
+    };
+  }
+
+  let bus: any = null;
+  const busId = (activeRow as any)?.bus_id ?? null;
+  if (busId) {
+    const { data: busRow } = await supabase
+      .from('buses')
+      .select('id, bus_number, bus_name, capacity')
+      .eq('id', busId)
+      .single();
+    if (busRow) {
+      bus = {
+        id:             (busRow as any).id,
+        vehicle_number: (busRow as any).bus_number,
+        bus_name:       (busRow as any).bus_name,
+        capacity:       (busRow as any).capacity,
+      };
+    }
+  }
+
+  return { conductor: { id: conductorId }, active_trip, bus };
+};
+
+const fetchRoutesFromSupabase = async () => {
+  const { data, error } = await supabase
+    .from('routes')
+    .select('id, route_name')
+    .order('route_name');
+  if (error) throw error;
+  return (data ?? []).map((r: any) => ({ id: r.id, name: r.route_name }));
+};
+
+const getRouteNameMap = async (routeIds: any[] = []) => {
+  const ids = [...new Set((routeIds || []).filter(Boolean))];
+  if (ids.length === 0) return {};
+  const { data } = await supabase.from('routes').select('id,route_name').in('id', ids);
+  return Object.fromEntries((data ?? []).map((r: any) => [String(r.id), r.route_name]));
+};
+
+const assignTripNumber = async (tripId: string, conductorId: string, sinceIso: string | null = null): Promise<number> => {
+  try {
+    const baseline = sinceIso ? new Date(sinceIso) : (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; })();
+    const { count, error } = await supabase
+      .from('trips')
+      .select('id', { count: 'exact', head: true })
+      .eq('conductor_id', conductorId)
+      .gte('start_time', baseline.toISOString())
+      .neq('id', tripId);
+    if (error) throw error;
+    const num = (count ?? 0) + 1;
+    await supabase.from('trips').update({ trip_number: num }).eq('id', tripId);
+    return num;
+  } catch {
+    return 1;
+  }
+};
 
 const routeNameForDirection = (routeName, direction) => {
   if (!routeName) return '';
@@ -100,6 +296,7 @@ const Counter = ({label, sublabel, value, onChange, accentColor = '#ffffff'}) =>
 // ─── TicketTab ────────────────────────────────────────────────────────────────
 const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}) => {
   const tripDirection = activeTrip?.direction ?? 'up';
+  const effectiveTripNumber = Number(activeTrip?.trip_number ?? tripNumber ?? 0);
   const getPlaces = useCallback(
     () => isDownDirection(tripDirection) ? [...places].reverse() : places,
     [tripDirection],
@@ -288,6 +485,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
         ticketNumber: numLine ? `Ticket #: ${numLine.replace(/#/g, '')}` : null,
         separator: '--------------------------------',
         busInfo: `Bus: ${busNumber}`,
+        tripInfo: effectiveTripNumber > 0 ? `Trip #: ${effectiveTripNumber}` : null,
         dateTime: `${dp}  ${tp}`,
         route: `${fn}  to  ${tn}`,
         fullFare: cFull > 0 ? `ADULT   Rs ${fareStr(cFullTotal)}` : null,
@@ -313,6 +511,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
             ticket_type: 'full',
             luggage_amount: cLug,
             ticket_number: fullTicketNum,
+            trip_number: effectiveTripNumber > 0 ? effectiveTripNumber : null,
             bus_number: busNumber,
             direction: tripDirection,
             issued_at: now.toISOString()
@@ -333,6 +532,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
             ticket_type: 'half',
             luggage_amount: cFull === 0 ? cLug : 0,
             ticket_number: halfTicketNum,
+            trip_number: effectiveTripNumber > 0 ? effectiveTripNumber : null,
             bus_number: busNumber,
             direction: tripDirection,
             issued_at: now.toISOString()
@@ -353,6 +553,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
             ticket_type: 'full',
             luggage_amount: cLug,
             ticket_number: fullTicketNum,
+            trip_number: effectiveTripNumber > 0 ? effectiveTripNumber : null,
             bus_number: busNumber,
             direction: tripDirection,
             issued_at: now.toISOString()
@@ -393,6 +594,9 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
       await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
 
       await NyxPrinter.printText(ticketInfo.busInfo, { textSize: 24, align: PrintAlign.CENTER });
+      if (ticketInfo.tripInfo) {
+        await NyxPrinter.printText(ticketInfo.tripInfo, { textSize: 24, align: PrintAlign.CENTER });
+      }
       await NyxPrinter.printText(ticketInfo.dateTime, { textSize: 24, align: PrintAlign.CENTER });
       await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
       await NyxPrinter.printText(ticketInfo.route, { textSize: 24, align: PrintAlign.CENTER });
@@ -422,6 +626,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
           ticket_type: 'full',
           luggage_amount: cLug, // Attach luggage to full
           ticket_number: fullTicketNum,
+          trip_number: effectiveTripNumber > 0 ? effectiveTripNumber : null,
           bus_number: busNumber,
           direction: tripDirection,
           issued_at: now.toISOString()
@@ -442,6 +647,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
           ticket_type: 'half',
           luggage_amount: cFull === 0 ? cLug : 0, // Attach to half if no full
           ticket_number: halfTicketNum,
+          trip_number: effectiveTripNumber > 0 ? effectiveTripNumber : null,
           bus_number: busNumber,
           direction: tripDirection,
           issued_at: now.toISOString()
@@ -462,6 +668,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
           ticket_type: 'full',
           luggage_amount: cLug,
           ticket_number: fullTicketNum,
+          trip_number: effectiveTripNumber > 0 ? effectiveTripNumber : null,
           bus_number: busNumber,
           direction: tripDirection,
           issued_at: now.toISOString()
@@ -556,18 +763,23 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
           <View className="w-px h-4 bg-black" />
           {activeTrip ? (
             <>
-              <MapPin size={13} color="#ffffff" />
               <Text className="text-white text-sm flex-1" numberOfLines={1}>
                 {routeNameForDirection(activeTrip.route_name, tripDirection)}
               </Text>
+              
               <Text className="text-white text-xs">
                 {formatDuration(activeTrip.start_time, null)}
-                {tripNumber > 0 ? ` · #${tripNumber}` : ''}
               </Text>
-              <View className={`px-2 py-0.5 rounded-full ${activeTrip.status === 'running' ? 'bg-green-950' : 'bg-black'}`}>
-                <Text className={`text-xs font-semibold ${activeTrip.status === 'running' ? 'text-green-400' : 'text-white'}`}>
+              
+              <View className={`px-2 py-0.5 rounded-full ${activeTrip.status === 'running' && (busNumber && busNumber !== 'N/A') && effectiveTripNumber > 0 ? 'bg-green-950' : activeTrip.status === 'running' ? 'bg-red-950' : 'bg-black'} flex-row gap-2`}>
+                <Text className={`text-xs font-semibold ${activeTrip.status === 'running' && (busNumber && busNumber !== 'N/A') && effectiveTripNumber > 0 ? 'text-green-400' : activeTrip.status === 'running' ? 'text-red-400' : 'text-white'}`}>
                   {activeTrip.status.toUpperCase()}
                 </Text>
+                {tripNumber > 0 && (
+                  <Text className="text-white text-xs">
+                    #{tripNumber}
+                  </Text>
+                )}
               </View>
               {posHook.unsyncedCount > 0 && (
                 <TouchableOpacity
@@ -786,6 +998,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
                 {ticketData.ticketNumber && <Text className="text-black text-center font-bold text-base mb-2">{ticketData.ticketNumber}</Text>}
                 <Text className="text-black text-center text-xs mb-2">{ticketData.separator}</Text>
                 <Text className="text-black text-center text-sm mb-1">{ticketData.busInfo}</Text>
+                {ticketData.tripInfo && <Text className="text-black text-center text-sm mb-1">{ticketData.tripInfo}</Text>}
                 <Text className="text-black text-center text-sm mb-1">{ticketData.dateTime}</Text>
                 <Text className="text-black text-center text-xs mb-2">{ticketData.separator}</Text>
                 <Text className="text-black text-center text-sm mb-1">{ticketData.route}</Text>
@@ -897,22 +1110,22 @@ const StartTripHome = ({ onStarted }: { onStarted: (trip: any) => void }) => {
   const start = async () => {
     setLoading(true);
     try {
-      const routesRes = await api.get('/conductor/routes');
-      const route = routesRes.data?.routes?.[0];
+      const allRoutes = await fetchRoutesFromSupabase();
+      const route = allRoutes?.[0];
       if (!route) { Alert.alert('Error', 'No routes available.'); return; }
-      const r = await api.post('/conductor/trip/start', { route_id: route.id, direction: dir });
-      if (r.data?.success) {
-        showToast('Trip started!');
-        onStarted({
-          ...r.data.trip,
-          route_name: route.name,
-          direction: dir,
-          start_time: new Date().toISOString(),
-          status: 'running',
-        });
-      }
+      const created = await startTripFromSupabase({ routeId: route.id, direction: dir });
+      showToast('Trip started!');
+      onStarted({
+        trip_id: created?.trip?.id,
+        bus_id: created?.trip?.bus_id,
+        trip_number: created?.trip?.trip_number ?? created?.tripNumber ?? 1,
+        route_name: route.name,
+        direction: dir,
+        start_time: created?.trip?.start_time ?? new Date().toISOString(),
+        status: 'running',
+      });
     } catch (e: any) {
-      Alert.alert('Error', e?.response?.data?.error || 'Failed to start trip.');
+      Alert.alert('Error', e?.message || 'Failed to start trip.');
     } finally {
       setLoading(false);
     }
@@ -955,6 +1168,8 @@ export default function HomeScreen() {
   const { activeTrip, setActiveTrip, busNumber, setBusNumber, tripNumber, setTripNumber, posHook } = useTripContext();
   const [dashLoaded, setDashLoaded] = useState(false);
   const [selectedBus, setSelectedBus] = useState<any>(null);
+  const [missingDataAlert, setMissingDataAlert] = useState(false);
+  const hasFetchedRef = useRef(false);
 
   useEffect(() => {
     AsyncStorage.getItem('selected_bus')
@@ -963,11 +1178,17 @@ export default function HomeScreen() {
   }, []);
 
   useEffect(() => {
-    if (dashLoaded) return;
+    if (hasFetchedRef.current) return;
+
+    if (activeTrip?.trip_id) {
+      hasFetchedRef.current = true;
+      setDashLoaded(true);
+      return;
+    }
+
     const fetchDashboard = async () => {
       try {
-        const r = await api.get('/conductor/dashboard');
-        const dashboard = r.data;
+        const dashboard = await fetchActiveTripFromSupabase();
         const trip = dashboard?.active_trip;
 
         if (trip?.trip_id && trip?.start_time &&
@@ -975,7 +1196,7 @@ export default function HomeScreen() {
           const elapsed = Date.now() - new Date(trip.start_time).getTime();
           if (elapsed >= 8 * 60 * 60 * 1000) {
             try {
-              await api.post(`/conductor/trip/${trip.trip_id}/status`, { status: 'completed' });
+              await updateTripStatusSupabase(trip.trip_id, 'completed');
               showToast('Trip auto-ended (exceeded 8 hours)');
             } catch (e) {
               console.error('[HomeScreen] Auto-end failed:', e);
@@ -986,9 +1207,12 @@ export default function HomeScreen() {
           }
         }
 
-        if (trip) {
+        if (trip?.trip_id) {
           setActiveTrip(trip);
           setTripNumber(Number(trip.trip_number ?? 0));
+          if (dashboard?.bus?.vehicle_number) {
+            setBusNumber(dashboard.bus.vehicle_number);
+          }
         }
       } catch (e) {
         console.error('[HomeScreen] Failed to fetch dashboard:', e);
@@ -996,12 +1220,47 @@ export default function HomeScreen() {
         setDashLoaded(true);
       }
     };
+    hasFetchedRef.current = true;
     fetchDashboard();
-  }, [dashLoaded]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTrip]);
+
+  const hardRefresh = useCallback(async () => {
+    setMissingDataAlert(false);
+    setDashLoaded(false);
+    hasFetchedRef.current = false;
+    setActiveTrip(null);
+    try {
+      const dashboard = await fetchActiveTripFromSupabase();
+      const trip = dashboard?.active_trip;
+      if (trip?.trip_id) {
+        setActiveTrip(trip);
+        setTripNumber(Number(trip.trip_number ?? 0));
+        if (dashboard?.bus?.vehicle_number) setBusNumber(dashboard.bus.vehicle_number);
+      }
+    } catch (e) {
+      console.error('[HomeScreen] Hard refresh failed:', e);
+    } finally {
+      setDashLoaded(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!activeTrip?.trip_id) return;
+    const effectiveTripNumber = Number(activeTrip?.trip_number ?? tripNumber ?? 0);
+    const effectiveBusNumber = selectedBus?.bus_number ?? busNumber;
+    const isMissingData = effectiveTripNumber <= 0 || !effectiveBusNumber || effectiveBusNumber === 'N/A';
+    if (isMissingData) {
+      setMissingDataAlert(true);
+    } else {
+      setMissingDataAlert(false);
+    }
+  }, [activeTrip, tripNumber, busNumber, selectedBus]);
 
   if (!dashLoaded) {
     return (
-      <SafeAreaView className="flex-1 bg-black" style={{justifyContent: 'center', alignItems: 'center'}}>
+      <SafeAreaView className="flex-1 bg-black items-center justify-center">
         <ActivityIndicator size="large" color="#00b7f3" />
       </SafeAreaView>
     );
@@ -1024,11 +1283,63 @@ export default function HomeScreen() {
     return (
       <SafeAreaView className="flex-1 bg-black">
         <StartTripHome
-          onStarted={(trip) => {
+          onStarted={async (trip) => {
             setActiveTrip(trip);
-            setTripNumber(Number(trip?.trip_number ?? 0));
+            const dbTripNumber = Number(trip?.trip_number ?? 0);
+            if (dbTripNumber > 0) {
+              setTripNumber(dbTripNumber);
+              return;
+            }
+            // trip_number not yet assigned — poll dashboard then call assignTripNumber
+            try {
+              // Read the session-reset ISO saved by TripScreen when a trip is ended,
+              // so we count only trips since the last reset (same logic as TripScreen).
+              let sinceIso: string | null = null;
+              try {
+                sinceIso = await AsyncStorage.getItem('trip_report_reset_after_iso');
+              } catch {}
+
+              let dash: any = null;
+              for (let i = 0; i < 6; i++) {
+                dash = await fetchActiveTripFromSupabase();
+                if (dash?.active_trip?.trip_id) break;
+                await new Promise<void>(done => setTimeout(done, 700));
+              }
+              const tripId = dash?.active_trip?.trip_id ?? trip?.trip_id ?? trip?.id;
+              const conductorId = dash?.active_trip?.conductor_id ?? dash?.conductor?.id;
+              const freshTripNumber = Number(dash?.active_trip?.trip_number ?? 0);
+              if (freshTripNumber > 0) {
+                setTripNumber(freshTripNumber);
+                if (dash?.active_trip) setActiveTrip(dash.active_trip);
+              } else if (tripId && conductorId) {
+                const num = await assignTripNumber(tripId, conductorId, sinceIso);
+                setTripNumber(num);
+                if (dash?.active_trip) setActiveTrip({ ...dash.active_trip, trip_number: num });
+              }
+              if (dash?.bus?.vehicle_number) setBusNumber(dash.bus.vehicle_number);
+            } catch (e) {
+              console.error('[HomeScreen] assignTripNumber after start failed:', e);
+            }
           }}
         />
+      </SafeAreaView>
+    );
+  }
+
+  if (missingDataAlert) {
+    return (
+      <SafeAreaView className="flex-1 bg-black items-center justify-center px-6">
+        <AlertCircle size={48} color="#f59e0b" />
+        <Text className="text-white text-lg font-bold mt-4 text-center">Trip data is incomplete</Text>
+        <Text className="text-zinc-400 text-sm text-center mt-2">
+          {`Trip number or bus number is missing.\nThis may happen right after starting a trip.`}
+        </Text>
+        <TouchableOpacity
+          className="mt-8 bg-sky-500 rounded-2xl px-8 py-4 flex-row items-center gap-3"
+          onPress={hardRefresh}>
+          <Play size={18} color="#fff" />
+          <Text className="text-white text-base font-bold">Try Again</Text>
+        </TouchableOpacity>
       </SafeAreaView>
     );
   }

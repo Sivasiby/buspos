@@ -12,10 +12,20 @@ import {
   X, Bell, AlertCircle,
 } from 'lucide-react-native';
 import { useNavigation } from '@react-navigation/native';
-import api from '../api/api';
 import { supabase } from '../../lib/supabase';
 import { useVerificationRealtime } from '../hooks/useVerificationRealtime';
 import { useTripContext } from '../context/TripContext';
+
+let NyxPrinter = null;
+let PrinterStatus = null;
+let PrintAlign = null;
+
+if (Platform.OS === 'android') {
+  const nyx = require('nyx-printer-react-native');
+  NyxPrinter = nyx.default;
+  PrinterStatus = nyx.PrinterStatus;
+  PrintAlign = nyx.PrintAlign;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const showToast = (msg, dur = ToastAndroid.SHORT) => {
@@ -43,6 +53,13 @@ const parseStopLabel = (name) => {
 };
 const isDown = (d) => ['dn', 'down', 'return'].includes(normalizeDir(d));
 
+const parseAmount = (v) => {
+  const n = Number(v);
+  return !Number.isFinite(n) || n < 0 ? 0 : n;
+};
+
+const FIXED_EXPENSES = ['Diesel', 'Driver', 'Conductor', 'Tollgate', 'Pooja', 'Others'];
+
 const routeLabel = (name, dir) => {
   if (!name) return '';
   if (!isDown(dir)) return name;
@@ -51,17 +68,146 @@ const routeLabel = (name, dir) => {
   return [...parts].reverse().join(' → ');
 };
 
-const assignTripNumber = async (tripId, conductorId) => {
+const jwtDecodePayload = (token) => {
   try {
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    const part = token.split('.')[1];
+    if (!part) return null;
+    const padded = part + '='.repeat((4 - (part.length % 4)) % 4);
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const std = padded.replace(/-/g, '+').replace(/_/g, '/');
+    let bytes = '';
+    for (let i = 0; i < std.length; i += 4) {
+      const c0 = chars.indexOf(std[i]);
+      const c1 = chars.indexOf(std[i + 1]);
+      const c2 = chars.indexOf(std[i + 2]);
+      const c3 = chars.indexOf(std[i + 3]);
+      bytes += String.fromCharCode((c0 << 2) | (c1 >> 4));
+      if (std[i + 2] !== '=') bytes += String.fromCharCode(((c1 & 15) << 4) | (c2 >> 2));
+      if (std[i + 3] !== '=') bytes += String.fromCharCode(((c2 & 3) << 6) | c3);
+    }
+    return JSON.parse(bytes);
+  } catch {
+    return null;
+  }
+};
+
+const getConductorIdFromStorage = async () => {
+  try {
+    const raw = await AsyncStorage.getItem('conductor_user');
+    const stored = raw ? JSON.parse(raw) : null;
+    const direct = stored?.id ?? stored?.user_id ?? stored?.conductor_id ?? stored?.user?.id ?? null;
+    if (direct) return String(direct);
+
+    const token = stored?.access_token ?? await AsyncStorage.getItem('access_token');
+    const payload = token ? jwtDecodePayload(token) : null;
+    const fromToken = payload?.sub ?? payload?.user_id ?? payload?.id ?? null;
+    return fromToken ? String(fromToken) : null;
+  } catch {
+    return null;
+  }
+};
+
+const getSessionBaselineIso = async () => {
+  try {
+    const saved = await AsyncStorage.getItem('trip_report_reset_after_iso');
+    if (saved) return saved;
+  } catch {}
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.toISOString();
+};
+
+const getRouteNameMap = async (routeIds = []) => {
+  const ids = [...new Set((routeIds || []).filter(Boolean))];
+  if (ids.length === 0) return {};
+  const { data } = await supabase.from('routes').select('id,route_name').in('id', ids);
+  return Object.fromEntries((data ?? []).map((r) => [String(r.id), r.route_name]));
+};
+
+const updateTripStatusSupabase = async (tripId, status) => {
+  const payload = status === 'completed'
+    ? { status, expected_end_time: new Date().toISOString() }
+    : { status };
+  const { error } = await supabase.from('trips').update(payload).eq('id', tripId);
+  if (error) throw error;
+};
+
+const verifyTicketSupabase = async (ticketId) => {
+  const { error } = await supabase.from('tickets').update({ is_verified: true }).eq('id', ticketId);
+  if (error) throw error;
+};
+
+const startTripFromSupabase = async ({ routeId, direction, busId = null }) => {
+  const conductorId = await getConductorIdFromStorage();
+  if (!conductorId) throw new Error('No conductor session');
+
+  const { data: existing } = await supabase
+    .from('trips')
+    .select('id')
+    .eq('conductor_id', conductorId)
+    .in('status', ['scheduled', 'running', 'paused'])
+    .limit(1);
+  if (existing?.[0]?.id) {
+    throw new Error('You already have an active trip');
+  }
+
+  let resolvedBusId = busId;
+  if (!resolvedBusId) {
+    try {
+      const raw = await AsyncStorage.getItem('selected_bus');
+      if (raw) resolvedBusId = JSON.parse(raw)?.id ?? null;
+    } catch {}
+  }
+  if (!resolvedBusId) {
+    const { data: last } = await supabase
+      .from('trips')
+      .select('bus_id,start_time')
+      .eq('conductor_id', conductorId)
+      .not('bus_id', 'is', null)
+      .order('start_time', { ascending: false })
+      .limit(1);
+    resolvedBusId = last?.[0]?.bus_id ?? null;
+  }
+
+  const baselineIso = await getSessionBaselineIso();
+  const { count } = await supabase
+    .from('trips')
+    .select('id', { count: 'exact', head: true })
+    .eq('conductor_id', conductorId)
+    .gte('start_time', baselineIso);
+  const tripNumber = (count ?? 0) + 1;
+
+  const insertPayload = {
+    route_id: routeId,
+    direction,
+    conductor_id: conductorId,
+    bus_id: resolvedBusId,
+    trip_number: tripNumber,
+    start_time: new Date().toISOString(),
+    status: 'running',
+  };
+  const { data: createdRows, error } = await supabase.from('trips').insert(insertPayload).select('id,bus_id,trip_number,start_time').limit(1);
+  if (error) throw error;
+  const created = createdRows?.[0] ?? null;
+  return { trip: created, conductorId, tripNumber };
+};
+
+const assignTripNumber = async (tripId, conductorId, forcedNumber = null, sinceIso = null) => {
+  try {
+    if (forcedNumber != null) {
+      const num = Math.max(1, Number(forcedNumber) || 1);
+      await supabase.from('trips').update({ trip_number: num }).eq('id', tripId);
+      return num;
+    }
+    const baseline = sinceIso ? new Date(sinceIso) : (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; })();
     const { count, error } = await supabase
       .from('trips')
       .select('id', { count: 'exact', head: true })
       .eq('conductor_id', conductorId)
-      .gte('start_time', todayStart.toISOString());
+      .gte('start_time', baseline.toISOString())
+      .neq('id', tripId);
     if (error) throw error;
-    const num = Math.max(1, count ?? 1);
+    const num = (count ?? 0) + 1;
     await supabase.from('trips').update({ trip_number: num }).eq('id', tripId);
     return num;
   } catch {
@@ -218,7 +364,7 @@ const DirectionToggle = ({ routeName, currentDirection, onStartReturn, starting 
 
 // ─── Start Trip Buttons (no active trip) ─────────────────────────────────────
 const StartTripButtons = ({ routes, onStarted }) => {
-  const [dir, setDir] = useState('up');
+  const [dir, setDir] = useState('dn');
   const [loading, setLoading] = useState(false);
 
   const start = async () => {
@@ -226,14 +372,19 @@ const StartTripButtons = ({ routes, onStarted }) => {
     if (!routeId) { Alert.alert('Error', 'No routes available.'); return; }
     setLoading(true);
     try {
-      const r = await api.post('/conductor/trip/start', { route_id: routeId, direction: dir });
-      if (r.data?.success) {
-        showToast('Trip started!');
-        const selectedRoute = routes[0];
-        onStarted({ direction: dir, route_name: selectedRoute?.name, start_time: new Date().toISOString(), bus_id: r.data?.trip?.bus_id });
-      }
+      const created = await startTripFromSupabase({ routeId, direction: dir });
+      showToast('Trip started!');
+      const selectedRoute = routes[0];
+      onStarted({
+        trip_id: created?.trip?.id,
+        direction: dir,
+        route_name: selectedRoute?.name,
+        start_time: created?.trip?.start_time ?? new Date().toISOString(),
+        bus_id: created?.trip?.bus_id,
+        trip_number: created?.trip?.trip_number ?? created?.tripNumber ?? 1,
+      });
     } catch (e) {
-      Alert.alert('Error', e?.response?.data?.error || 'Failed to start trip.');
+      Alert.alert('Error', e?.message || 'Failed to start trip.');
     } finally {
       setLoading(false);
     }
@@ -250,8 +401,8 @@ const StartTripButtons = ({ routes, onStarted }) => {
       <Text className="text-zinc-400 text-xs font-semibold tracking-widest mb-3">SELECT ROUTE</Text>
       <View className="flex-row gap-3 mb-5">
         {[
-          { key: 'up', label: 'STY TO CBE' },
-          { key: 'dn', label: 'CBE TO STY' }
+          { key: 'up', label: 'CBE TO STY' },
+          { key: 'dn', label: 'STY TO CBE' }
         ].map(d => (
           <TouchableOpacity
             key={d.key}
@@ -279,6 +430,143 @@ const StartTripButtons = ({ routes, onStarted }) => {
   );
 };
 
+// ─── Supabase Dashboard Fetch ────────────────────────────────────────────────
+const fetchDashboardFromSupabase = async () => {
+  const conductorId = await getConductorIdFromStorage();
+  if (!conductorId) throw new Error('No conductor session');
+
+  // Active trip
+  const { data: activeRows } = await supabase
+    .from('trips')
+    .select('id, bus_id, route_id, conductor_id, direction, start_time, expected_end_time, status, trip_number')
+    .eq('conductor_id', conductorId)
+    .in('status', ['scheduled', 'running', 'paused'])
+    .order('start_time', { ascending: false })
+    .limit(1);
+
+  const activeRow = activeRows?.[0] ?? null;
+
+  let active_trip = null;
+  if (activeRow) {
+    const { count: tkCount, data: tkData } = await supabase
+      .from('tickets')
+      .select('fare', { count: 'exact' })
+      .eq('trip_id', activeRow.id);
+    const tickets_sold = tkCount ?? 0;
+    const collection = (tkData ?? []).reduce((s, t) => s + Number(t.fare ?? 0), 0);
+    active_trip = {
+      trip_id:      activeRow.id,
+      trip_number:  activeRow.trip_number,
+      route_id:     activeRow.route_id,
+      route_name:   'Unknown',
+      direction:    activeRow.direction,
+      status:       activeRow.status,
+      start_time:   activeRow.start_time,
+      end_time:     activeRow.expected_end_time ?? null,
+      bus_id:       activeRow.bus_id ?? null,
+      conductor_id: activeRow.conductor_id,
+      tickets_sold,
+      collection:   Math.round(collection * 100) / 100,
+    };
+  }
+
+  // Bus info
+  const busId = activeRow?.bus_id ?? null;
+  let bus = null;
+  if (busId) {
+    const { data: busRow } = await supabase
+      .from('buses')
+      .select('id, bus_number, bus_name, capacity')
+      .eq('id', busId)
+      .single();
+    if (busRow) {
+      bus = {
+        id:             busRow.id,
+        vehicle_number: busRow.bus_number,
+        bus_name:       busRow.bus_name,
+        capacity:       busRow.capacity,
+      };
+    }
+  }
+
+  // Recent trips (last 24h)
+  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const { data: recentRows } = await supabase
+    .from('trips')
+    .select('id, bus_id, route_id, direction, start_time, expected_end_time, status, trip_number')
+    .eq('conductor_id', conductorId)
+    .gte('start_time', since24h)
+    .order('start_time', { ascending: false })
+    .limit(10);
+
+  const routeNameMap = await getRouteNameMap([
+    activeRow?.route_id,
+    ...(recentRows ?? []).map((r) => r.route_id),
+  ]);
+  if (active_trip?.route_id) {
+    active_trip.route_name = routeNameMap[String(active_trip.route_id)] ?? 'Unknown';
+  }
+
+  const recent_trips = await Promise.all(
+    (recentRows ?? []).map(async (row) => {
+      const { count: tkCount, data: tkData } = await supabase
+        .from('tickets')
+        .select('fare', { count: 'exact' })
+        .eq('trip_id', row.id);
+      const collection = (tkData ?? []).reduce((s, t) => s + Number(t.fare ?? 0), 0);
+      return {
+        trip_id:      row.id,
+        trip_number:  row.trip_number,
+        route_name:   routeNameMap[String(row.route_id)] ?? 'Unknown',
+        direction:    row.direction,
+        status:       row.status,
+        start_time:   row.start_time,
+        end_time:     row.expected_end_time ?? null,
+        bus_id:       row.bus_id ?? null,
+        tickets_sold: tkCount ?? 0,
+        collection:   Math.round(collection * 100) / 100,
+      };
+    })
+  );
+
+  // Today stats
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const { data: todayTripRows } = await supabase
+    .from('trips')
+    .select('id')
+    .eq('conductor_id', conductorId)
+    .gte('start_time', todayStart.toISOString());
+
+  const todayTripIds = (todayTripRows ?? []).map(t => t.id);
+  let today_stats = { trips_completed: todayTripIds.length, tickets_sold: 0, total_collection: 0, passengers: 0 };
+  if (todayTripIds.length > 0) {
+    const { data: todayTix } = await supabase
+      .from('tickets')
+      .select('ticket_count, fare')
+      .in('trip_id', todayTripIds);
+    const tixRows = todayTix ?? [];
+    const tickets_sold = tixRows.reduce((s, t) => s + Number(t.ticket_count ?? 1), 0);
+    const total_collection = Math.round(tixRows.reduce((s, t) => s + Number(t.fare ?? 0), 0) * 100) / 100;
+    today_stats = { trips_completed: todayTripIds.length, tickets_sold, total_collection, passengers: tickets_sold };
+  }
+
+  // Conductor info
+  const conductor = { id: conductorId };
+
+  return { conductor, bus, active_trip, today_stats, recent_trips };
+};
+
+// ─── Supabase Routes Fetch ─────────────────────────────────────────────────────
+const fetchRoutesFromSupabase = async () => {
+  const { data, error } = await supabase
+    .from('routes')
+    .select('id, route_name')
+    .order('route_name');
+  if (error) throw error;
+  return (data ?? []).map(r => ({ id: r.id, name: r.route_name }));
+};
+
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 const TripScreen = () => {
   const navigation = useNavigation();
@@ -302,6 +590,13 @@ const TripScreen = () => {
   const [passcode, setPasscode] = useState('');
   const [passcodeError, setPasscodeError] = useState('');
   const [endingTrip, setEndingTrip] = useState(false);
+  const [resetNextTripNumber, setResetNextTripNumber] = useState(false);
+  const resetNextTripNumberRef = useRef(false);
+  const sessionStartRef = useRef(null);
+
+  const [showReportModal, setShowReportModal] = useState(false);
+  const [reportData, setReportData] = useState(null);
+  const [splitAtAnnur] = useState(true);
 
   const at = dashboard?.active_trip;
 
@@ -322,7 +617,7 @@ const TripScreen = () => {
   }, [pendingRequests.length]);
 
   useEffect(() => {
-    api.get('/conductor/routes').then(r => setRoutes(r.data?.routes || [])).catch(() => {});
+    fetchRoutesFromSupabase().then(r => setRoutes(r)).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -357,20 +652,36 @@ const TripScreen = () => {
 
   const fetchDashboard = async () => {
     try {
-      const r = await api.get('/conductor/dashboard');
-      setDashboard(r.data);
-      const conductorId = r.data?.active_trip?.conductor_id ?? r.data?.conductor?.id;
-      const tripId = r.data?.active_trip?.trip_id;
-      const dbTripNumber = Number(r.data?.active_trip?.trip_number ?? 0);
+      if (!sessionStartRef.current) {
+        try {
+          const saved = await AsyncStorage.getItem('trip_report_reset_after_iso');
+          if (saved) sessionStartRef.current = saved;
+        } catch {}
+      }
+      const data = await fetchDashboardFromSupabase();
+      setDashboard(data);
+      const conductorId = data?.active_trip?.conductor_id ?? data?.conductor?.id;
+      const tripId = data?.active_trip?.trip_id;
+      const shouldResetTripNumber = resetNextTripNumberRef.current || resetNextTripNumber;
+      const dbTripNumber = Number(data?.active_trip?.trip_number ?? 0);
       if (dbTripNumber > 0) {
         setLocalTripNumber(dbTripNumber);
+        if (shouldResetTripNumber) {
+          setResetNextTripNumber(false);
+          resetNextTripNumberRef.current = false;
+        }
       } else if (conductorId && tripId) {
-        const nextNum = await assignTripNumber(tripId, conductorId);
+        const nextNum = await assignTripNumber(tripId, conductorId, shouldResetTripNumber ? 1 : null, sessionStartRef.current);
         setLocalTripNumber(nextNum);
+        setCtxTripNumber(nextNum);
+        if (shouldResetTripNumber) {
+          setResetNextTripNumber(false);
+          resetNextTripNumberRef.current = false;
+        }
       }
-      setCtxTrip(r.data?.active_trip ?? null);
-      setCtxTripNumber(dbTripNumber);
-      if (r.data?.bus?.vehicle_number) setCtxBusNumber(r.data.bus.vehicle_number);
+      setCtxTrip(data?.active_trip ?? null);
+      if (dbTripNumber > 0) setCtxTripNumber(dbTripNumber);
+      if (data?.bus?.vehicle_number) setCtxBusNumber(data.bus.vehicle_number);
     } catch (e) { console.error(e); }
     finally { setDashLoading(false); }
   };
@@ -379,8 +690,8 @@ const TripScreen = () => {
     setRefreshing(true);
     try {
       await fetchDashboard();
-      const r = await api.get('/conductor/routes');
-      setRoutes(r.data?.routes || []);
+      const freshRoutes = await fetchRoutesFromSupabase().catch(() => []);
+      setRoutes(freshRoutes);
       if (posHook.reload) await posHook.reload();
       setTicketRefreshKey(k => k + 1);
     } catch (e) { console.error('[TripScreen] Refresh failed:', e); }
@@ -409,8 +720,7 @@ const TripScreen = () => {
       }
       let dash = null;
       for (let i = 0; i < 6; i++) {
-        const r = await api.get('/conductor/dashboard');
-        dash = r.data;
+        dash = await fetchDashboardFromSupabase();
         if (dash?.active_trip?.trip_id) break;
         await new Promise(res => setTimeout(res, 700));
       }
@@ -418,15 +728,25 @@ const TripScreen = () => {
         setDashboard(dash);
         const conductorId = dash?.active_trip?.conductor_id ?? dash?.conductor?.id;
         const tripId = dash?.active_trip?.trip_id ?? dash?.active_trip?.id;
+        const shouldResetTripNumber = resetNextTripNumberRef.current || resetNextTripNumber;
         const dbTripNumber = Number(dash?.active_trip?.trip_number ?? 0);
         if (dbTripNumber > 0) {
           setLocalTripNumber(dbTripNumber);
+          if (shouldResetTripNumber) {
+            setResetNextTripNumber(false);
+            resetNextTripNumberRef.current = false;
+          }
         } else if (conductorId && tripId) {
-          const nextNum = await assignTripNumber(tripId, conductorId);
+          const nextNum = await assignTripNumber(tripId, conductorId, shouldResetTripNumber ? 1 : null, sessionStartRef.current);
           setLocalTripNumber(nextNum);
+          setCtxTripNumber(nextNum);
+          if (shouldResetTripNumber) {
+            setResetNextTripNumber(false);
+            resetNextTripNumberRef.current = false;
+          }
         }
         setCtxTrip(dash?.active_trip ?? null);
-        setCtxTripNumber(dbTripNumber);
+        if (dbTripNumber > 0) setCtxTripNumber(dbTripNumber);
         if (dash?.bus?.vehicle_number) setCtxBusNumber(dash.bus.vehicle_number);
       }
     } catch (e) { console.error(e); }
@@ -447,17 +767,22 @@ const TripScreen = () => {
             setChanging(true);
             setChangingMessage('Ending current trip…');
             try {
-              await api.post(`/conductor/trip/${at.trip_id}/status`, { status: 'completed' });
+              await updateTripStatusSupabase(at.trip_id, 'completed');
               setChangingMessage('Starting return trip…');
               const route = routes.find(r => r.name === at.route_name) ?? routes[0];
               if (!route) throw new Error('Route not found');
-              const r = await api.post('/conductor/trip/start', { route_id: route.id, direction: dir });
-              if (r.data?.success) {
-                showToast('Return trip started!');
-                await handleTripStarted({ direction: dir, route_name: route.name, start_time: new Date().toISOString() });
-              }
+              const created = await startTripFromSupabase({ routeId: route.id, direction: dir, busId: at.bus_id ?? null });
+              showToast('Return trip started!');
+              await handleTripStarted({
+                trip_id: created?.trip?.id,
+                direction: dir,
+                route_name: route.name,
+                start_time: created?.trip?.start_time ?? new Date().toISOString(),
+                bus_id: created?.trip?.bus_id,
+                trip_number: created?.trip?.trip_number ?? created?.tripNumber ?? 1,
+              });
             } catch (e) {
-              Alert.alert('Error', e?.response?.data?.error || 'Could not switch trip.');
+              Alert.alert('Error', e?.message || 'Could not switch trip.');
             } finally {
               setChanging(false);
               setChangingMessage('');
@@ -482,11 +807,11 @@ const TripScreen = () => {
           setChanging(true);
           setChangingMessage(loadingLabels[s] || 'Please wait…');
           try {
-            await api.post(`/conductor/trip/${at.trip_id}/status`, { status: s });
+            await updateTripStatusSupabase(at.trip_id, s);
             showToast(toastLabels[s] || 'Done');
             await handleTripStarted();
           } catch (e) {
-            Alert.alert('Error', e?.response?.data?.error || 'Could not change status.');
+            Alert.alert('Error', e?.message || 'Could not change status.');
           } finally {
             setChanging(false);
             setChangingMessage('');
@@ -496,36 +821,345 @@ const TripScreen = () => {
     ]);
   };
 
-  const handleEndTripConfirmed = async () => {
-    if (passcode !== '1212') {
-      setPasscodeError('Incorrect passcode. Try again.');
-      setPasscode('');
+  const printCollectionReport = async (dash, useSplit = splitAtAnnur) => {
+    console.log('[printCollectionReport] useSplit:', useSplit, 'splitAtAnnur:', splitAtAnnur);
+    const testingMode = await AsyncStorage.getItem('testing_mode');
+    const isTestingMode = testingMode === 'true';
+
+    // ── Session cutoff: only include trips/tickets from the current session ──
+    // sessionStartRef.current is set when a trip is ended, so only data
+    // from that point forward (until now) belongs to this report.
+    const sessionCutoffIso = sessionStartRef.current ?? null;
+    const isAfterCutoff = (isoStr) => {
+      if (!isoStr) return false;
+      if (!sessionCutoffIso) return true;
+      return new Date(isoStr).getTime() >= new Date(sessionCutoffIso).getTime();
+    };
+
+    const recentTrips = (dash?.recent_trips ?? []).filter((t) => isAfterCutoff(t.start_time));
+
+    const posByTripAll = posHook.todayByTrip();
+    // Filter POS tickets to only those belonging to sessions trips (by trip_id)
+    // and also to tickets issued after the session cutoff
+    const sessionTripIds = new Set(recentTrips.map((t) => t.trip_id).filter(Boolean));
+    const posByTrip = Object.fromEntries(
+      Object.entries(posByTripAll)
+        .map(([tripId, tix]) => [
+          tripId,
+          tix.filter((t) => isAfterCutoff(t.issued_at)),
+        ])
+        .filter(([tripId, tix]) => sessionTripIds.has(tripId) || tix.length > 0)
+    );
+
+    const todayTripIds = recentTrips.map((t) => t.trip_id);
+
+    const allTripIds = [...new Set([...Object.keys(posByTrip), ...todayTripIds])];
+    const backendTrip = (id) => recentTrips.find((t) => t.trip_id === id);
+
+    const rawTripRows = allTripIds
+      .map((tripId, idx) => {
+        const bt = backendTrip(tripId);
+        const posTix = posByTrip[tripId] || [];
+        const posAmt = posTix.reduce((s, t) => s + Number(t.fare || 0), 0);
+        const appAmt = Number(bt?.collection ?? 0);
+        const total = appAmt + posAmt;
+        const dir = (bt?.direction ?? '').toString().trim().toLowerCase();
+        return {
+          tripId,
+          trip: bt?.trip_number ?? idx + 1,
+          amount: total,
+          direction: dir,
+        };
+      })
+      .sort((a, b) => {
+        const an = Number(a.trip);
+        const bn = Number(b.trip);
+        if (!Number.isNaN(an) && !Number.isNaN(bn)) return an - bn;
+        return String(a.trip).localeCompare(String(b.trip));
+      });
+
+    // When splitting at Annur (011), each physical trip becomes 2 sub-trips.
+    // We fetch per-stop ticket breakdown from Supabase + POS to split amounts
+    // at the Annur(011) boundary, mirroring the Quick Select filter in TripSheetTab.
+    let tripRows;
+    console.log('[printCollectionReport] About to check useSplit, useSplit:', useSplit, 'rawTripRows count:', rawTripRows.length);
+    if (useSplit) {
+      const ANNUR_UP_1 = '003-011'; // STY → Annur
+      const ANNUR_UP_2 = '011-018'; // Annur → CBE
+      const ANNUR_DN_1 = '018-011'; // CBE → Annur
+      const ANNUR_DN_2 = '011-003'; // Annur → STY
+      const ANNUR_STAGE = 11; // stage number for Annur
+
+      // Helper: parse stage number from a stop name like "1-11-Annur"
+      const stageNumFromName = (name) => {
+        if (!name) return NaN;
+        const parts = name.split('-');
+        for (const p of parts) {
+          const n = parseInt(p.trim(), 10);
+          if (!isNaN(n)) return n;
+        }
+        return NaN;
+      };
+
+      // Fetch app tickets for all trips in one query
+      const tripIdsForFetch = allTripIds.filter(Boolean);
+      let appTicketsByTrip = {};
+      try {
+        const { data: allTickets } = await supabase
+          .from('tickets')
+          .select('trip_id,ticket_count,total_fare,fare,from_stop_id,to_stop_id,payment_method')
+          .in('trip_id', tripIdsForFetch)
+          .neq('payment_method', 'pos');
+
+        if (allTickets && allTickets.length > 0) {
+          // Resolve stop names in one query
+          const stopIds = [...new Set(allTickets.flatMap(t => [t.from_stop_id, t.to_stop_id].filter(Boolean)))];
+          const stopMap = {};
+          if (stopIds.length) {
+            const { data: stops } = await supabase.from('stops').select('id,stop_name').in('id', stopIds);
+            (stops ?? []).forEach(s => { stopMap[String(s.id)] = s.stop_name; });
+          }
+          for (const t of allTickets) {
+            const tid = t.trip_id;
+            if (!appTicketsByTrip[tid]) appTicketsByTrip[tid] = [];
+            appTicketsByTrip[tid].push({
+              from_stage: stageNumFromName(stopMap[String(t.from_stop_id)] ?? ''),
+              cnt: Number(t.ticket_count ?? 1),
+              total: t.total_fare != null ? Number(t.total_fare) : Number(t.fare ?? 0) * Number(t.ticket_count ?? 1),
+            });
+          }
+        }
+      } catch { /* fall back to total amount if fetch fails */ }
+
+      // For each physical trip, compute sub-trip amounts by filtering on stage boundary
+      const amtInRange = (tripId, lo, hi) => {
+        // App tickets in range
+        const appAmt = (appTicketsByTrip[tripId] ?? [])
+          .filter(t => !isNaN(t.from_stage) && t.from_stage >= lo && t.from_stage <= hi)
+          .reduce((s, t) => s + t.total, 0);
+        // POS tickets in range
+        const posAmt = (posByTrip[tripId] ?? [])
+          .filter(t => {
+            const parts = String(t.from_stop ?? '').split('-');
+            let stage = NaN;
+            for (const p of parts) { const n = parseInt(p.trim(), 10); if (!isNaN(n)) { stage = n; break; } }
+            return !isNaN(stage) && stage >= lo && stage <= hi;
+          })
+          .reduce((s, t) => s + Number(t.fare || 0), 0);
+        return appAmt + posAmt;
+      };
+
+      tripRows = [];
+      console.log('[printCollectionReport] Executing split logic for rawTripRows:', rawTripRows);
+      rawTripRows.forEach((r) => {
+        const dn = ['dn', 'down', 'return'].includes(r.direction);
+        const baseNum = typeof r.trip === 'number' ? (r.trip - 1) * 2 + 1 : r.trip;
+        const tripId = r.tripId;
+
+        // DN: sub1 = 018→011 (stages 11–18), sub2 = 011→003 (stages 3–11)
+        // UP: sub1 = 003→011 (stages 3–11),  sub2 = 011→018 (stages 11–18)
+        let amt1, amt2;
+        if (tripId && (appTicketsByTrip[tripId] || posByTrip[tripId])) {
+          if (dn) {
+            amt1 = amtInRange(tripId, ANNUR_STAGE, 18); // CBE→Annur: from stage 11..18
+            amt2 = amtInRange(tripId, 3, ANNUR_STAGE);  // Annur→STY: from stage 3..11
+          } else {
+            amt1 = amtInRange(tripId, 3, ANNUR_STAGE);  // STY→Annur: from stage 3..11
+            amt2 = amtInRange(tripId, ANNUR_STAGE, 18); // Annur→CBE: from stage 11..18
+          }
+        } else {
+          // fallback: put full amount on sub1
+          amt1 = r.amount;
+          amt2 = 0;
+        }
+
+        tripRows.push(
+          { trip: baseNum,     route: dn ? ANNUR_DN_1 : ANNUR_UP_1, amount: amt1 },
+          { trip: baseNum + 1, route: dn ? ANNUR_DN_2 : ANNUR_UP_2, amount: amt2 },
+        );
+      });
+      console.log('[printCollectionReport] Split tripRows generated:', tripRows);
+    } else {
+      tripRows = rawTripRows.map(r => ({ trip: r.trip, route: '01', amount: r.amount }));
+      console.log('[printCollectionReport] Non-split tripRows generated:', tripRows);
+    }
+
+    if (tripRows.length === 0) {
+      Alert.alert('No data', 'No collection data to print.');
+      return false;
+    }
+
+    const expenses = FIXED_EXPENSES.map((label) => ({ label, amount: '0', fixed: true }));
+    const totalCollection = tripRows.reduce((s, r) => s + r.amount, 0);
+    const totalExpenses = expenses.reduce((s, e) => s + parseAmount(e.amount), 0);
+
+    if (isTestingMode) {
+      console.log('[printCollectionReport] Testing mode - showing modal with tripRows:', tripRows);
+      const now = new Date();
+      const dateStr = now.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: '2-digit' }).replace(/\//g, '/');
+      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+      const busNo = dash?.recent_trips?.[0]?.bus_number ?? dash?.bus?.vehicle_number ?? 'N/A';
+
+      setReportData({
+        busNo,
+        dateStr,
+        timeStr,
+        tripRows,
+        totalCollection,
+        expenses,
+        totalExpenses,
+        useSplit,
+      });
+      setShowReportModal(true);
+      showToast('Testing mode: collection report modal shown');
+      return true;
+    }
+
+    if (Platform.OS !== 'android' || !NyxPrinter) {
+      Alert.alert('Not supported', 'Printing is only available on Android.');
+      return false;
+    }
+
+    console.log('[printCollectionReport] About to print with tripRows:', tripRows, 'useSplit:', useSplit);
+    try {
+      const statusRet = await NyxPrinter.getPrinterStatus();
+      if (statusRet !== PrinterStatus.SDK_OK) {
+        Alert.alert('Printer Error', PrinterStatus.msg(statusRet));
+        return false;
+      }
+
+      const padL = (s, w) => String(s).padEnd(w, ' ');
+      const padR = (s, w) => String(s).padStart(w, ' ');
+      const padC = (s, w) => {
+        const str = String(s);
+        const tot = Math.max(0, w - str.length);
+        const l = Math.floor(tot / 2);
+        return ' '.repeat(l) + str + ' '.repeat(tot - l);
+      };
+      const fmtAmt = (n) => Number(n).toFixed(2);
+
+      const DASH32 = '--------------------------------';
+      const DASH_LIGHT = '- - - - - - - - - - - - - - - -';
+
+      const now = new Date();
+      const dateStr = now.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: '2-digit' }).replace(/\//g, '/');
+      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+      const busNo = dash?.recent_trips?.[0]?.bus_number ?? dash?.bus?.vehicle_number ?? 'N/A';
+
+      await NyxPrinter.printText('COLLECTION REPORT', { textSize: 24, align: PrintAlign.CENTER, bold: true });
+      await NyxPrinter.printText(`${dateStr}  ${timeStr}`, { textSize: 22, align: PrintAlign.CENTER });
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(`BUS NUMBER:${busNo}`, { textSize: 22, align: PrintAlign.CENTER });
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
+
+      const LINE = 40;
+      const C = { trip: 5, route: 9, amt: LINE - 5 - 9 };
+      const hdr = padL('TRIP', C.trip) + padC('ROUTE', C.route) + padR('AMOUNT', C.amt);
+      await NyxPrinter.printText(hdr, { textSize: 26, bold: true });
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
+
+      for (const r of tripRows) {
+        const routeStr = r.route ?? '01';
+        const row =
+          padL(String(r.trip), C.trip) +
+          padC(routeStr, C.route) +
+          padR(fmtAmt(r.amount), C.amt);
+        await NyxPrinter.printText(row, { textSize: 26 });
+      }
+
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(
+        `${padL('TOTAL Rs.:', 16)}${padR(fmtAmt(totalCollection), 24)}`,
+        { textSize: 26, bold: true },
+      );
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
+
+      await NyxPrinter.printText('EXPENSES', { textSize: 26, align: PrintAlign.CENTER, bold: true });
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
+
+      const expL = 12;
+      const expSep = ' : ';
+      const expA = LINE - expL - expSep.length;
+      for (const label of FIXED_EXPENSES) {
+        const exp = expenses.find((e) => e.label.toUpperCase() === label.toUpperCase());
+        const amt = exp ? parseAmount(exp.amount) : 0;
+        const lbl = label.toUpperCase().substring(0, expL);
+        await NyxPrinter.printText(
+          `${padL(lbl, expL)}${expSep}${padR(fmtAmt(amt), expA)}`,
+          { textSize: 26 },
+        );
+      }
+
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(
+        `${padL('TOTAL Rs.:', 16)}${padR(fmtAmt(totalExpenses), 24)}`,
+        { textSize: 26, bold: true },
+      );
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
+
+      await NyxPrinter.printEndAutoOut();
+      showToast('Collection report printed!');
+      return true;
+    } catch (e) {
+      Alert.alert('Print Error', e?.message || 'Unknown');
+      return false;
+    }
+  };
+
+  const handleEndTripWithMandatoryReport = async (useSplit = splitAtAnnur) => {
+    console.log('[handleEndTripWithMandatoryReport] Called with useSplit:', useSplit, 'splitAtAnnur:', splitAtAnnur);
+    if (!at?.trip_id) {
+      Alert.alert('No active trip', 'There is no active trip to end.');
       return;
     }
     setEndingTrip(true);
-    setShowPasscodeModal(false);
-    setPasscode('');
-    setPasscodeError('');
     setChanging(true);
-    setChangingMessage('Ending trip…');
+    setChangingMessage('Preparing collection report…');
     try {
-      await api.post(`/conductor/trip/${at.trip_id}/status`, { status: 'completed' });
+      const latestDash = await fetchDashboardFromSupabase().catch(() => ({}));
+      const activeTrip = latestDash?.active_trip;
+      const mergedRecentTrips = activeTrip?.trip_id
+        ? [
+            activeTrip,
+            ...(latestDash?.recent_trips ?? []).filter((t) => t.trip_id !== activeTrip.trip_id),
+          ]
+        : (latestDash?.recent_trips ?? []);
+      const dashForPrint = {
+        ...latestDash,
+        recent_trips: mergedRecentTrips,
+      };
+
+      setChangingMessage('Printing collection report…');
+      const printed = await printCollectionReport(dashForPrint, useSplit);
+      if (!printed) {
+        Alert.alert('Collection report required', 'Collection report print is mandatory. Please print it from Coll. Report tab before proceeding.');
+        return;
+      }
+
+      setChangingMessage('Ending trip…');
+      await updateTripStatusSupabase(at.trip_id, 'completed');
+
+      setResetNextTripNumber(true);
+      resetNextTripNumberRef.current = true;
+      try {
+        const resetIso = new Date().toISOString();
+        await AsyncStorage.setItem('trip_report_reset_after_iso', resetIso);
+        sessionStartRef.current = resetIso;
+      } catch {}
       await posHook.clearAll();
       await AsyncStorage.multiRemove([
         'pos_tickets_v2',
         'pos_tickets_v1',
-        'selected_bus',
         'ticket_stops_up',
         'ticket_stops_dn',
       ]);
       setCtxTrip(null);
       setCtxTripNumber(0);
-      setCtxBusNumber('N/A');
       setLocalTripNumber(0);
       showToast('Trip ended');
       await handleTripStarted();
     } catch (e) {
-      Alert.alert('Error', e?.response?.data?.error || 'Could not end trip.');
+      Alert.alert('Error', e?.message || 'Could not end trip.');
     } finally {
       setChanging(false);
       setChangingMessage('');
@@ -533,15 +1167,45 @@ const TripScreen = () => {
     }
   };
 
+  const handleEndTripConfirmed = async () => {
+    if (passcode !== '1212') {
+      setPasscodeError('Incorrect passcode. Try again.');
+      setPasscode('');
+      return;
+    }
+    setShowPasscodeModal(false);
+    setPasscode('');
+    setPasscodeError('');
+    Alert.alert(
+      'Take collection report?',
+      'Collection report print is mandatory before finishing trip end.',
+      [
+        {
+          text: 'Print & End Trip',
+          onPress: () => {
+            handleEndTripWithMandatoryReport(true);
+          },
+        },
+        {
+          text: 'No 011, Print',
+          onPress: () => {
+            handleEndTripWithMandatoryReport(false);
+          },
+        },
+      ],
+      { cancelable: false },
+    );
+  };
+
   const handleVerify = async (id) => {
     setVerifyingTicket(id);
     try {
-      await api.post(`/conductor/ticket/${id}/verify`);
+      await verifyTicketSupabase(id);
       clearTicket(id);
       showToast('Ticket verified ✓');
       fetchDashboard();
     } catch (e) {
-      Alert.alert('Error', e?.response?.data?.error || 'Could not verify ticket.');
+      Alert.alert('Error', e?.message || 'Could not verify ticket.');
     } finally {
       setVerifyingTicket(null);
     }
@@ -688,16 +1352,6 @@ const TripScreen = () => {
 
               {/* Trip Actions */}
               <View className="flex-row gap-2">
-                {at.status === 'running' && (
-                  <TouchableOpacity
-                    className="flex-1 flex-row items-center justify-center gap-2 bg-amber-500/10 border border-amber-500/30 py-3 rounded-xl"
-                    onPress={() => changeStatus('paused')}
-                    disabled={changing}
-                  >
-                    <Pause size={16} color="#f59e0b" />
-                    <Text className="text-amber-400 text-sm font-bold">Pause</Text>
-                  </TouchableOpacity>
-                )}
                 {at.status === 'paused' && (
                   <TouchableOpacity
                     className="flex-1 flex-row items-center justify-center gap-2 bg-emerald-500/10 border border-emerald-500/30 py-3 rounded-xl"
@@ -795,6 +1449,86 @@ const TripScreen = () => {
                 <Text style={{ color: '#fff', fontWeight: '800', fontSize: 14 }}>Confirm</Text>
               </TouchableOpacity>
             </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* ── Report Modal for Testing Mode ── */}
+      <Modal
+        visible={showReportModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowReportModal(false)}
+      >
+        <View className="flex-1 bg-black/80 justify-center items-center px-4 py-16">
+          <View className="bg-zinc-900 rounded-2xl p-6 w-full max-w-sm border border-white/20" style={{ maxHeight: '100%', flex: 1 }}>
+            <View className="flex-row justify-between items-center mb-4">
+              <Text className="text-white text-lg font-bold">Report Preview</Text>
+              <TouchableOpacity onPress={() => setShowReportModal(false)}>
+                <Text className="text-sky-400 font-semibold">Close</Text>
+              </TouchableOpacity>
+            </View>
+            
+            {reportData && (
+              <View className="flex-1 mb-4 bg-white rounded-xl overflow-hidden">
+                <ScrollView contentContainerStyle={{ padding: 16 }} showsVerticalScrollIndicator={true}>
+                <Text className="text-black text-center font-bold text-lg mb-1">COLLECTION REPORT</Text>
+                <Text className="text-black text-center text-base mb-1">{reportData.dateStr}  {reportData.timeStr}</Text>
+                <Text className="text-black text-center text-xs mb-1">--------------------------------</Text>
+                <Text className="text-black text-center text-base mb-1">BUS NUMBER:{reportData.busNo}</Text>
+                <Text className="text-black text-center text-xs mb-2">--------------------------------</Text>
+
+                <View className="flex-row justify-between mb-1">
+                  <Text className="text-black font-bold w-12">TRIP</Text>
+                  <Text className="text-black font-bold flex-1 text-center">ROUTE</Text>
+                  <Text className="text-black font-bold w-20 text-right">AMOUNT</Text>
+                </View>
+                <Text className="text-black text-center text-xs mb-1">- - - - - - - - - - - - - - - - -</Text>
+                
+                {reportData.tripRows.map((r, i) => (
+                  <View key={i} className="flex-row justify-between mb-1">
+                    <Text className="text-black w-12">{r.trip}</Text>
+                    <Text className="text-black flex-1 text-center">{r.route ?? '01'}</Text>
+                    <Text className="text-black w-20 text-right">{Number(r.amount).toFixed(2)}</Text>
+                  </View>
+                ))}
+
+                <Text className="text-black text-center text-xs mt-1 mb-1">- - - - - - - - - - - - - - - - -</Text>
+                <View className="flex-row justify-between mb-1">
+                  <Text className="text-black font-bold flex-1">TOTAL Rs.:</Text>
+                  <Text className="text-black font-bold w-24 text-right">{Number(reportData.totalCollection).toFixed(2)}</Text>
+                </View>
+                <Text className="text-black text-center text-xs mb-2">--------------------------------</Text>
+
+                <Text className="text-black text-center font-bold text-lg mb-1">EXPENSES</Text>
+                <Text className="text-black text-center text-xs mb-2">- - - - - - - - - - - - - - - - -</Text>
+
+                {reportData.expenses.map((e, i) => {
+                  const label = e.label.toUpperCase().substring(0, 12);
+                  const amt = Number(e.amount || 0);
+                  return (
+                    <View key={i} className="flex-row justify-between mb-1">
+                      <Text className="text-black flex-1">{label} :</Text>
+                      <Text className="text-black w-24 text-right">{amt.toFixed(2)}</Text>
+                    </View>
+                  );
+                })}
+
+                <Text className="text-black text-center text-xs mt-1 mb-1">- - - - - - - - - - - - - - - - -</Text>
+                <View className="flex-row justify-between mb-2">
+                  <Text className="text-black font-bold flex-1">TOTAL Rs.:</Text>
+                  <Text className="text-black font-bold w-24 text-right">{Number(reportData.totalExpenses).toFixed(2)}</Text>
+                </View>
+                <Text className="text-black text-center text-xs mb-4">--------------------------------</Text>
+                </ScrollView>
+              </View>
+            )}
+
+            <TouchableOpacity
+              className="bg-sky-500 rounded-xl py-3 items-center"
+              onPress={() => setShowReportModal(false)}>
+              <Text className="text-white font-bold">OK</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>

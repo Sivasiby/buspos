@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -30,9 +30,8 @@ import {
   Navigation,
   DollarSign,
 } from 'lucide-react-native';
-import api from '../api/api';
 import { supabase } from '../../lib/supabase';
-import { usePOSTickets } from '../hooks/usePOSTickets';
+import { useTripContext } from '../context/TripContext';
 import { places } from '../utils/places';
 
 // ─── NYX imports (Android only) ───────────────────────────────────────────────
@@ -113,6 +112,17 @@ const routeLabel = (name, dir) => {
   return parts.length >= 2 ? [...parts].reverse().join(' → ') : name;
 };
 
+const RESET_REPORT_CUTOFF_KEY = 'trip_report_reset_after_iso';
+
+const isOnOrAfterCutoff = (iso, cutoffIso) => {
+  if (!iso) return false;
+  if (!cutoffIso) return true;
+  const t = new Date(iso).getTime();
+  const c = new Date(cutoffIso).getTime();
+  if (!Number.isFinite(t) || !Number.isFinite(c)) return true;
+  return t >= c;
+};
+
 const buildStageRows = (appBreakdown, posTix) => {
   const map = {};
   for (const rb of appBreakdown) {
@@ -151,6 +161,380 @@ const buildStageRows = (appBreakdown, posTix) => {
     if (isNaN(bn)) return -1;
     return an - bn;
   });
+};
+
+const jwtDecodePayload = token => {
+  try {
+    const part = token.split('.')[1];
+    if (!part) return null;
+    const padded = part + '='.repeat((4 - (part.length % 4)) % 4);
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const std = padded.replace(/-/g, '+').replace(/_/g, '/');
+    let bytes = '';
+    for (let i = 0; i < std.length; i += 4) {
+      const c0 = chars.indexOf(std[i]);
+      const c1 = chars.indexOf(std[i + 1]);
+      const c2 = chars.indexOf(std[i + 2]);
+      const c3 = chars.indexOf(std[i + 3]);
+      bytes += String.fromCharCode((c0 << 2) | (c1 >> 4));
+      if (std[i + 2] !== '=') bytes += String.fromCharCode(((c1 & 15) << 4) | (c2 >> 2));
+      if (std[i + 3] !== '=') bytes += String.fromCharCode(((c2 & 3) << 6) | c3);
+    }
+    return JSON.parse(bytes);
+  } catch {
+    return null;
+  }
+};
+
+const getConductorIdFromStorage = async () => {
+  try {
+    const raw = await AsyncStorage.getItem('conductor_user');
+    const stored = raw ? JSON.parse(raw) : null;
+    const direct = stored?.id ?? stored?.user_id ?? stored?.conductor_id ?? stored?.user?.id ?? null;
+    if (direct) return String(direct);
+
+    const token = stored?.access_token ?? await AsyncStorage.getItem('access_token');
+    const payload = token ? jwtDecodePayload(token) : null;
+    const fromToken = payload?.sub ?? payload?.user_id ?? payload?.id ?? null;
+    return fromToken ? String(fromToken) : null;
+  } catch {
+    return null;
+  }
+};
+
+const fetchDashboardFromSupabase = async () => {
+  const conductorId = await getConductorIdFromStorage();
+  if (!conductorId) throw new Error('No conductor session');
+
+  const now = Date.now();
+  const since24hIso = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+
+  const [activeRes, recentRes, todayTripsRes] = await Promise.all([
+    supabase
+      .from('trips')
+      .select(
+        'id,bus_id,route_id,conductor_id,direction,start_time,expected_end_time,status,trip_number',
+      )
+      .eq('conductor_id', conductorId)
+      .in('status', ['scheduled', 'running', 'paused'])
+      .order('start_time', { ascending: false })
+      .limit(1),
+    supabase
+      .from('trips')
+      .select(
+        'id,bus_id,route_id,direction,start_time,expected_end_time,status,trip_number',
+      )
+      .eq('conductor_id', conductorId)
+      .gte('start_time', since24hIso)
+      .order('start_time', { ascending: false })
+      .limit(10),
+    supabase
+      .from('trips')
+      .select('id')
+      .eq('conductor_id', conductorId)
+      .gte('start_time', todayStart.toISOString()),
+  ]);
+
+  if (activeRes.error) throw activeRes.error;
+  if (recentRes.error) throw recentRes.error;
+  if (todayTripsRes.error) throw todayTripsRes.error;
+
+  const activeRow = activeRes.data?.[0] ?? null;
+  const recentRows = recentRes.data ?? [];
+  const todayTripIds = (todayTripsRes.data ?? []).map(t => t.id);
+
+  const routeIds = [
+    ...new Set(
+      [activeRow?.route_id, ...recentRows.map(r => r.route_id)]
+        .filter(Boolean)
+        .map(String),
+    ),
+  ];
+  const busIds = [
+    ...new Set(
+      [activeRow?.bus_id, ...recentRows.map(r => r.bus_id)]
+        .filter(Boolean)
+        .map(String),
+    ),
+  ];
+  const summaryTripIds = [
+    ...new Set(
+      [activeRow?.id, ...recentRows.map(r => r.id), ...todayTripIds]
+        .filter(Boolean)
+        .map(String),
+    ),
+  ];
+
+  const [routesRes, busesRes, ticketsRes] = await Promise.all([
+    routeIds.length > 0
+      ? supabase.from('routes').select('id,route_name').in('id', routeIds)
+      : Promise.resolve({ data: [], error: null }),
+    busIds.length > 0
+      ? supabase.from('buses').select('id,bus_number,bus_name,capacity').in('id', busIds)
+      : Promise.resolve({ data: [], error: null }),
+    summaryTripIds.length > 0
+      ? supabase.from('tickets').select('trip_id,fare').in('trip_id', summaryTripIds)
+      : Promise.resolve({ data: [], error: null }),
+  ]);
+
+  if (routesRes.error) throw routesRes.error;
+  if (busesRes.error) throw busesRes.error;
+  if (ticketsRes.error) throw ticketsRes.error;
+
+  const routeNameMap = Object.fromEntries(
+    (routesRes.data ?? []).map(r => [String(r.id), r.route_name]),
+  );
+  const busMap = Object.fromEntries(
+    (busesRes.data ?? []).map(b => [
+      String(b.id),
+      {
+        id: b.id,
+        vehicle_number: b.bus_number,
+        bus_name: b.bus_name,
+        capacity: b.capacity,
+      },
+    ]),
+  );
+
+  const ticketMetricsByTrip = (ticketsRes.data ?? []).reduce((acc, row) => {
+    const key = String(row.trip_id);
+    if (!acc[key]) acc[key] = { tickets_sold: 0, collection: 0 };
+    acc[key].tickets_sold += 1;
+    acc[key].collection += Number(row.fare ?? 0);
+    return acc;
+  }, {});
+
+  const toTripPayload = row => {
+    if (!row) return null;
+    const metric = ticketMetricsByTrip[String(row.id)] ?? {
+      tickets_sold: 0,
+      collection: 0,
+    };
+    return {
+      trip_id: row.id,
+      trip_number: row.trip_number,
+      route_id: row.route_id ?? null,
+      route_name: routeNameMap[String(row.route_id)] ?? 'Unknown',
+      direction: row.direction,
+      status: row.status,
+      start_time: row.start_time,
+      end_time: row.expected_end_time ?? null,
+      bus_id: row.bus_id ?? null,
+      conductor_id: row.conductor_id ?? conductorId,
+      tickets_sold: metric.tickets_sold,
+      collection: Math.round(metric.collection * 100) / 100,
+    };
+  };
+
+  const active_trip = toTripPayload(activeRow);
+  const recent_trips = recentRows.map(toTripPayload);
+
+  const todayAgg = todayTripIds.reduce(
+    (acc, tripId) => {
+      const metric = ticketMetricsByTrip[String(tripId)] ?? {
+        tickets_sold: 0,
+        collection: 0,
+      };
+      acc.tickets_sold += metric.tickets_sold;
+      acc.total_collection += metric.collection;
+      return acc;
+    },
+    { tickets_sold: 0, total_collection: 0 },
+  );
+
+  const refBusId = activeRow?.bus_id ?? recentRows?.[0]?.bus_id ?? null;
+
+  return {
+    conductor: { id: conductorId },
+    bus: refBusId ? busMap[String(refBusId)] ?? null : null,
+    active_trip,
+    today_stats: {
+      trips_completed: todayTripIds.length,
+      tickets_sold: todayAgg.tickets_sold,
+      total_collection: Math.round(todayAgg.total_collection * 100) / 100,
+      passengers: todayAgg.tickets_sold,
+    },
+    recent_trips,
+  };
+};
+
+const fetchTripReportWithAppTripFromSupabase = async tripId => {
+  const conductorId = await getConductorIdFromStorage();
+  if (!conductorId) throw new Error('No conductor session');
+
+  const { data: tripRow, error: tripErr } = await supabase
+    .from('trips')
+    .select(
+      'id,conductor_id,route_id,bus_id,trip_number,direction,status,start_time,expected_end_time',
+    )
+    .eq('id', tripId)
+    .eq('conductor_id', conductorId)
+    .maybeSingle();
+  if (tripErr) throw tripErr;
+  if (!tripRow) throw new Error('Trip not found');
+
+  const [routeRes, busRes, ticketRes] = await Promise.all([
+    tripRow.route_id
+      ? supabase.from('routes').select('route_name').eq('id', tripRow.route_id).maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
+    tripRow.bus_id
+      ? supabase.from('buses').select('bus_number').eq('id', tripRow.bus_id).maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
+    supabase
+      .from('tickets')
+      .select(
+        'id,fare,total_fare,ticket_count,is_verified,payment_method,created_at,from_stop_id,to_stop_id,ticket_type',
+      )
+      .eq('trip_id', tripId),
+  ]);
+
+  if (routeRes.error) throw routeRes.error;
+  if (busRes.error) throw busRes.error;
+  if (ticketRes.error) throw ticketRes.error;
+
+  const ticketRows = ticketRes.data ?? [];
+  const stopIds = [
+    ...new Set(
+      ticketRows
+        .flatMap(r => [r.from_stop_id, r.to_stop_id])
+        .filter(Boolean)
+        .map(String),
+    ),
+  ];
+
+  const stopRes = stopIds.length > 0
+    ? await supabase.from('stops').select('id,stop_name').in('id', stopIds)
+    : { data: [], error: null };
+  if (stopRes.error) throw stopRes.error;
+
+  const stopMap = Object.fromEntries(
+    (stopRes.data ?? []).map(s => [String(s.id), s.stop_name]),
+  );
+
+  const allGrouped = {};
+  const appGrouped = {};
+  let allCollection = 0;
+  let allVerified = 0;
+  let allFull = 0;
+  let allHalf = 0;
+  let allFree = 0;
+
+  let appTickets = 0;
+  let appCollection = 0;
+  let appFull = 0;
+  let appHalf = 0;
+  let appFree = 0;
+
+  const addToGroup = (groupMap, fromName, toName, fullCount, halfCount, freeCount, total) => {
+    const key = `${fromName}|||${toName}`;
+    if (!groupMap[key]) {
+      groupMap[key] = {
+        from: fromName,
+        to: toName,
+        count: 0,
+        full_count: 0,
+        half_count: 0,
+        free_count: 0,
+        total_fare: 0,
+      };
+    }
+    groupMap[key].count += fullCount + halfCount + freeCount;
+    groupMap[key].full_count += fullCount;
+    groupMap[key].half_count += halfCount;
+    groupMap[key].free_count += freeCount;
+    groupMap[key].total_fare += total;
+  };
+
+  for (const row of ticketRows) {
+    const cnt = Number(row.ticket_count ?? 1);
+    const unit = Number(row.fare ?? 0);
+    const total = row.total_fare != null ? Number(row.total_fare) : unit * cnt;
+    const pm = String(row.payment_method ?? '').toLowerCase();
+    const tt = String(row.ticket_type ?? 'full').toLowerCase();
+    const fromName = stopMap[String(row.from_stop_id)] ?? 'Unknown';
+    const toName = stopMap[String(row.to_stop_id)] ?? 'Unknown';
+    const isFree = pm === 'fr';
+    const isHalf = !isFree && tt === 'half';
+    const fullCount = isFree || isHalf ? 0 : cnt;
+    const halfCount = isHalf ? cnt : 0;
+    const freeCount = isFree ? cnt : 0;
+
+    addToGroup(allGrouped, fromName, toName, fullCount, halfCount, freeCount, total);
+
+    allCollection += total;
+    if (row.is_verified) allVerified += 1;
+    allFull += fullCount;
+    allHalf += halfCount;
+    allFree += freeCount;
+
+    if (pm !== 'pos') {
+      addToGroup(appGrouped, fromName, toName, fullCount, halfCount, freeCount, total);
+      appTickets += cnt;
+      appCollection += total;
+      appFull += fullCount;
+      appHalf += halfCount;
+      appFree += freeCount;
+    }
+  }
+
+  const toBreakdownArray = grouped =>
+    Object.values(grouped)
+      .sort((a, b) => Number(b.total_fare) - Number(a.total_fare))
+      .map(g => ({
+        from: g.from,
+        to: g.to,
+        route: `${g.from} → ${g.to}`,
+        count: g.count,
+        full_count: g.full_count,
+        half_count: g.half_count,
+        free_count: g.free_count,
+        revenue: Math.round(Number(g.total_fare) * 100) / 100,
+        total_fare: Math.round(Number(g.total_fare) * 100) / 100,
+      }));
+
+  return {
+    report: {
+      trip_id: tripId,
+      trip_number: tripRow.trip_number ?? null,
+      route_name: routeRes.data?.route_name ?? 'Unknown',
+      direction: tripRow.direction,
+      status: tripRow.status,
+      start_time: tripRow.start_time,
+      end_time: tripRow.expected_end_time ?? null,
+      bus_number: busRes.data?.bus_number ?? null,
+      summary: {
+        total_tickets: ticketRows.length,
+        total_collection: Math.round(allCollection * 100) / 100,
+        total_full: allFull,
+        total_half: allHalf,
+        total_free: allFree,
+        verified: allVerified,
+        surrendered: 0,
+      },
+      route_breakdown: toBreakdownArray(allGrouped),
+      tickets: ticketRows.map(row => ({
+        ticket_id: String(row.id),
+        from: stopMap[String(row.from_stop_id)] ?? 'Unknown',
+        to: stopMap[String(row.to_stop_id)] ?? 'Unknown',
+        fare: row.total_fare != null
+          ? Number(row.total_fare)
+          : Number(row.fare ?? 0) * Number(row.ticket_count ?? 1),
+        is_verified: !!row.is_verified,
+        is_free: String(row.payment_method ?? '').toLowerCase() === 'fr',
+        created_at: row.created_at,
+      })),
+    },
+    appTrip: {
+      tickets: appTickets,
+      collection: Math.round(appCollection * 100) / 100,
+      full: appFull,
+      half: appHalf,
+      free: appFree,
+      breakdown: toBreakdownArray(appGrouped),
+    },
+  };
 };
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
@@ -308,26 +692,31 @@ const TripSheetTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
   const [report, setReport] = useState(null);
   const [appTrip, setAppTrip] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [showPrintModal, setShowPrintModal] = useState(false);
+  const [printModalData, setPrintModalData] = useState(null);
 
   // Filter panel state
-  const [filterOpen, setFilterOpen] = useState(false);
   const [filterStart, setFilterStart] = useState(null);
   const [filterEnd, setFilterEnd] = useState(null);
   const [showFilterStartDrop, setShowFilterStartDrop] = useState(false);
   const [showFilterEndDrop, setShowFilterEndDrop] = useState(false);
-
-  const STORAGE_KEY_TRIP = 'report_selected_trip_id';
+  const [tableTab, setTableTab] = useState('full');
 
   const at = dashboard?.active_trip;
-  const recentTrips = dashboard?.recent_trips ?? [];
 
   // Build trip list: active first, then recent
-  const trips = [
-    ...(at?.trip_id ? [{ ...at, isActive: true }] : []),
-    ...recentTrips
-      .filter(t => t.trip_id !== at?.trip_id)
-      .map(t => ({ ...t, isActive: false })),
-  ];
+  const trips = useMemo(
+    () => {
+      const recentTrips = dashboard?.recent_trips ?? [];
+      return [
+        ...(at?.trip_id ? [{ ...at, isActive: true }] : []),
+        ...recentTrips
+        .filter(t => t.trip_id !== at?.trip_id)
+        .map(t => ({ ...t, isActive: false })),
+      ];
+    },
+    [at, dashboard?.recent_trips],
+  );
 
   // Direction-aware place ordering (mirrors HomeScreen)
   const selectedTripDir = (
@@ -335,43 +724,69 @@ const TripSheetTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
     at?.direction ??
     'up'
   );
-  const getFilterPlaces = () =>
-    isDownDirection(selectedTripDir) ? [...places].reverse() : places;
+  const filterPlaces = useMemo(
+    () => (isDownDirection(selectedTripDir) ? [...places].reverse() : places),
+    [selectedTripDir],
+  );
 
-  // Load saved trip ID on mount
-  useEffect(() => {
-    const loadSavedTrip = async () => {
-      try {
-        const savedTripId = await AsyncStorage.getItem(STORAGE_KEY_TRIP);
-        if (savedTripId) {
-          setSelectedTripId(savedTripId);
-        }
-      } catch (e) {
-        console.error('Failed to load saved trip:', e);
-      }
-    };
-    loadSavedTrip();
-  }, []);
+  const quickFilterRanges = useMemo(
+    () =>
+      isDownDirection(selectedTripDir)
+        ? [
+          { from: 3, to: 11 },
+          { from: 11, to: 18 },
+          ]
+        : [
+          { from: 18, to: 11 },
+          { from: 11, to: 3 },
+          ],
+    [selectedTripDir],
+  );
 
-  // Auto-select latest trip when no trip is selected and dashboard is available
-  useEffect(() => {
-    if (selectedTripId === null && trips.length > 0) {
-      // Auto-select latest trip: active trip if available, else most recent
-      if (at?.trip_id) {
-        setSelectedTripId(at.trip_id);
-      } else {
-        setSelectedTripId(trips[0].trip_id);
-      }
+  const stageNumFromPlace = place =>
+    parseInt(place?.label?.split('-')[1]?.trim(), 10);
+
+  const applyQuickRange = (fromStage, toStage) => {
+    const fromPlace = filterPlaces.find(
+      p => stageNumFromPlace(p) === fromStage,
+    );
+    const toPlace = filterPlaces.find(p => stageNumFromPlace(p) === toStage);
+    if (!fromPlace || !toPlace) {
+      Alert.alert('Unavailable', 'Could not apply this stage range.');
+      return;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [at?.trip_id, trips]);
+    setFilterStart(fromPlace);
+    setFilterEnd(toPlace);
+    setShowFilterStartDrop(false);
+    setShowFilterEndDrop(false);
+  };
 
-  // Save selected trip ID to AsyncStorage whenever it changes
+  // Initial default selection: active trip first; otherwise latest trip.
+  // Do not force active trip after user manually changes selection.
   useEffect(() => {
-    if (selectedTripId) {
-      AsyncStorage.setItem(STORAGE_KEY_TRIP, selectedTripId);
+    if (selectedTripId !== null) return;
+    if (at?.trip_id) {
+      setSelectedTripId(at.trip_id);
+      return;
     }
-  }, [selectedTripId]);
+    if (trips.length > 0) {
+      setSelectedTripId(trips[0].trip_id);
+    }
+  }, [at?.trip_id, trips, selectedTripId]);
+
+  // If saved/selected trip is no longer in filtered list, switch to latest valid trip
+  useEffect(() => {
+    if (!selectedTripId) return;
+    const exists = trips.some(t => t.trip_id === selectedTripId);
+    if (exists) return;
+    if (at?.trip_id) {
+      setSelectedTripId(at.trip_id);
+    } else if (trips.length > 0) {
+      setSelectedTripId(trips[0].trip_id);
+    } else {
+      setSelectedTripId(null);
+    }
+  }, [selectedTripId, trips, at?.trip_id]);
 
   useEffect(() => {
     if (!selectedTripId) {
@@ -384,91 +799,13 @@ const TripSheetTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
     setLoading(true);
     (async () => {
       try {
-        const r = await api.get(`/conductor/trip/${selectedTripId}/report`);
-        setReport(r.data);
+        const { report: tripReport, appTrip: appOnlyTrip } =
+          await fetchTripReportWithAppTripFromSupabase(selectedTripId);
+        setReport(tripReport);
+        setAppTrip(appOnlyTrip);
       } catch {
         Alert.alert('Error', 'Could not load trip report');
-      }
-
-      try {
-        const { data: rows, error } = await supabase
-          .from('tickets')
-          .select(
-            'ticket_type,payment_method,ticket_count,total_fare,fare,from_stop_id,to_stop_id',
-          )
-          .eq('trip_id', selectedTripId)
-          .neq('payment_method', 'pos');
-        if (error) throw error;
-
-        const stopIds = [
-          ...new Set(
-            (rows ?? []).flatMap(r =>
-              [r.from_stop_id, r.to_stop_id].filter(Boolean),
-            ),
-          ),
-        ];
-        const stopMap = {};
-        if (stopIds.length) {
-          const { data: stops } = await supabase
-            .from('stops')
-            .select('id,stop_name')
-            .in('id', stopIds);
-          (stops ?? []).forEach(s => {
-            stopMap[String(s.id)] = s.stop_name;
-          });
-        }
-
-        const map = {};
-        let full = 0,
-          half = 0,
-          free = 0,
-          tickets = 0,
-          collection = 0;
-        for (const r of rows ?? []) {
-          const cnt = Number(r.ticket_count ?? 1);
-          const pm = String(r.payment_method ?? '').toLowerCase();
-          const tt = r.ticket_type ?? 'full';
-          const unit = Number(r.fare ?? 0);
-          const total =
-            r.total_fare != null ? Number(r.total_fare) : unit * cnt;
-          const fromName = stopMap[String(r.from_stop_id)] ?? 'Unknown';
-          const toName = stopMap[String(r.to_stop_id)] ?? 'Unknown';
-          const ss = stageCodeFromName(fromName);
-          const es = stageCodeFromName(toName);
-          const k = `${ss}|||${es}`;
-          if (!map[k])
-            map[k] = {
-              from: fromName,
-              to: toName,
-              full_count: 0,
-              half_count: 0,
-              free_count: 0,
-              total_fare: 0,
-            };
-          const isFree = pm === 'fr';
-          if (isFree) {
-            map[k].free_count += cnt;
-            free += cnt;
-          } else if (tt === 'half') {
-            map[k].half_count += cnt;
-            half += cnt;
-          } else {
-            map[k].full_count += cnt;
-            full += cnt;
-          }
-          map[k].total_fare += total;
-          tickets += cnt;
-          collection += total;
-        }
-        setAppTrip({
-          tickets,
-          collection,
-          full,
-          half,
-          free,
-          breakdown: Object.values(map),
-        });
-      } catch {
+        setReport(null);
         setAppTrip({
           tickets: 0,
           collection: 0,
@@ -481,6 +818,10 @@ const TripSheetTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
         setLoading(false);
       }
     })();
+  }, [selectedTripId]);
+
+  useEffect(() => {
+    setTableTab('full');
   }, [selectedTripId]);
 
 const posTix = (posHook?.tickets ?? []).filter(
@@ -499,23 +840,28 @@ const posTix = (posHook?.tickets ?? []).filter(
 
   // Filtered stage rows (when filter panel is open and both places selected)
   const filteredStageRows = (() => {
-    if (!filterOpen || !filterStart || !filterEnd) return null;
-    const startNum = parseInt(filterStart.label.split('-')[1]?.trim(), 10);
-    const endNum = parseInt(filterEnd.label.split('-')[1]?.trim(), 10);
+    if (!filterStart || !filterEnd) return null;
+    const startNum = stageNumFromPlace(filterStart);
+    const endNum = stageNumFromPlace(filterEnd);
     if (isNaN(startNum) || isNaN(endNum)) return null;
-    const lo = Math.min(startNum, endNum);
-    const hi = Math.max(startNum, endNum);
+
+    const isFromWithinSelectedRange = from => {
+      if (isNaN(from)) return false;
+      if (startNum === endNum) return from === startNum;
+
+      if (startNum < endNum) {
+        return from >= startNum && from < endNum;
+      }
+      return from <= startNum && from > endNum;
+    };
+
     const filteredApp = appBreakdown.filter(rb => {
       const from = parseInt(stageCodeFromName(rb.from), 10);
-      const to = parseInt(stageCodeFromName(rb.to), 10);
-      if (isNaN(from) || isNaN(to)) return false;
-      return from >= lo && from <= hi && to >= lo && to <= hi;
+      return isFromWithinSelectedRange(from);
     });
     const filteredPos = posTix.filter(t => {
       const from = parseInt(stageCode(t.from_stop), 10);
-      const to = parseInt(stageCode(t.to_stop), 10);
-      if (isNaN(from) || isNaN(to)) return false;
-      return from >= lo && from <= hi && to >= lo && to <= hi;
+      return isFromWithinSelectedRange(from);
     });
     return buildStageRows(filteredApp, filteredPos);
   })();
@@ -527,12 +873,56 @@ const posTix = (posHook?.tickets ?? []).filter(
   };
 
   const handlePrintTripSheet = async () => {
-    if (Platform.OS !== 'android' || !NyxPrinter) {
-      Alert.alert('Not supported', 'Printing is only available on Android.');
-      return;
-    }
     if (!report || !stageRows || stageRows.length === 0) {
       Alert.alert('No data', 'No trip data to print.');
+      return;
+    }
+
+    const testingMode = await AsyncStorage.getItem('testing_mode');
+    const isTestingMode = testingMode === 'true';
+
+    const _selectedTrip = trips.find(t => t.trip_id === selectedTripId);
+    const _busNo = report.bus_number ?? dashboard?.bus?.vehicle_number ?? 'N/A';
+    const _tripNum = report.trip_number ?? _selectedTrip?.trip_number ?? '—';
+    const _wayBill = report.way_bill_number ?? report.waybill ?? _selectedTrip?.way_bill_number ?? '—';
+    const _startDt = report.start_time ? new Date(report.start_time) : new Date();
+    const _dateStr = _startDt.toLocaleDateString('en-GB');
+    const _timeStr = _startDt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+
+    // Use filtered rows if in filtered tab, otherwise use full rows
+    const isFiltered = tableTab === 'filtered' && filteredStageRows && filteredStageRows.length > 0;
+    const rowsToPrint = isFiltered ? filteredStageRows : stageRows;
+
+    // Calculate totals from the rows being printed
+    const printGrandFull = rowsToPrint.reduce((s, r) => s + r.f, 0);
+    const printGrandHalf = rowsToPrint.reduce((s, r) => s + r.h, 0);
+    const printGrandCollection = rowsToPrint.reduce((s, r) => s + r.amt, 0);
+
+    // For filtered mode, only show trip collection (no combined total)
+    const printCombinedTotal = isFiltered ? printGrandCollection : combinedTotal;
+
+    if (isTestingMode) {
+      setPrintModalData({
+        title: 'TRIP SHEET',
+        busNo: _busNo,
+        tripNum: _tripNum,
+        wayBill: _wayBill,
+        dateStr: _dateStr,
+        timeStr: _timeStr,
+        stageRows: rowsToPrint,
+        grandFull: printGrandFull,
+        grandHalf: printGrandHalf,
+        grandCollection: printGrandCollection,
+        combinedTotal: printCombinedTotal,
+        type: 'tripsheet',
+        filterLabel: isFiltered ? `FILTERED: ${getFilterDisplayName(filterStart)} → ${getFilterDisplayName(filterEnd)}` : null,
+      });
+      setShowPrintModal(true);
+      return;
+    }
+
+    if (Platform.OS !== 'android' || !NyxPrinter) {
+      Alert.alert('Not supported', 'Printing is only available on Android.');
       return;
     }
     try {
@@ -581,9 +971,14 @@ const posTix = (posHook?.tickets ?? []).filter(
       await NyxPrinter.printText('TRIP SHEET', { textSize: 26, align: PrintAlign.CENTER, bold: true });
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
+      if (isFiltered) {
+        const filterLabel = `FILTERED: ${getFilterDisplayName(filterStart)} → ${getFilterDisplayName(filterEnd)}`;
+        await NyxPrinter.printText(filterLabel, { textSize: 18, align: PrintAlign.CENTER });
+      }
+
       await NyxPrinter.printText(`BUS:${busNo}  TRIP No.:${tripNum}`, { textSize: 24 });
       await NyxPrinter.printText(`${dateStr} ${timeStr}${ticketRangeStr ? `  TKT:${ticketRangeStr}` : ''}`, { textSize: 22 });
-      
+
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
       // ── Column headers: SS ES F H L P AMT ──────────────────────────────────
@@ -609,7 +1004,7 @@ const posTix = (posHook?.tickets ?? []).filter(
       await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
 
       // ── Stage rows ───────────────────────────────────────────────────────────
-      for (const r of stageRows) {
+      for (const r of rowsToPrint) {
         const row =
           padL(r.ss,          COL.ss)  +
           padL(r.es,          COL.es)  +
@@ -624,7 +1019,7 @@ const posTix = (posHook?.tickets ?? []).filter(
 
       // ── FULL total ───────────────────────────────────────────────────────────
       await NyxPrinter.printText(
-        `FULL : ${grandFull}`,
+        `FULL : ${printGrandFull}`,
         { textSize: 26, align: PrintAlign.CENTER },
       );
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
@@ -632,11 +1027,11 @@ const posTix = (posHook?.tickets ?? []).filter(
       // ── TRIP.COLL + TOT.COLL ────────────────────────────────────────────────
       // textSize 32 fits ~20 chars. label=12 + amount right-aligned in 8 = 20
       await NyxPrinter.printText(
-        `${padL('TRIP.COLL:', 12)}${padR(fmtAmt(grandCollection), 8)}`,
+        `${padL('TRIP.COLL:', 12)}${padR(fmtAmt(printGrandCollection), 8)}`,
         { textSize: 32 },
       );
       await NyxPrinter.printText(
-        `${padL('TOT.COLL:', 12)}${padR(fmtAmt(combinedTotal), 8)}`,
+        `${padL('TOT.COLL:', 12)}${padR(fmtAmt(printCombinedTotal), 8)}`,
         { textSize: 32 },
       );
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
@@ -650,6 +1045,7 @@ const posTix = (posHook?.tickets ?? []).filter(
   };
 
   return (
+    <>
     <ScrollView
       className="flex-1"
       contentContainerStyle={{ padding: 16, paddingBottom: 40 }}
@@ -695,26 +1091,24 @@ const posTix = (posHook?.tickets ?? []).filter(
                 style={{ minWidth: 110 }}
               >
                 {trip.isActive && (
-                  <View className="flex-row items-center gap-1 mb-1">
-                    <View className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                    <Text
-                      className={`text-[9px] font-black tracking-widest ${
-                        isSelected ? 'text-sky-100' : 'text-emerald-400'
-                      }`}
-                    >
-                      ACTIVE
-                    </Text>
-                  </View>
+                  <View className="absolute top-2 right-2 w-2.5 h-2.5 rounded-full bg-emerald-400" />
                 )}
                 <Text
-                  className={`text-sm font-black ${
-                    isSelected ? 'text-white' : 'text-zinc-200'
+                  className={`text-[10px] font-bold tracking-wider ${
+                    isSelected ? 'text-sky-100' : 'text-zinc-400'
                   }`}
                 >
-                  {trip.trip_number ? `Trip #${trip.trip_number}` : 'No #'}
+                  Trip
                 </Text>
                 <Text
-                  className={`text-[10px] mt-0.5 ${
+                  className={`text-center text-2xl font-black leading-tight ${
+                    isSelected ? 'text-white' : 'text-zinc-100'
+                  }`}
+                >
+                  {trip.trip_number ? `#${trip.trip_number}` : '#—'}
+                </Text>
+                <Text
+                  className={`text-[10px] mt-1 ${
                     isSelected ? 'text-sky-100' : 'text-zinc-500'
                   }`}
                   numberOfLines={1}
@@ -837,81 +1231,165 @@ const posTix = (posHook?.tickets ?? []).filter(
                 STAGE BREAKDOWN
               </Text>
             </View>
-            <StageTable rows={stageRows} />
-
-            {/* Grand total */}
-            <View className="flex-row justify-between items-center bg-sky-500/10 border border-sky-500/20 rounded-xl px-4 py-3 mt-3">
-              <Text className="text-zinc-300 text-sm font-bold">TRP TOTAL</Text>
-              <Text className="text-sky-400 text-xl font-black">
-                ₹{grandCollection.toFixed(2)}
-              </Text>
+            <View className="flex-row bg-black rounded-xl p-1 mt-3 mb-2 border border-zinc-700">
+              <TouchableOpacity
+                className={`flex-1 py-2 rounded-lg ${
+                  tableTab === 'full' ? 'bg-sky-500/40 border border-sky-400/30' : 'bg-transparent'
+                }`}
+                onPress={() => setTableTab('full')}
+                activeOpacity={0.8}
+              >
+                <Text
+                  className={`text-center text-xs font-bold ${
+                    tableTab === 'full' ? 'text-sky-100' : 'text-zinc-400'
+                  }`}
+                >
+                  FULL
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                className={`flex-1 py-2 rounded-lg ${
+                  tableTab === 'filtered' ? 'bg-violet-500/40 border border-violet-400/30' : 'bg-transparent'
+                }`}
+                onPress={() => setTableTab('filtered')}
+                activeOpacity={0.8}
+              >
+                <Text
+                  className={`text-center text-xs font-bold ${
+                    tableTab === 'filtered' ? 'text-violet-100' : 'text-zinc-400'
+                  }`}
+                >
+                  FILTERED
+                </Text>
+              </TouchableOpacity>
             </View>
+
+            {tableTab === 'full' ? (
+              <>
+                <View className="flex-row justify-end mb-3">
+                  <TouchableOpacity
+                    className="flex-row items-center justify-center gap-1.5 bg-sky-500 rounded-xl px-4 py-3"
+                    activeOpacity={0.8}
+                    onPress={handlePrintTripSheet}
+                  >
+                    <Download size={14} color="#fff" />
+                    <Text className="text-white text-xs font-bold">Print</Text>
+                  </TouchableOpacity>
+                </View>
+                <StageTable rows={stageRows} />
+                <View className="flex-row justify-between items-center bg-sky-500/10 border border-sky-500/20 rounded-xl px-4 py-3 mt-3">
+                  <Text className="text-zinc-300 text-sm font-bold">TRP TOTAL</Text>
+                  <Text className="text-sky-400 text-xl font-black">
+                    ₹{grandCollection.toFixed(2)}
+                  </Text>
+                </View>
+              </>
+            ) : (
+              null
+            )}
           </View>
 
-         {/* Filter toggle */}
-          <View className="px-4 pb-2">
-            <TouchableOpacity
-              className={`flex-row items-center justify-between px-4 py-3 rounded-xl border ${
-                filterOpen ? 'bg-violet-500/10 border-violet-500/30' : 'bg-zinc-800/60 border-zinc-700'
-              }`}
-              onPress={() => { setFilterOpen(v => !v); setShowFilterStartDrop(false); setShowFilterEndDrop(false); }}
-              activeOpacity={0.8}
-            >
-              <View className="flex-row items-center gap-2">
-                <BarChart3 size={14} color={filterOpen ? '#a78bfa' : '#71717a'} />
-                <Text className={`text-sm font-bold ${filterOpen ? 'text-violet-400' : 'text-zinc-400'}`}>
-                  Filter by Stage Range
+          {/* Filter controls (always open in filtered tab) */}
+          {tableTab === 'filtered' && (
+            <View className="px-4 pb-2 mt-1">
+              {/* Quick stage ranges */}
+              <View className="bg-black rounded-xl border border-zinc-700 p-2 mb-3">
+                <Text className="text-zinc-500 text-[9px] font-black tracking-widest px-1 pb-2">
+                  QUICK SELECT
                 </Text>
+                <View className="flex-row gap-2">
+                  {quickFilterRanges.map(range => {
+                    const fromLabel = String(range.from).padStart(3, '0');
+                    const toLabel = String(range.to).padStart(3, '0');
+                    const isActive =
+                      stageNumFromPlace(filterStart) === range.from &&
+                      stageNumFromPlace(filterEnd) === range.to;
+                    return (
+                      <TouchableOpacity
+                        key={`q-${range.from}-${range.to}`}
+                        className={`flex-1 rounded-lg px-3 py-2 border ${
+                          isActive
+                            ? 'bg-violet-500/50 border-violet-400'
+                            : 'bg-zinc-800 border-zinc-700'
+                        }`}
+                        onPress={() => applyQuickRange(range.from, range.to)}
+                        activeOpacity={0.8}
+                      >
+                        <Text
+                          className={`text-center text-xs font-bold ${
+                            isActive ? 'text-white' : 'text-zinc-300'
+                          }`}
+                        >
+                          {fromLabel} - {toLabel}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
               </View>
-              <Text className={`text-xs font-bold ${filterOpen ? 'text-violet-400' : 'text-zinc-600'}`}>
-                {filterOpen ? 'HIDE ▲' : 'SHOW ▼'}
-              </Text>
-            </TouchableOpacity>
 
-            {filterOpen && (
-              <View className="mt-3">
+              <View className="mt-1">
                 {/* Stage range selector */}
-                <View className="bg-zinc-800/60 rounded-xl border border-zinc-700 overflow-hidden mb-3">
-                  {/* Start */}
+                <View className="flex-row items-stretch bg-zinc-900 rounded-xl border border-zinc-700 overflow-hidden mb-3">
+                  {/* FROM */}
                   <TouchableOpacity
-                    className="flex-row items-center gap-3 px-4 py-3 border-b border-zinc-700"
-                    onPress={() => { setShowFilterStartDrop(v => !v); setShowFilterEndDrop(false); }}
+                    className={`flex-1 px-3 py-3 ${showFilterStartDrop ? 'bg-zinc-800/60' : ''}`}
+                    onPress={() => {
+                      setShowFilterStartDrop(v => !v);
+                      setShowFilterEndDrop(false);
+                    }}
                     activeOpacity={0.8}
                   >
-                    <View className="w-6 h-6 rounded-full bg-zinc-700 items-center justify-center">
-                      <Navigation size={11} color="#71717a" />
-                    </View>
-                    <View className="flex-1">
-                      <Text className="text-zinc-500 text-[9px] font-black tracking-widest">FROM STAGE</Text>
-                      <Text className={`text-sm font-bold ${filterStart ? 'text-white' : 'text-zinc-500'}`}>
-                        {filterStart ? getFilterDisplayName(filterStart) : 'Select start stage'}
-                      </Text>
-                    </View>
-                    {filterStart && (
-                      <TouchableOpacity onPress={() => setFilterStart(null)} className="px-2 py-1 rounded-lg bg-zinc-700">
-                        <Text className="text-zinc-500 text-[10px] font-bold">✕</Text>
-                      </TouchableOpacity>
+                    <Text className="text-zinc-500 text-[10px] font-black tracking-widest mb-1">
+                      FROM
+                    </Text>
+                    {filterStart ? (
+                      <View className="flex-row items-baseline gap-1">
+                        <Text className="text-sky-400 text-2xl font-black leading-7">
+                          {String(stageNumFromPlace(filterStart)).padStart(3, '0')}
+                        </Text>
+                        <Text
+                          className="text-white text-sm font-medium flex-shrink"
+                          numberOfLines={1}
+                        >
+                          {getFilterDisplayName(filterStart)}
+                        </Text>
+                      </View>
+                    ) : (
+                      <Text className="text-zinc-500 text-sm">Select start stage</Text>
                     )}
                   </TouchableOpacity>
-                  {/* End */}
+
+                  <View className="w-10 items-center justify-center border-x border-zinc-700">
+                    <ArrowRight size={14} color="#71717a" />
+                  </View>
+
+                  {/* TO */}
                   <TouchableOpacity
-                    className="flex-row items-center gap-3 px-4 py-3"
-                    onPress={() => { setShowFilterEndDrop(v => !v); setShowFilterStartDrop(false); }}
+                    className={`flex-1 px-3 py-3 ${showFilterEndDrop ? 'bg-zinc-800/60' : ''}`}
+                    onPress={() => {
+                      setShowFilterEndDrop(v => !v);
+                      setShowFilterStartDrop(false);
+                    }}
                     activeOpacity={0.8}
                   >
-                    <View className="w-6 h-6 rounded-full bg-violet-500/20 items-center justify-center">
-                      <Navigation size={11} color="#a78bfa" />
-                    </View>
-                    <View className="flex-1">
-                      <Text className="text-zinc-500 text-[9px] font-black tracking-widest">TO STAGE</Text>
-                      <Text className={`text-sm font-bold ${filterEnd ? 'text-white' : 'text-zinc-500'}`}>
-                        {filterEnd ? getFilterDisplayName(filterEnd) : 'Select end stage'}
-                      </Text>
-                    </View>
-                    {filterEnd && (
-                      <TouchableOpacity onPress={() => setFilterEnd(null)} className="px-2 py-1 rounded-lg bg-zinc-700">
-                        <Text className="text-zinc-500 text-[10px] font-bold">✕</Text>
-                      </TouchableOpacity>
+                    <Text className="text-zinc-500 text-[10px] font-black tracking-widest mb-1">
+                      TO
+                    </Text>
+                    {filterEnd ? (
+                      <View className="flex-row items-baseline gap-1">
+                        <Text className="text-violet-400 text-2xl font-black leading-7">
+                          {String(stageNumFromPlace(filterEnd)).padStart(3, '0')}
+                        </Text>
+                        <Text
+                          className="text-white text-sm font-medium flex-shrink"
+                          numberOfLines={1}
+                        >
+                          {getFilterDisplayName(filterEnd)}
+                        </Text>
+                      </View>
+                    ) : (
+                      <Text className="text-zinc-500 text-sm">Select end stage</Text>
                     )}
                   </TouchableOpacity>
                 </View>
@@ -920,7 +1398,7 @@ const posTix = (posHook?.tickets ?? []).filter(
                 {showFilterStartDrop && (
                   <View className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden mb-3">
                     <View className="flex-row flex-wrap">
-                      {getFilterPlaces().map((p, idx) => {
+                      {filterPlaces.map((p, idx) => {
                         const isSel = filterStart?.key === p.key;
                         const isDis = filterEnd?.key === p.key;
                         const isNotLastInRow = (idx + 1) % 3 !== 0;
@@ -958,7 +1436,7 @@ const posTix = (posHook?.tickets ?? []).filter(
                 {showFilterEndDrop && (
                   <View className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden mb-3">
                     <View className="flex-row flex-wrap">
-                      {getFilterPlaces().map((p, idx) => {
+                      {filterPlaces.map((p, idx) => {
                         const isSel = filterEnd?.key === p.key;
                         const isDis = filterStart?.key === p.key;
                         const isNotLastInRow = (idx + 1) % 3 !== 0;
@@ -992,47 +1470,122 @@ const posTix = (posHook?.tickets ?? []).filter(
                   </View>
                 )}
 
-                {/* Filtered result */}
-                {filteredStageRows && (
-                  filteredStageRows.length > 0 ? (
-                    <View>
-                      <View className="flex-row items-center gap-2 mb-1">
-                        <Text className="text-violet-400 text-[10px] font-black tracking-widest">
-                          FILTERED: {getFilterDisplayName(filterStart)} → {getFilterDisplayName(filterEnd)}
+              </View>
+            </View>
+          )}
+
+          {/* Filtered table (bottom) */}
+          {tableTab === 'filtered' && (
+            <View className="px-4 pb-3">
+              {filteredStageRows ? (
+                filteredStageRows.length > 0 ? (
+                  <>
+                    <View className="flex-row items-center justify-between gap-2 mb-3">
+                      <View className="flex-[0.8] bg-violet-500/10 border border-violet-500/20 rounded-xl px-3 py-2">
+                        <Text className="text-zinc-400 text-[10px] font-bold uppercase">Tickets</Text>
+                        <Text className="text-white text-lg font-black">
+                          {filteredStageRows.reduce((s, r) => s + r.f + r.h + r.l, 0)}
                         </Text>
                       </View>
-                      <StageTable rows={filteredStageRows} />
-                      <View className="flex-row justify-between items-center bg-violet-500/10 border border-violet-500/20 rounded-xl px-4 py-3 mt-3">
-                        <Text className="text-zinc-300 text-sm font-bold">RANGE TOTAL</Text>
-                        <Text className="text-violet-400 text-xl font-black">
+                      <View className="flex-[0.8] bg-sky-500/10 border border-sky-500/20 rounded-xl px-3 py-2">
+                        <Text className="text-zinc-400 text-[10px] font-bold uppercase">Collection</Text>
+                        <Text className="text-sky-400 text-lg font-black">
                           ₹{filteredStageRows.reduce((s, r) => s + r.amt, 0).toFixed(2)}
                         </Text>
                       </View>
+                      <TouchableOpacity
+                        className="flex-1 flex-row items-center justify-center gap-1.5 bg-sky-500 rounded-xl px-4 py-3"
+                        activeOpacity={0.8}
+                        onPress={handlePrintTripSheet}
+                      >
+                        <Download size={14} color="#fff" />
+                        <Text className="text-white text-xs font-bold">Print</Text>
+                      </TouchableOpacity>
                     </View>
-                  ) : (
-                    <View className="items-center py-6 gap-1">
-                      <Text className="text-zinc-500 text-sm font-semibold">No tickets in this range</Text>
-                    </View>
-                  )
-                )}
-              </View>
-            )}
-          </View>
-
-          {/* Print button */}
-          <TouchableOpacity
-            className="mx-4 mb-4 flex-row items-center justify-center gap-2 bg-sky-500 rounded-xl py-3.5"
-            activeOpacity={0.8}
-            onPress={handlePrintTripSheet}
-          >
-            <Download size={16} color="#fff" />
-            <Text className="text-white text-sm font-bold">
-              Print Trip Sheet
-            </Text>
-          </TouchableOpacity>
+                    <StageTable rows={filteredStageRows} />
+                  </>
+                ) : (
+                  <View className="items-center py-6 gap-1">
+                    <Text className="text-zinc-500 text-sm font-semibold">No tickets in this range</Text>
+                  </View>
+                )
+              ) : (
+                <View className="items-center py-6 gap-1">
+                  <Text className="text-zinc-500 text-sm font-semibold">
+                    Select a stage range to view filtered table
+                  </Text>
+                </View>
+              )}
+            </View>
+          )}
         </View>
       )}
     </ScrollView>
+
+    {/* ── Print Preview Modal (Testing Mode) ── */}
+    <Modal
+      visible={showPrintModal}
+      transparent
+      animationType="slide"
+      onRequestClose={() => setShowPrintModal(false)}
+    >
+      <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.80)', justifyContent: 'center', alignItems: 'center', padding: 16 }}>
+        <View style={{ backgroundColor: '#18181b', borderRadius: 20, padding: 20, width: '100%', maxWidth: 380, borderWidth: 1, borderColor: '#3f3f46', maxHeight: '90%' }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '800' }}>Print ---Preview</Text>
+            <TouchableOpacity onPress={() => setShowPrintModal(false)}>
+              <Text style={{ color: '#38bdf8', fontWeight: '700', fontSize: 14 }}>Close</Text>
+            </TouchableOpacity>
+          </View>
+          <ScrollView showsVerticalScrollIndicator={false}>
+            {printModalData && (
+              <View style={{ backgroundColor: '#fff', borderRadius: 12, padding: 14, marginBottom: 12 }}>
+                <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 15, marginBottom: 4 }}>SPS TRANSPORT</Text>
+                <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 17, marginBottom: 6 }}>{printModalData.title}</Text>
+                <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginBottom: 6 }}>{'--------------------------------'}</Text>
+                {printModalData.filterLabel && (
+                  <Text style={{ color: '#000', textAlign: 'center', fontSize: 10, fontWeight: '700', marginBottom: 2 }}>{printModalData.filterLabel}</Text>
+                )}
+                <Text style={{ color: '#000', textAlign: 'center', fontSize: 12, marginBottom: 2 }}>BUS: {printModalData.busNo}  TRIP #: {printModalData.tripNum}</Text>
+                <Text style={{ color: '#000', textAlign: 'center', fontSize: 12, marginBottom: 2 }}>WB: {printModalData.wayBill}</Text>
+                <Text style={{ color: '#000', textAlign: 'center', fontSize: 12, marginBottom: 6 }}>{printModalData.dateStr}  {printModalData.timeStr}</Text>
+                <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginBottom: 4 }}>{'- - - - - - - - - - - - - - - -'}</Text>
+                {/* Stage rows header */}
+                <View style={{ flexDirection: 'row', marginBottom: 2 }}>
+                  {['SS','ES','F','H','L','P','AMT'].map((h, i) => (
+                    <Text key={i} style={{ flex: i === 6 ? 2 : 1, textAlign: i === 6 ? 'right' : 'center', fontSize: 10, fontWeight: '800', color: '#333' }}>{h}</Text>
+                  ))}
+                </View>
+                <Text style={{ color: '#aaa', textAlign: 'center', fontSize: 10, marginBottom: 2 }}>{'- - - - - - - - - - - - - - - -'}</Text>
+                {(printModalData.stageRows ?? []).map((r, i) => (
+                  <View key={i} style={{ flexDirection: 'row', marginBottom: 1 }}>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#111', fontWeight: '700' }}>{r.ss}</Text>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#111', fontWeight: '700' }}>{r.es}</Text>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#333' }}>{r.f > 0 ? r.f : '—'}</Text>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#333' }}>{r.h > 0 ? r.h : '—'}</Text>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#333' }}>{r.l > 0 ? r.l : '0'}</Text>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#333' }}>0</Text>
+                    <Text style={{ flex: 2, textAlign: 'right', fontSize: 10, color: '#0369a1', fontWeight: '700' }}>₹{Number(r.amt).toFixed(0)}</Text>
+                  </View>
+                ))}
+                <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginTop: 4, marginBottom: 4 }}>{'- - - - - - - - - - - - - - - -'}</Text>
+                <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 13, marginBottom: 2 }}>FULL : {printModalData.grandFull}</Text>
+                <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginBottom: 4 }}>{'--------------------------------'}</Text>
+                <Text style={{ color: '#000', fontWeight: '800', fontSize: 14, marginBottom: 1 }}>TRIP.COLL:  ₹{Number(printModalData.grandCollection).toFixed(2)}</Text>
+                <Text style={{ color: '#000', fontWeight: '800', fontSize: 14 }}>TOT.COLL:   ₹{Number(printModalData.combinedTotal).toFixed(2)}</Text>
+              </View>
+            )}
+          </ScrollView>
+          <TouchableOpacity
+            style={{ backgroundColor: '#0ea5e9', borderRadius: 12, paddingVertical: 12, alignItems: 'center', marginTop: 4 }}
+            onPress={() => setShowPrintModal(false)}
+          >
+            <Text style={{ color: '#fff', fontWeight: '800', fontSize: 14 }}>OK</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+    </>
   );
 };
 
@@ -1044,6 +1597,8 @@ const StatusReportTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
   const [showDestDrop, setShowDestDrop] = useState(false);
   const [filtering, setFiltering] = useState(false);
   const [filteredData, setFilteredData] = useState(null);
+  const [showStatusModal, setShowStatusModal] = useState(false);
+  const [statusModalData, setStatusModalData] = useState(null);
 
 const STORAGE_KEY_DEST = 'report_dest_place';
   const STORAGE_KEY_OVERRIDE_START = 'report_override_start_place';
@@ -1082,66 +1637,33 @@ useEffect(() => {
     } else {
       setFilteredData(null);
     }
-  }, [selStart, selDest]);
+  }, [selStart, filterTickets, selDest]);
 
   const filterTickets = useCallback(async () => {
     if (!selStart || !selDest) return;
     setFiltering(true);
     try {
-      const recentTrips = dashboard?.recent_trips ?? [];
       const at = dashboard?.active_trip;
-      const todayStr = new Date().toDateString();
-      // ← ADD THIS
-      console.log('[DEBUG] dashboard active_trip:', at);
-      console.log(
-        '[DEBUG] recentTrips:',
-        recentTrips.map(t => ({ id: t.trip_id, start: t.start_time })),
-      );
-      console.log('[DEBUG] todayStr:', todayStr);
-      const todayTripIds = [
-        ...(at?.trip_id ? [at.trip_id] : []),
-        ...recentTrips
-          .filter(t => {
-            if (!t.start_time) return false;
-            // Convert UTC to local time before comparing date string
-            const localDate = new Date(t.start_time).toLocaleDateString(
-              'en-IN',
-              {
-                timeZone: 'Asia/Kolkata',
-                year: 'numeric',
-                month: 'short',
-                day: 'numeric',
-              },
-            );
-            const todayLocal = new Date().toLocaleDateString('en-IN', {
-              timeZone: 'Asia/Kolkata',
-              year: 'numeric',
-              month: 'short',
-              day: 'numeric',
-            });
-            return localDate === todayLocal;
-          })
-          .map(t => t.trip_id),
-      ];
-      const uniqueTripIds = [...new Set(todayTripIds)];
-      console.log('[DEBUG] uniqueTripIds:', uniqueTripIds);
-      // Fetch all app tickets for today's trips from supabase directly
+      // Status Report shows on-board passengers for the active trip only.
+      // Fall back to the most recent trip if no trip is currently active.
+      const activeTripId =
+        at?.trip_id ?? (dashboard?.recent_trips?.[0]?.trip_id ?? null);
+      if (!activeTripId) {
+        setFilteredData(null);
+        setFiltering(false);
+        return;
+      }
+      // Fetch app tickets for the active trip only
       let allAppRows = [];
-      if (uniqueTripIds.length > 0) {
+      {
         const { data: rows, error } = await supabase
           .from('tickets')
           .select(
             'ticket_type,payment_method,ticket_count,total_fare,fare,from_stop_id,to_stop_id',
           )
-          .in('trip_id', uniqueTripIds)
+          .eq('trip_id', activeTripId)
           .neq('payment_method', 'pos');
 
-        console.log('[DEBUG] supabase tickets query error:', error);
-        console.log('[DEBUG] supabase tickets raw rows count:', rows?.length);
-        console.log(
-          '[DEBUG] supabase tickets sample payment_methods:',
-          rows?.slice(0, 5).map(r => r.payment_method),
-        );
         if (!error && rows) {
           // Resolve stop names
           const stopIds = [
@@ -1180,9 +1702,9 @@ useEffect(() => {
         }
       }
 
-      // Get POS tickets for today's trips
+      // Get POS tickets for the active trip only
       const allPosTix = (posHook?.tickets ?? []).filter(t =>
-        uniqueTripIds.includes(t.trip_id),
+        t.trip_id === activeTripId,
       );
 
       // Match selected place labels to stop names
@@ -1279,7 +1801,7 @@ useEffect(() => {
     } finally {
       setFiltering(false);
     }
-}, [selStart, selDest, dashboard, posHook, autoStart]);
+}, [selStart, selDest, dashboard, posHook, autoStart,overrideStart]);
 
   const getPlaces = () =>
     isDownDirection(tripDir) ? [...places].reverse() : places;
@@ -1291,12 +1813,26 @@ useEffect(() => {
   };
 
   const handlePrintStatusReport = async () => {
-    if (Platform.OS !== 'android' || !NyxPrinter) {
-      Alert.alert('Not supported', 'Printing is only available on Android.');
-      return;
-    }
     if (!filteredData || filteredData.stageRows.length === 0) {
       Alert.alert('No data', 'No report data to print.');
+      return;
+    }
+
+    const testingMode = await AsyncStorage.getItem('testing_mode');
+    const isTestingMode = testingMode === 'true';
+
+    if (isTestingMode) {
+      setStatusModalData({
+        stageRows: filteredData.stageRows,
+        grandFull: filteredData.grandFull,
+        grandCollection: filteredData.grandCollection,
+      });
+      setShowStatusModal(true);
+      return;
+    }
+
+    if (Platform.OS !== 'android' || !NyxPrinter) {
+      Alert.alert('Not supported', 'Printing is only available on Android.');
       return;
     }
     try {
@@ -1354,6 +1890,7 @@ useEffect(() => {
   };
 
   return (
+    <>
     <ScrollView
       className="flex-1"
       contentContainerStyle={{ padding: 16, paddingBottom: 40 }}
@@ -1369,53 +1906,51 @@ useEffect(() => {
     >
      <Text className="text-zinc-500 text-[10px] font-bold tracking-widest mb-3">SELECT END PLACE</Text>
 
-      {/* Route bar — start (auto/override) → end (user picks) */}
-      <View className="bg-zinc-900 rounded-2xl border border-zinc-800 mb-4 overflow-hidden">
-
-        {/* Start place — tap to override */}
+      {/* Route bar — FROM 30% / TO 70% */}
+      <View className="flex-row gap-2 mb-4">
+        {/* Start place — 30% */}
         <TouchableOpacity
-          className="flex-row items-center gap-3 px-4 py-3 border-b border-zinc-800/60"
+          style={{ flex: 3 }}
+          className="bg-zinc-900 rounded-2xl border border-zinc-800 px-3 py-3"
           onPress={() => { setShowStartDrop(!showStartDrop); setShowDestDrop(false); }}
           activeOpacity={0.8}
         >
-          <View className="w-7 h-7 rounded-full bg-zinc-800 items-center justify-center">
-            <Navigation size={13} color="#71717a" />
-          </View>
-          <View className="flex-1">
-            <Text className="text-zinc-500 text-[9px] font-black tracking-widest">
-              FROM {overrideStart ? '(CUSTOM)' : '(AUTO)'}
-            </Text>
-            <Text className="text-zinc-400 text-sm font-bold" numberOfLines={1}>
-              {getDisplayName(selStart)}
+          <View className="flex-row items-center gap-2 mb-1">
+            <View className="w-6 h-6 rounded-full bg-zinc-800 items-center justify-center">
+              <Navigation size={12} color="#71717a" />
+            </View>
+            <Text className="text-zinc-500 text-[9px] font-black tracking-widest" numberOfLines={1}>
+              FROM
             </Text>
           </View>
+          <Text className="text-zinc-300 text-sm font-bold" numberOfLines={1}>
+            {getDisplayName(selStart)}
+          </Text>
           {overrideStart && (
-            <TouchableOpacity
-              onPress={(e) => { e.stopPropagation(); setOverrideStart(null); AsyncStorage.removeItem(STORAGE_KEY_OVERRIDE_START); }}
-              className="px-2 py-1 rounded-lg bg-zinc-800"
-            >
-              <Text className="text-zinc-500 text-[10px] font-bold">RESET</Text>
-            </TouchableOpacity>
+            <Text className="text-zinc-500 text-[9px] font-bold mt-1">CUSTOM</Text>
           )}
         </TouchableOpacity>
 
-        {/* End place — primary control */}
+        {/* End place — 70% */}
         <TouchableOpacity
-          className="flex-row items-center gap-3 px-4 py-3"
+          style={{ flex: 7 }}
+          className="bg-sky-500/15 rounded-2xl border border-sky-500/40 px-4 py-3"
           onPress={() => { setShowDestDrop(!showDestDrop); setShowStartDrop(false); }}
           activeOpacity={0.8}
         >
-          <View className="w-7 h-7 rounded-full bg-sky-500/20 items-center justify-center">
-            <Navigation size={13} color="#0ea5e9" />
+          <View className="flex-row items-center gap-2 mb-1">
+            <View className="w-6 h-6 rounded-full bg-sky-500/30 items-center justify-center">
+              <Navigation size={12} color="#38bdf8" />
+            </View>
+            <Text className="text-sky-300 text-[9px] font-black tracking-widest">TO (TAP TO CHANGE)</Text>
           </View>
-          <View className="flex-1">
-            <Text className="text-zinc-500 text-[9px] font-black tracking-widest">TO (TAP TO CHANGE)</Text>
-            <Text className={`text-sm font-bold ${selDest ? 'text-white' : 'text-zinc-500'}`} numberOfLines={1}>
+          <View className="flex-row items-center justify-between">
+            <Text className={`text-sm font-bold ${selDest ? 'text-white' : 'text-sky-200/80'}`} numberOfLines={1}>
               {selDest ? getDisplayName(selDest) : 'Select end place'}
             </Text>
-          </View>
-          <View className="w-6 h-6 rounded-full bg-sky-500/20 items-center justify-center">
-            <ArrowRight size={12} color="#0ea5e9" />
+            <View className="w-6 h-6 rounded-full bg-sky-500/30 items-center justify-center ml-2">
+              <ArrowRight size={12} color="#0ea5e9" />
+            </View>
           </View>
         </TouchableOpacity>
       </View>
@@ -1580,6 +2115,62 @@ useEffect(() => {
         </View>
       )}
     </ScrollView>
+
+    {/* ── Status Report Preview Modal (Testing Mode) ── */}
+    <Modal
+      visible={showStatusModal}
+      transparent
+      animationType="slide"
+      onRequestClose={() => setShowStatusModal(false)}
+    >
+      <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.80)', justifyContent: 'center', alignItems: 'center', padding: 16 }}>
+        <View style={{ backgroundColor: '#18181b', borderRadius: 20, padding: 20, width: '100%', maxWidth: 380, borderWidth: 1, borderColor: '#3f3f46', maxHeight: '90%' }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '800' }}>Print Preview</Text>
+            <TouchableOpacity onPress={() => setShowStatusModal(false)}>
+              <Text style={{ color: '#38bdf8', fontWeight: '700', fontSize: 14 }}>Close</Text>
+            </TouchableOpacity>
+          </View>
+          <ScrollView showsVerticalScrollIndicator={false}>
+            {statusModalData && (
+              <View style={{ backgroundColor: '#fff', borderRadius: 12, padding: 14, marginBottom: 12 }}>
+                <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 15, marginBottom: 4 }}>SPS TRANSPORT</Text>
+                <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 17, marginBottom: 6 }}>STATUS REPORT</Text>
+                <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginBottom: 6 }}>{'--------------------------------'}</Text>
+                <View style={{ flexDirection: 'row', marginBottom: 2 }}>
+                  {['SS','ES','F','H','L','P','AMT'].map((h, i) => (
+                    <Text key={i} style={{ flex: i === 6 ? 2 : 1, textAlign: i === 6 ? 'right' : 'center', fontSize: 10, fontWeight: '800', color: '#333' }}>{h}</Text>
+                  ))}
+                </View>
+                <Text style={{ color: '#aaa', textAlign: 'center', fontSize: 10, marginBottom: 2 }}>{'- - - - - - - - - - - - - - - -'}</Text>
+                {(statusModalData.stageRows ?? []).map((r, i) => (
+                  <View key={i} style={{ flexDirection: 'row', marginBottom: 1 }}>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#111', fontWeight: '700' }}>{r.ss}</Text>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#111', fontWeight: '700' }}>{r.es}</Text>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#333' }}>{r.f > 0 ? r.f : '—'}</Text>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#333' }}>{r.h > 0 ? r.h : '—'}</Text>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#333' }}>{r.l > 0 ? r.l : '0'}</Text>
+                    <Text style={{ flex: 1, textAlign: 'center', fontSize: 10, color: '#333' }}>0</Text>
+                    <Text style={{ flex: 2, textAlign: 'right', fontSize: 10, color: '#0369a1', fontWeight: '700' }}>₹{Number(r.amt).toFixed(0)}</Text>
+                  </View>
+                ))}
+                <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginTop: 4, marginBottom: 4 }}>{'- - - - - - - - - - - - - - - -'}</Text>
+                <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 13, marginBottom: 2 }}>FULL : {statusModalData.grandFull}</Text>
+                <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginBottom: 4 }}>{'--------------------------------'}</Text>
+                <Text style={{ color: '#000', fontWeight: '800', fontSize: 14 }}>TOT.COLL:   ₹{Number(statusModalData.grandCollection).toFixed(2)}</Text>
+              </View>
+            )}
+          </ScrollView>
+          <TouchableOpacity
+            style={{ backgroundColor: '#0ea5e9', borderRadius: 12, paddingVertical: 12, alignItems: 'center', marginTop: 4 }}
+            onPress={() => setShowStatusModal(false)}
+          >
+            <Text style={{ color: '#fff', fontWeight: '800', fontSize: 14 }}>OK</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+    </>
   );
 };
 // ─── Collection Report Tab ────────────────────────────────────────────────────
@@ -2015,8 +2606,10 @@ const ReportScreen = () => {
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const posHook = usePOSTickets();
+  const [reportCutoffIso, setReportCutoffIso] = useState(null);
+  const { posHook } = useTripContext();
   const indicatorAnim = useRef(new Animated.Value(0)).current;
+  const fetchingDashboardRef = useRef(false);
 
   const TABS = [
     { key: 'tripsheet', label: 'Trip Sheet', Icon: Receipt },
@@ -2024,24 +2617,39 @@ const ReportScreen = () => {
     { key: 'collection', label: 'Coll. Report', Icon: DollarSign },
   ];
 
-  const fetchDashboard = useCallback(async (quiet = false) => {
-    if (!quiet) setLoading(true);
-    else setRefreshing(true);
+  const fetchDashboard = useCallback(async ({ showLoader = false, showRefresh = false } = {}) => {
+    if (fetchingDashboardRef.current) return;
+    fetchingDashboardRef.current = true;
+    if (showLoader) setLoading(true);
+    if (showRefresh) setRefreshing(true);
     try {
-      const r = await api.get('/conductor/dashboard');
-      setDashboard(r.data);
+      const cutoffIso = await AsyncStorage.getItem(RESET_REPORT_CUTOFF_KEY);
+      setReportCutoffIso(cutoffIso);
+      const raw = await fetchDashboardFromSupabase();
+      const filteredRecentTrips = (raw.recent_trips ?? []).filter(t =>
+        isOnOrAfterCutoff(t?.start_time, cutoffIso),
+      );
+      const filteredActiveTrip = isOnOrAfterCutoff(raw.active_trip?.start_time, cutoffIso)
+        ? raw.active_trip
+        : null;
+      setDashboard({
+        ...raw,
+        active_trip: filteredActiveTrip,
+        recent_trips: filteredRecentTrips,
+      });
     } catch (e) {
       console.error('[ReportScreen] dashboard fetch failed', e);
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      fetchingDashboardRef.current = false;
+      if (showLoader) setLoading(false);
+      if (showRefresh) setRefreshing(false);
     }
   }, []);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      await fetchDashboard(true);
+      await fetchDashboard({ showRefresh: true });
       await posHook.reload?.();
     } catch (e) {
       console.error('[ReportScreen] Refresh failed:', e);
@@ -2051,14 +2659,15 @@ const ReportScreen = () => {
   }, [fetchDashboard, posHook]);
 
   useEffect(() => {
-    fetchDashboard();
-  }, []);
+    fetchDashboard({ showLoader: true });
+  }, [fetchDashboard]);
 
   // Reload POS tickets when screen comes into focus
   useFocusEffect(
     useCallback(() => {
+      fetchDashboard();
       posHook.reload?.();
-    }, [posHook]),
+    }, [fetchDashboard, posHook]),
   );
 
   // Animate tab indicator
@@ -2082,7 +2691,7 @@ const ReportScreen = () => {
     const todayTrips = [
       ...(dashboard.active_trip?.trip_id ? [dashboard.active_trip] : []),
       ...(dashboard.recent_trips ?? []),
-    ];
+    ].filter(t => isOnOrAfterCutoff(t?.start_time, reportCutoffIso));
     const todayStr = new Date().toLocaleDateString('en-IN', {
       timeZone: 'Asia/Kolkata',
       year: 'numeric',
@@ -2112,7 +2721,7 @@ const ReportScreen = () => {
         if (error || !data) { setTodayAppCount(0); return; }
         setTodayAppCount(data.reduce((s, r) => s + Number(r.ticket_count ?? 1), 0));
       });
-  }, [dashboard]);
+  }, [dashboard, reportCutoffIso]);
 
   if (loading) {
     return (
@@ -2141,7 +2750,7 @@ const ReportScreen = () => {
           </Text>
         </View>
         <TouchableOpacity
-          onPress={() => fetchDashboard(true)}
+          onPress={onRefresh}
           disabled={refreshing}
           className="w-9 h-9 rounded-full bg-zinc-900 border border-zinc-800 items-center justify-center"
         >
@@ -2196,7 +2805,7 @@ const ReportScreen = () => {
       </View>
 
       {/* ── Tab bar ── */}
-      <View className="mx-4 mb-2 bg-zinc-900 rounded-2xl p-1 flex-row border border-zinc-800">
+      <View className="mx-4 mb-2 bg-zinc-900/95 gap-2 rounded-2xl p-1.5 flex-row border border-zinc-700">
         {TABS.map((tab, i) => {
           const isActive = activeTab === tab.key;
           return (
@@ -2204,14 +2813,14 @@ const ReportScreen = () => {
               key={tab.key}
               onPress={() => setActiveTab(tab.key)}
               activeOpacity={0.8}
-              className={`flex-1 flex-row items-center justify-center gap-2 py-2.5 rounded-xl ${
-                isActive ? 'bg-sky-500' : ''
+              className={`flex-1 flex-row items-center justify-center gap-2 py-3 rounded-xl border ${
+                isActive ? 'bg-sky-500 border-sky-300' : 'bg-zinc-800/80 border-zinc-700'
               }`}
             >
-              <tab.Icon size={14} color={isActive ? '#fff' : '#71717a'} />
+              {/* <tab.Icon size={16} color={isActive ? '#ffffff' : '#d4d4d8'} /> */}
               <Text
-                className={`text-sm font-bold ${
-                  isActive ? 'text-white' : 'text-zinc-500'
+                className={`text-[12px] font-black tracking-wide ${
+                  isActive ? 'text-white' : 'text-zinc-200'
                 }`}
               >
                 {tab.label}
