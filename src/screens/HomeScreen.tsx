@@ -7,7 +7,7 @@ import {
 import {SafeAreaView} from 'react-native-safe-area-context';
 import {
   ArrowUpDown, Minus, Plus, Play,
-  Bus, AlertCircle, Download, MapPin, CloudOff, WifiOff,
+  Bus, AlertCircle, Download, CloudOff, WifiOff, Bell,
 } from 'lucide-react-native';
 import {getRandomFortune} from '../utils/fortune';
 import {places} from '../utils/places';
@@ -17,6 +17,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 
 import { useTripContext } from '../context/TripContext';
+import { useVerificationRealtime } from '../hooks/useVerificationRealtime';
+import { useNavigation } from '@react-navigation/native';
 
 let NyxPrinter = null;
 let PrinterStatus = null;
@@ -1163,6 +1165,29 @@ const StartTripHome = ({ onStarted }: { onStarted: (trip: any) => void }) => {
   );
 };
 
+// ─── Pending Verify Banner ───────────────────────────────────────────────────
+const PendingVerifyBanner = ({ tripId, tripStatus }: { tripId: string | null; tripStatus: string | null }) => {
+  const { pendingRequests } = useVerificationRealtime(tripId, tripStatus);
+  const navigation = useNavigation<any>();
+
+  if (!pendingRequests.length) return null;
+
+  return (
+    <TouchableOpacity
+      onPress={() => navigation.navigate('Trip')}
+      activeOpacity={0.8}
+      className="flex-row items-center gap-2 bg-amber-950/60 border-b border-amber-500/30 px-4 py-2.5"
+    >
+      <Bell size={13} color="#f59e0b" />
+      <View className="w-5 h-5 rounded-full bg-amber-500 items-center justify-center">
+        <Text className="text-black text-[10px] font-black">{pendingRequests.length}</Text>
+      </View>
+      <Text className="text-amber-400 text-xs font-semibold flex-1">pending verification</Text>
+      <Text className="text-amber-600 text-xs font-bold">Go →</Text>
+    </TouchableOpacity>
+  );
+};
+
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 export default function HomeScreen() {
   const { activeTrip, setActiveTrip, busNumber, setBusNumber, tripNumber, setTripNumber, posHook } = useTripContext();
@@ -1346,6 +1371,7 @@ export default function HomeScreen() {
 
   return (
     <SafeAreaView className="flex-1 bg-black">
+      <PendingVerifyBanner tripId={activeTrip?.trip_id ?? null} tripStatus={activeTrip?.status ?? null} />
       <TicketTab
         activeTrip={activeTrip}
         busNumber={selectedBus?.bus_number ?? busNumber}

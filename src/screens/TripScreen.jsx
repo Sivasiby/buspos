@@ -1,20 +1,21 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  Text, TouchableOpacity, View, ScrollView,
+  Text, TouchableOpacity, View, ScrollView, Image,
   Platform, Alert, ActivityIndicator, ToastAndroid, RefreshControl,
-  Animated, Modal, TextInput,
+  Animated, Modal, TextInput, PanResponder, Dimensions,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
-  Bus, Play, Pause, Square,
-  UserCheck, CheckCircle, Clock, Timer, ArrowLeftRight, FileText,
-  X, Bell, AlertCircle,
+  Bus, Play, Square,
+  Clock, Timer, ArrowLeftRight, FileText,
+  Printer,
 } from 'lucide-react-native';
 import { useNavigation } from '@react-navigation/native';
 import { supabase } from '../../lib/supabase';
 import { useVerificationRealtime } from '../hooks/useVerificationRealtime';
 import { useTripContext } from '../context/TripContext';
+import { getRandomFortune } from '../utils/fortune';
 
 let NyxPrinter = null;
 let PrinterStatus = null;
@@ -40,6 +41,17 @@ const formatDuration = (start) => {
   if (!start) return '—';
   const mins = Math.round((Date.now() - new Date(start).getTime()) / 60000);
   return mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
+};
+
+const relativeTime = (iso) => {
+  if (!iso) return '';
+  const secs = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (secs < 15) return 'just now';
+  if (secs < 60) return `${secs}s ago`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  return `${hrs}h ago`;
 };
 
 const normalizeDir = (d) => (d ?? '').toString().trim().toLowerCase();
@@ -244,73 +256,144 @@ const BlockingOverlay = ({ message }) => (
 );
 
 // ─── Pending Verify Row ───────────────────────────────────────────────────────
-const PendingVerifyRow = ({ item, onVerify, onDismiss, verifying }) => {
-  const pulse = useRef(new Animated.Value(1)).current;
+const SCREEN_W = Dimensions.get('window').width;
+const SWIPE_THRESHOLD = SCREEN_W * 0.32;
+
+const PendingVerifyRow = ({ item, onVerify, onDismiss, onPrint, verifying, printing }) => {
+  const translateX  = useRef(new Animated.Value(0)).current;
+  const dragProgress = useRef(new Animated.Value(0)).current; // JS driver only — for color/opacity
+  const entryAnim   = useRef(new Animated.Value(0)).current;
+  const actionLock  = useRef(false);
 
   useEffect(() => {
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulse, { toValue: 0.55, duration: 750, useNativeDriver: true }),
-        Animated.timing(pulse, { toValue: 1,    duration: 750, useNativeDriver: true }),
-      ])
-    );
-    loop.start();
-    return () => loop.stop();
-  }, [pulse]);
+    Animated.spring(entryAnim, { toValue: 1, useNativeDriver: true, tension: 70, friction: 11 }).start();
+    // Keep dragProgress in sync with translateX via listener (JS thread, no driver conflict)
+    const id = translateX.addListener(({ value }) => {
+      dragProgress.setValue(value / SWIPE_THRESHOLD);
+    });
+    return () => translateX.removeListener(id);
+  }, [entryAnim, translateX, dragProgress]);
 
-  const isBusy = verifying === item.ticket_id;
+  const isBusy     = verifying === item.ticket_id;
+  const isPrinting  = printing === item.ticket_id;
+  const isAnyBusy   = isBusy || isPrinting;
+  const fromParsed  = parseStopLabel(item.from);
+  const toParsed    = parseStopLabel(item.to);
+  const fromStage   = fromParsed.tripNum;
+  const toStage     = toParsed.tripNum;
+
+  const flyOut = (toValue, cb) => {
+    Animated.timing(translateX, {
+      toValue,
+      duration: 220,
+      useNativeDriver: true,
+    }).start(() => cb());
+  };
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => !actionLock.current && !isAnyBusy,
+      onMoveShouldSetPanResponder: (_, g) => !actionLock.current && !isAnyBusy && Math.abs(g.dx) > Math.abs(g.dy) && Math.abs(g.dx) > 6,
+      onPanResponderMove: (_, g) => { translateX.setValue(g.dx); },
+      onPanResponderRelease: (_, g) => {
+        if (actionLock.current) return;
+        if (g.dx > SWIPE_THRESHOLD) {
+          actionLock.current = true;
+          flyOut(SCREEN_W, () => onVerify(item.ticket_id));
+        } else if (g.dx < -SWIPE_THRESHOLD) {
+          actionLock.current = true;
+          flyOut(-SCREEN_W, () => onDismiss(item.ticket_id));
+        } else {
+          Animated.spring(translateX, { toValue: 0, useNativeDriver: true, tension: 120, friction: 10 }).start();
+        }
+      },
+      onPanResponderTerminate: () => {
+        Animated.spring(translateX, { toValue: 0, useNativeDriver: true, tension: 120, friction: 10 }).start();
+      },
+    })
+  ).current;
+
+  // All color/opacity interpolations use dragProgress (JS driver — no conflict with native translateX)
+  const verifyOpacity  = dragProgress.interpolate({ inputRange: [0, 1],  outputRange: [0, 1], extrapolate: 'clamp' });
+  const dismissOpacity = dragProgress.interpolate({ inputRange: [-1, 0], outputRange: [1, 0], extrapolate: 'clamp' });
+  const verifyBg       = dragProgress.interpolate({ inputRange: [0, 1],  outputRange: ['rgba(16,185,129,0)', 'rgba(16,185,129,0.18)'], extrapolate: 'clamp' });
+  const dismissBg      = dragProgress.interpolate({ inputRange: [-1, 0], outputRange: ['rgba(239,68,68,0.18)', 'rgba(239,68,68,0)'],   extrapolate: 'clamp' });
 
   return (
-    <Animated.View style={{ opacity: pulse }}>
-      <View className="flex-row items-center justify-between bg-zinc-900 rounded-xl p-3 mb-2 border border-amber-500/30">
-        <View className="flex-row items-center flex-1 mr-3 gap-3">
-          <View className="w-10 h-10 rounded-full bg-amber-500/20 justify-center items-center">
-            <UserCheck size={18} color="#f59e0b" />
-          </View>
-          <View className="flex-1">
-            <View className="flex-row items-center gap-1 flex-wrap">
-              <Text className="text-white text-sm font-bold" numberOfLines={1}>
-                {parseStopLabel(item.from).tamil}
-              </Text>
-              <Text className="text-zinc-500 text-sm">→</Text>
-              <Text className="text-white text-sm font-bold" numberOfLines={1}>
-                {parseStopLabel(item.to).tamil}
-              </Text>
-            </View>
-            <View className="flex-row items-center gap-2 mt-0.5">
-              {(parseStopLabel(item.from).tripNum || parseStopLabel(item.to).tripNum) && (
-                <Text className="text-zinc-600 text-[10px] font-semibold">
-                  {parseStopLabel(item.from).tripNum} → {parseStopLabel(item.to).tripNum}
+    <Animated.View
+      style={{
+        transform: [{ translateY: entryAnim.interpolate({ inputRange: [0, 1], outputRange: [-8, 0] }) }],
+        opacity: entryAnim,
+        marginBottom: 6,
+      }}
+    >
+      <View style={{ borderRadius: 14, overflow: 'hidden', position: 'relative' }}>
+        {/* Green layer (verify – right swipe) */}
+        <Animated.View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: verifyBg, justifyContent: 'center', paddingLeft: 18 }}>
+          <Animated.Text style={{ color: '#10b981', fontSize: 11, fontWeight: '800', letterSpacing: 0.5, opacity: verifyOpacity }}>VERIFY ✓</Animated.Text>
+        </Animated.View>
+        {/* Red layer (dismiss – left swipe) */}
+        <Animated.View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: dismissBg, justifyContent: 'center', alignItems: 'flex-end', paddingRight: 18 }}>
+          <Animated.Text style={{ color: '#ef4444', fontSize: 11, fontWeight: '800', letterSpacing: 0.5, opacity: dismissOpacity }}>DISMISS</Animated.Text>
+        </Animated.View>
+
+        {/* Swipeable card — native driver for translation only */}
+        <Animated.View
+          {...panResponder.panHandlers}
+          style={[
+            { borderRadius: 14, borderWidth: 1, borderColor: 'rgba(255,255,255,0.07)', overflow: 'hidden', backgroundColor: '#111113' },
+            { transform: [{ translateX }] },
+          ]}
+        >
+          <View style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 14, gap: 12 }}>
+
+            {/* Avatar */}
+            {item.avatar_url ? (
+              <Image source={{ uri: item.avatar_url }} style={{ width: 40, height: 40, borderRadius: 20 }} />
+            ) : (
+              <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(245,158,11,0.15)', justifyContent: 'center', alignItems: 'center' }}>
+                <Text style={{ color: '#f59e0b', fontSize: 16, fontWeight: '900' }}>
+                  {item.username ? item.username[0].toUpperCase() : '?'}
                 </Text>
-              )}
-              <Text className="text-zinc-400 text-xs">₹{item.fare ?? item.amount ?? 0}</Text>
-              {item.bus_number ? <Text className="text-zinc-500 text-xs">🚌 {item.bus_number}</Text> : null}
+              </View>
+            )}
+
+            {/* Name + time */}
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }} numberOfLines={1}>
+                {item.username || 'Passenger'}
+              </Text>
+              <Text style={{ color: '#52525b', fontSize: 10, marginTop: 2 }}>
+                {relativeTime(item.requested_at)}
+              </Text>
             </View>
+
+            {/* Stage pill */}
+            {(fromStage || toStage) && (
+              <View style={{ backgroundColor: 'rgba(251,191,36,0.1)', borderRadius: 8, borderWidth: 1, borderColor: 'rgba(251,191,36,0.2)', paddingHorizontal: 8, paddingVertical: 4, alignItems: 'center' }}>
+                <Text style={{ color: '#fbbf24', fontSize: 18, fontWeight: '900', lineHeight: 22 }}>
+                  {fromStage ?? toStage}{fromStage && toStage && fromStage !== toStage ? `→${toStage}` : ''}
+                </Text>
+                <Text style={{ color: '#a16207', fontSize: 9, fontWeight: '600', letterSpacing: 0.3 }}>STAGE</Text>
+              </View>
+            )}
+
+            {/* Fare */}
+            <Text style={{ color: '#fff', fontSize: 14, fontWeight: '800' }}>₹{item.fare ?? 0}</Text>
+
+            {/* Print button only */}
+            <TouchableOpacity
+              style={{ width: 32, height: 32, borderRadius: 9, backgroundColor: isPrinting ? 'rgba(14,165,233,0.3)' : 'rgba(14,165,233,0.15)', borderWidth: 1, borderColor: 'rgba(14,165,233,0.3)', justifyContent: 'center', alignItems: 'center' }}
+              onPress={() => onPrint(item)}
+              disabled={isAnyBusy}
+              activeOpacity={0.75}
+            >
+              {isPrinting ? <ActivityIndicator size="small" color="#38bdf8" /> : <Printer size={13} color="#38bdf8" />}
+            </TouchableOpacity>
+
+            {isBusy && <ActivityIndicator size="small" color="#10b981" style={{ marginLeft: 2 }} />}
           </View>
-        </View>
-        <View className="flex-row items-center gap-2">
-          <TouchableOpacity
-            className={`flex-row items-center gap-1.5 px-3 py-2.5 rounded-xl ${
-              isBusy ? 'bg-emerald-700/50' : 'bg-emerald-600'
-            }`}
-            onPress={() => onVerify(item.ticket_id)}
-            disabled={isBusy}
-            activeOpacity={0.75}
-          >
-            {isBusy
-              ? <ActivityIndicator size="small" color="#fff" />
-              : <><CheckCircle size={14} color="#fff" /><Text className="text-white text-xs font-bold">Verify</Text></>
-            }
-          </TouchableOpacity>
-          <TouchableOpacity
-            className="w-10 h-10 rounded-xl bg-red-500/10 border border-red-500/30 justify-center items-center"
-            onPress={() => onDismiss(item.ticket_id)}
-            disabled={isBusy}
-            activeOpacity={0.75}
-          >
-            <X size={16} color="#ef4444" />
-          </TouchableOpacity>
-        </View>
+        </Animated.View>
       </View>
     </Animated.View>
   );
@@ -567,6 +650,18 @@ const fetchRoutesFromSupabase = async () => {
   return (data ?? []).map(r => ({ id: r.id, name: r.route_name }));
 };
 
+const getNextTicketNumber = async (busId) => {
+  if (!busId) return null;
+  try {
+    const { data, error } = await supabase.rpc('increment_ticket_number', { p_bus_id: busId });
+    if (error) throw error;
+    return typeof data === 'number' ? data : null;
+  } catch (e) {
+    console.warn('[TicketNum] RPC failed:', e);
+    return null;
+  }
+};
+
 // ─── Main Screen ──────────────────────────────────────────────────────────────
 const TripScreen = () => {
   const navigation = useNavigation();
@@ -578,8 +673,7 @@ const TripScreen = () => {
   const [startingReturn, setStartingReturn] = useState(false);
   const [routes, setRoutes] = useState([]);
   const [verifyingTicket, setVerifyingTicket] = useState(null);
-  const [showVerification, setShowVerification] = useState(true);
-  const prevVerifyCountRef = useRef(0);
+  const prevVerifyCountRef = useRef(new Set());
   const [ticketRefreshKey, setTicketRefreshKey] = useState(0);
   const [appOnlyTickets, setAppOnlyTickets] = useState(0);
   const [appOnlyFare, setAppOnlyFare] = useState(0);
@@ -598,6 +692,10 @@ const TripScreen = () => {
   const [reportData, setReportData] = useState(null);
   const [splitAtAnnur] = useState(true);
 
+  const [showTicketModal, setShowTicketModal] = useState(false);
+  const [ticketData, setTicketData] = useState(null);
+  const [printingTicket, setPrintingTicket] = useState(null);
+
   const at = dashboard?.active_trip;
 
   const { pendingRequests, clearTicket, dismissTicket } = useVerificationRealtime(at?.trip_id, at?.status);
@@ -610,11 +708,9 @@ const TripScreen = () => {
   useEffect(() => { fetchDashboard(); }, []);
 
   useEffect(() => {
-    if (pendingRequests.length > 0 && prevVerifyCountRef.current === 0) {
-      setShowVerification(true);
-    }
-    prevVerifyCountRef.current = pendingRequests.length;
-  }, [pendingRequests.length]);
+    const currentIds = new Set(pendingRequests.map(r => r.ticket_id));
+    prevVerifyCountRef.current = currentIds;
+  }, [pendingRequests]);
 
   useEffect(() => {
     fetchRoutesFromSupabase().then(r => setRoutes(r)).catch(() => {});
@@ -1211,6 +1307,97 @@ const TripScreen = () => {
     }
   };
 
+  const handlePrintVerification = async (item) => {
+    setPrintingTicket(item.ticket_id);
+    try {
+      const testingMode = await AsyncStorage.getItem('testing_mode');
+      const isTestingMode = testingMode === 'true';
+
+      if (!isTestingMode) {
+        if (Platform.OS !== 'android' || !NyxPrinter) {
+          Alert.alert('Not supported', 'Printing is only available on Android.');
+          return;
+        }
+        const statusRet = await NyxPrinter.getPrinterStatus();
+        if (statusRet !== PrinterStatus.SDK_OK) {
+          Alert.alert('Printer Error', PrinterStatus.msg(statusRet));
+          return;
+        }
+      }
+
+      const storedBusRaw = await AsyncStorage.getItem('selected_bus');
+      const storedBus = storedBusRaw ? JSON.parse(storedBusRaw) : null;
+      const busId = storedBus?.id ?? at?.bus_id ?? null;
+
+      const ticketNum = await getNextTicketNumber(busId);
+
+      const now = new Date();
+      const dp = now.toLocaleDateString('en-GB').replace(/\//g, '-');
+      const tp = now.toLocaleTimeString('en-GB', { hour12: false });
+      const fortune = getRandomFortune();
+      const busNum = dashboard?.bus?.vehicle_number ?? storedBus?.bus_number ?? 'N/A';
+      const fareStr = (n) => (n % 1 === 0 ? `${n}.00` : Number(n).toFixed(2));
+
+      const fromParts = (item.from || '').split('-');
+      const toParts   = (item.to   || '').split('-');
+      const fn = fromParts.length >= 3 ? fromParts.slice(2).join('-').trim() : (item.from || '');
+      const tn = toParts.length   >= 3 ? toParts.slice(2).join('-').trim()   : (item.to   || '');
+
+      const ticketInfo = {
+        header: 'SPS - ZYRAP',
+        ticketNumber: ticketNum ? `Ticket #: ${ticketNum}` : null,
+        separator: '--------------------------------',
+        busInfo: `Bus: ${busNum}`,
+        tripInfo: localTripNumber > 0 ? `Trip #: ${localTripNumber}` : null,
+        dateTime: `${dp}  ${tp}`,
+        route: `${fn}  to  ${tn}`,
+        fullFare: `ADULT   Rs ${fareStr(item.fare ?? 0)}`,
+        halfFare: null,
+        luggageFare: null,
+        fortune,
+        footer: 'Powered by RoutePass',
+        total: item.fare ?? 0,
+      };
+
+      if (isTestingMode) {
+        setTicketData(ticketInfo);
+        setShowTicketModal(true);
+        showToast(`Ticket printed · ₹${item.fare ?? 0}`);
+        await verifyTicketSupabase(item.ticket_id);
+        clearTicket(item.ticket_id);
+        return;
+      }
+
+      await NyxPrinter.printText('SPS - ZYRAP', { textSize: 28, align: PrintAlign.CENTER });
+      if (ticketInfo.ticketNumber) {
+        await NyxPrinter.printText(ticketInfo.ticketNumber, { textSize: 24, align: PrintAlign.CENTER });
+      }
+      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(ticketInfo.busInfo, { textSize: 24, align: PrintAlign.CENTER });
+      if (ticketInfo.tripInfo) {
+        await NyxPrinter.printText(ticketInfo.tripInfo, { textSize: 24, align: PrintAlign.CENTER });
+      }
+      await NyxPrinter.printText(ticketInfo.dateTime, { textSize: 24, align: PrintAlign.CENTER });
+      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(ticketInfo.route, { textSize: 24, align: PrintAlign.CENTER });
+      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(ticketInfo.fullFare, { textSize: 24, align: PrintAlign.CENTER });
+      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(ticketInfo.fortune, { textSize: 18, align: PrintAlign.CENTER });
+      await NyxPrinter.printText('--------------------------------', { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(ticketInfo.footer, { textSize: 18, align: PrintAlign.CENTER });
+      await NyxPrinter.printEndAutoOut();
+
+      showToast(`Ticket printed · ₹${item.fare ?? 0}`);
+      await verifyTicketSupabase(item.ticket_id);
+      clearTicket(item.ticket_id);
+    } catch (e) {
+      Alert.alert('Error', e?.message || 'Could not print ticket.');
+    } finally {
+      setPrintingTicket(null);
+    }
+  };
+
   if (dashLoading) {
     return (
       <View className="flex-1 justify-center items-center bg-zinc-950">
@@ -1235,46 +1422,19 @@ const TripScreen = () => {
       >
         {/* ── Pending Verification Requests ── */}
         {pendingRequests.length > 0 && (
-          showVerification ? (
-            <View className="bg-amber-950/40 border border-amber-500/30 rounded-2xl p-4 mb-4">
-              {/* Header */}
-              <View className="flex-row items-center justify-between mb-1">
-                <View className="flex-row items-center gap-2 flex-1">
-                  <Bell size={14} color="#f59e0b" />
-                  <Text className="text-amber-400 text-sm font-bold">Verification Requests</Text>
-                  <View className="bg-amber-500 rounded-full w-5 h-5 justify-center items-center">
-                    <Text className="text-white text-[10px] font-black">{pendingRequests.length}</Text>
-                  </View>
-                  <Text className="text-amber-500 text-[11px] font-bold">● LIVE</Text>
-                </View>
-                <TouchableOpacity
-                  onPress={() => setShowVerification(false)}
-                  className="w-7 h-7 rounded-full bg-zinc-800 border border-zinc-700 justify-center items-center ml-2"
-                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                >
-                  <X size={14} color="#a1a1aa" />
-                </TouchableOpacity>
-              </View>
-              <Text className="text-zinc-500 text-xs mb-3">Tap verify to confirm a passenger ticket</Text>
-              {pendingRequests.map(i => (
-                <PendingVerifyRow key={i.ticket_id} item={i} onVerify={handleVerify} onDismiss={dismissTicket} verifying={verifyingTicket} />
-              ))}
+          <View style={{ marginBottom: 14 }}>
+            {/* Header */}
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8, paddingHorizontal: 2 }}>
+              <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#f59e0b', marginRight: 7 }} />
+              <Text style={{ color: '#a1a1aa', fontSize: 11, fontWeight: '600', letterSpacing: 0.4, flex: 1 }}>
+                {pendingRequests.length} pending{pendingRequests.length === 1 ? '' : ''}
+              </Text>
+              <Text style={{ color: '#52525b', fontSize: 10, fontWeight: '500' }}>swipe to act</Text>
             </View>
-          ) : (
-            <TouchableOpacity
-              onPress={() => setShowVerification(true)}
-              activeOpacity={0.75}
-              className="flex-row items-center justify-between bg-amber-950/40 border border-amber-500/40 rounded-2xl px-4 py-3 mb-4"
-            >
-              <View className="flex-row items-center gap-2">
-                <AlertCircle size={16} color="#f59e0b" />
-                <Text className="text-amber-400 text-sm font-semibold">
-                  {pendingRequests.length} awaiting verification
-                </Text>
-              </View>
-              <Text className="text-amber-500 text-xs font-bold">View →</Text>
-            </TouchableOpacity>
-          )
+            {pendingRequests.map(i => (
+              <PendingVerifyRow key={i.ticket_id} item={i} onVerify={handleVerify} onDismiss={dismissTicket} onPrint={handlePrintVerification} verifying={verifyingTicket} printing={printingTicket} />
+            ))}
+          </View>
         )}
 
         {at ? (
@@ -1527,6 +1687,55 @@ const TripScreen = () => {
             <TouchableOpacity
               className="bg-sky-500 rounded-xl py-3 items-center"
               onPress={() => setShowReportModal(false)}>
+              <Text className="text-white font-bold">OK</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* ── Ticket Preview Modal (Testing Mode) ── */}
+      <Modal
+        visible={showTicketModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowTicketModal(false)}
+      >
+        <View className="flex-1 bg-black/80 justify-center items-center px-4">
+          <View className="bg-zinc-900 rounded-2xl p-6 w-full max-w-sm border border-white/20">
+            <View className="flex-row justify-between items-center mb-4">
+              <Text className="text-white text-lg font-bold">Ticket Preview</Text>
+              <TouchableOpacity onPress={() => setShowTicketModal(false)}>
+                <Text className="text-sky-400 font-semibold">Close</Text>
+              </TouchableOpacity>
+            </View>
+
+            {ticketData && (
+              <View className="bg-white rounded-xl p-4 mb-4">
+                <Text className="text-black text-center font-bold text-lg mb-2">{ticketData.header}</Text>
+                {ticketData.ticketNumber && (
+                  <Text className="text-black text-center font-bold text-base mb-2">{ticketData.ticketNumber}</Text>
+                )}
+                <Text className="text-black text-center text-xs mb-2">{ticketData.separator}</Text>
+                <Text className="text-black text-center text-sm mb-1">{ticketData.busInfo}</Text>
+                {ticketData.tripInfo && (
+                  <Text className="text-black text-center text-sm mb-1">{ticketData.tripInfo}</Text>
+                )}
+                <Text className="text-black text-center text-sm mb-1">{ticketData.dateTime}</Text>
+                <Text className="text-black text-center text-xs mb-2">{ticketData.separator}</Text>
+                <Text className="text-black text-center text-sm mb-1">{ticketData.route}</Text>
+                <Text className="text-black text-center text-xs mb-2">{ticketData.separator}</Text>
+                {ticketData.fullFare && (
+                  <Text className="text-black text-center text-sm mb-1">{ticketData.fullFare}</Text>
+                )}
+                <Text className="text-black text-center text-xs mb-2">{ticketData.separator}</Text>
+                <Text className="text-black text-center text-xs italic">{ticketData.fortune}</Text>
+              </View>
+            )}
+
+            <TouchableOpacity
+              className="bg-sky-500 rounded-xl py-3 items-center"
+              onPress={() => setShowTicketModal(false)}
+            >
               <Text className="text-white font-bold">OK</Text>
             </TouchableOpacity>
           </View>

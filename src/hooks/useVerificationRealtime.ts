@@ -10,6 +10,8 @@ export interface PendingTicket {
   is_free:      boolean;
   bus_number:   string;
   requested_at: string;
+  username:     string | null;
+  avatar_url:   string | null;
 }
 
 export function useVerificationRealtime(
@@ -41,7 +43,8 @@ export function useVerificationRealtime(
           payment_method,
           verification_requested_at,
           from_stop_id,
-          to_stop_id
+          to_stop_id,
+          ver_meta_data
         `)
         .eq('trip_id', tid)
         .eq('is_verified', false)
@@ -103,14 +106,24 @@ export function useVerificationRealtime(
           const isVerified = record.is_verified === true;
           const hasRequest = !!record.verification_requested_at;
           const twoMinsAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-          const isRecent = record.verification_requested_at >= twoMinsAgo;
+          const isRecent = !!(record.verification_requested_at && record.verification_requested_at >= twoMinsAgo);
 
-          if (isVerified || !hasRequest || !isRecent) {
+          const isFreshRequest = hasRequest && isRecent && !isVerified;
+          const isStaleOrDone = isVerified || !hasRequest || !isRecent;
+
+          // Always remove from pending if the ticket is no longer needing verification
+          if (isStaleOrDone) {
             setPendingRequests(prev =>
               prev.filter(p => p.ticket_id !== record.id),
             );
+          }
+
+          if (!isFreshRequest) {
             return;
           }
+
+          // ✅ A new verification request came in — lift any prior dismissal so it re-appears
+          dismissedTicketsRef.current.delete(record.id);
 
           // ✅ always re-fetch (with stopMap)
           await fetchInitial();
@@ -234,5 +247,7 @@ function mapRows(
     is_free: (r.payment_method ?? '').toLowerCase() === 'fr',
     bus_number: '',
     requested_at: r.verification_requested_at ?? '',
+    username: r.ver_meta_data?.username ?? null,
+    avatar_url: r.ver_meta_data?.avatar_url ?? null,
   }));
 }

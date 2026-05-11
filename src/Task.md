@@ -1,0 +1,2 @@
+- ⁠after trip changed, status report still shows the old data, only goes on refresh. 
+- ⁠end trip, coll.report testing more works, but print is not matching the same

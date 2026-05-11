@@ -275,7 +275,7 @@ const fetchDashboardFromSupabase = async () => {
       ? supabase.from('buses').select('id,bus_number,bus_name,capacity').in('id', busIds)
       : Promise.resolve({ data: [], error: null }),
     summaryTripIds.length > 0
-      ? supabase.from('tickets').select('trip_id,fare').in('trip_id', summaryTripIds)
+      ? supabase.from('tickets').select('trip_id,fare,payment_method').in('trip_id', summaryTripIds)
       : Promise.resolve({ data: [], error: null }),
   ]);
 
@@ -301,8 +301,11 @@ const fetchDashboardFromSupabase = async () => {
   const ticketMetricsByTrip = (ticketsRes.data ?? []).reduce((acc, row) => {
     const key = String(row.trip_id);
     if (!acc[key]) acc[key] = { tickets_sold: 0, collection: 0 };
-    acc[key].tickets_sold += 1;
-    acc[key].collection += Number(row.fare ?? 0);
+    const isPos = String(row.payment_method ?? '').toLowerCase() === 'pos';
+    if (!isPos) {
+      acc[key].tickets_sold += 1;
+      acc[key].collection += Number(row.fare ?? 0);
+    }
     return acc;
   }, {});
 
