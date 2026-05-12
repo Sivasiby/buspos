@@ -1,15 +1,16 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Easing } from 'react-native';
 import {
   Text, TouchableOpacity, View, ScrollView, Image,
   Platform, Alert, ActivityIndicator, ToastAndroid, RefreshControl,
-  Animated, Modal, TextInput, PanResponder, Dimensions,
+  Animated, Modal, TextInput, PanResponder, Dimensions, KeyboardAvoidingView,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   Bus, Play, Square,
   Clock, Timer, ArrowLeftRight, FileText,
-  Printer,
+  Printer, Search, Filter, ArrowUpDown, X, ArrowRight, ArrowUp, ArrowDown, MoreVertical,
 } from 'lucide-react-native';
 import { useNavigation } from '@react-navigation/native';
 import { supabase } from '../../lib/supabase';
@@ -254,6 +255,32 @@ const BlockingOverlay = ({ message }) => (
     </View>
   </View>
 );
+
+// ─── Sort Header ─────────────────────────────────────────────────────────────
+const SortHeader = ({ label, sortKey, width, align = 'center', activeSortKey, sortOrder, onSort }) => {
+  const isActive = activeSortKey === sortKey;
+  return (
+    <TouchableOpacity
+      onPress={() => onSort(sortKey)}
+      style={{
+        width,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: align === 'right' ? 'flex-end' : 'center',
+        gap: 2,
+      }}
+      hitSlop={{ top: 6, bottom: 6, left: 4, right: 4 }}
+    >
+      <Text style={{ fontSize: 10, color: isActive ? '#e4e4e7' : '#52525b', fontWeight: isActive ? '700' : '400' }}>
+        {label}
+      </Text>
+      {isActive
+        ? (sortOrder === 'asc' ? <ArrowUp size={8} color="#0ea5e9" /> : <ArrowDown size={8} color="#0ea5e9" />)
+        : <ArrowUpDown size={8} color="#3f3f46" />
+      }
+    </TouchableOpacity>
+  );
+};
 
 // ─── Pending Verify Row ───────────────────────────────────────────────────────
 const SCREEN_W = Dimensions.get('window').width;
@@ -696,9 +723,236 @@ const TripScreen = () => {
   const [ticketData, setTicketData] = useState(null);
   const [printingTicket, setPrintingTicket] = useState(null);
 
+  // Online tickets state
+  const [onlineTickets, setOnlineTickets] = useState([]);
+  const [onlineTicketsLoading, setOnlineTicketsLoading] = useState(false);
+  const [onlineSearchQuery, setOnlineSearchQuery] = useState('');
+  const [onlineSortBy, setOnlineSortBy] = useState('created_at'); // created_at, fare, username
+  const [onlineSortOrder, setOnlineSortOrder] = useState('desc'); // asc, desc
+  const [onlineFilterStatus, setOnlineFilterStatus] = useState('all'); // all, verified, unverified
+  const [showOnlineFilters, setShowOnlineFilters] = useState(false);
+  const [onlineTimeRange, setOnlineTimeRange] = useState('all'); // all, 30s, 1m, 5m, 10m, 15m, custom
+  const [customTimeRanges, setCustomTimeRanges] = useState([
+    { id: '30s', label: '30s', seconds: 30 },
+    { id: '1m', label: '1m', seconds: 60 },
+    { id: '5m', label: '5m', seconds: 300 },
+    { id: '10m', label: '10m', seconds: 600 },
+    { id: '15m', label: '15m', seconds: 900 },
+  ]);
+  const [showTimeRangeModal, setShowTimeRangeModal] = useState(false);
+  const [editingTimeRange, setEditingTimeRange] = useState(null);
+  const [newTimeRangeLabel, setNewTimeRangeLabel] = useState('');
+  const [newTimeRangeSeconds, setNewTimeRangeSeconds] = useState('');
+
+  // Ticket detail modal (long press)
+  const [ticketDetailModal, setTicketDetailModal] = useState(null);
+
+  // Polling animation
+  const pollingAnim = useRef(new Animated.Value(0)).current;
+  const lastTicketCountRef = useRef(0);
+
   const at = dashboard?.active_trip;
 
   const { pendingRequests, clearTicket, dismissTicket } = useVerificationRealtime(at?.trip_id, at?.status);
+
+  // Fetch online tickets for current trip
+  const fetchOnlineTickets = useCallback(async () => {
+    if (!at?.trip_id) return;
+    setOnlineTicketsLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from('tickets')
+        .select(`
+          id,
+          user_id,
+          fare,
+          total_fare,
+          ticket_count,
+          booking_status,
+          is_verified,
+          created_at,
+          from_stop_id,
+          to_stop_id,
+          payment_method,
+          users:user_id (username, email, avatar_url)
+        `)
+        .eq('trip_id', at.trip_id)
+        .or('payment_method.neq.pos,payment_method.is.null');
+
+      if (error) throw error;
+
+      // Resolve stop names
+      const stopIds = [...new Set((data || []).flatMap(t => [t.from_stop_id, t.to_stop_id]).filter(Boolean))];
+      let stopMap = {};
+      if (stopIds.length > 0) {
+        const { data: stops } = await supabase
+          .from('stops')
+          .select('id, stop_name')
+          .in('id', stopIds);
+        (stops || []).forEach(s => { stopMap[s.id] = s.stop_name; });
+      }
+
+      const mapped = (data || []).map(t => ({
+        ticket_id: t.id,
+        user_id: t.user_id,
+        user_id_short: t.user_id ? t.user_id.slice(-3).toUpperCase() : 'N/A',
+        username: t.users?.username || t.users?.email || 'Unknown',
+        avatar_url: t.users?.avatar_url || null,
+        fare: parseFloat(t.total_fare ?? t.fare ?? 0),
+        ticket_count: t.ticket_count ?? 1,
+        booking_status: t.booking_status || 'booked',
+        is_verified: t.is_verified,
+        created_at: t.created_at,
+        from: stopMap[t.from_stop_id] || 'Unknown',
+        to: stopMap[t.to_stop_id] || 'Unknown',
+        from_stop_id: t.from_stop_id,
+        to_stop_id: t.to_stop_id,
+        payment_method: t.payment_method || 'online',
+      }));
+
+      setOnlineTickets(mapped);
+    } catch (e) {
+      console.error('Error fetching online tickets:', e);
+    } finally {
+      setOnlineTicketsLoading(false);
+    }
+  }, [at?.trip_id]);
+
+  // Fetch online tickets on trip change or refresh
+  useEffect(() => {
+    fetchOnlineTickets();
+  }, [fetchOnlineTickets, ticketRefreshKey]);
+
+  // Check count only - for polling
+  const checkTicketCount = useCallback(async () => {
+    if (!at?.trip_id) return 0;
+    try {
+      const { count, error } = await supabase
+        .from('tickets')
+        .select('*', { count: 'exact', head: true })
+        .eq('trip_id', at.trip_id)
+        .or('payment_method.neq.pos,payment_method.is.null');
+
+      if (error) throw error;
+      return count || 0;
+    } catch (e) {
+      console.error('Error checking ticket count:', e);
+      return lastTicketCountRef.current;
+    }
+  }, [at?.trip_id]);
+
+  // Polling effect - check count first, only fetch if changed
+  useEffect(() => {
+    if (!at?.trip_id) return;
+
+    const poll = async () => {
+      // Start blinking animation
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(pollingAnim, {
+            toValue: 1,
+            duration: 300,
+            easing: Easing.ease,
+            useNativeDriver: true,
+          }),
+          Animated.timing(pollingAnim, {
+            toValue: 0,
+            duration: 300,
+            easing: Easing.ease,
+            useNativeDriver: true,
+          }),
+        ]),
+        { iterations: 3 }
+      ).start();
+
+      const currentCount = await checkTicketCount();
+      // Only fetch full data if count changed
+      if (currentCount !== lastTicketCountRef.current) {
+        lastTicketCountRef.current = currentCount;
+        await fetchOnlineTickets();
+      }
+    };
+
+    // Do initial full fetch to set baseline
+    const init = async () => {
+      await fetchOnlineTickets();
+      const count = await checkTicketCount();
+      lastTicketCountRef.current = count;
+    };
+    init();
+
+    const interval = setInterval(poll, 5000);
+
+    return () => clearInterval(interval);
+  }, [at?.trip_id, fetchOnlineTickets, pollingAnim, checkTicketCount]);
+
+  // Filter and sort online tickets
+  const filteredOnlineTickets = useCallback(() => {
+    let result = [...onlineTickets];
+
+    // Search filter
+    if (onlineSearchQuery.trim()) {
+      const query = onlineSearchQuery.toLowerCase().trim();
+      result = result.filter(t =>
+        t.username.toLowerCase().includes(query) ||
+        t.user_id_short.toLowerCase().includes(query) ||
+        t.from.toLowerCase().includes(query) ||
+        t.to.toLowerCase().includes(query)
+      );
+    }
+
+    // Status filter
+    if (onlineFilterStatus !== 'all') {
+      if (onlineFilterStatus === 'verified') {
+        result = result.filter(t => t.is_verified);
+      } else if (onlineFilterStatus === 'unverified') {
+        result = result.filter(t => !t.is_verified);
+      }
+    }
+
+    // Time range filter
+    if (onlineTimeRange !== 'all') {
+      const range = customTimeRanges.find(r => r.id === onlineTimeRange);
+      if (range) {
+        const cutoff = Date.now() - (range.seconds * 1000);
+        result = result.filter(t => {
+          const ticketTime = new Date(t.created_at).getTime();
+          return ticketTime >= cutoff;
+        });
+      }
+    }
+
+    // Sorting
+    result.sort((a, b) => {
+      let valA, valB;
+      switch (onlineSortBy) {
+        case 'fare':
+          valA = a.fare;
+          valB = b.fare;
+          break;
+        case 'username':
+          valA = a.username.toLowerCase();
+          valB = b.username.toLowerCase();
+          break;
+        case 'from_stage':
+          valA = parseInt(parseStopLabel(a.from).tripNum || '0', 10);
+          valB = parseInt(parseStopLabel(b.from).tripNum || '0', 10);
+          break;
+        case 'created_at':
+        default:
+          valA = new Date(a.created_at || 0).getTime();
+          valB = new Date(b.created_at || 0).getTime();
+          break;
+      }
+      if (valA < valB) return onlineSortOrder === 'asc' ? -1 : 1;
+      if (valA > valB) return onlineSortOrder === 'asc' ? 1 : -1;
+      return 0;
+    });
+
+    return result;
+  }, [onlineTickets, onlineSearchQuery, onlineSortBy, onlineSortOrder, onlineFilterStatus, onlineTimeRange, customTimeRanges]);
+
+  const displayedOnlineTickets = filteredOnlineTickets();
 
   const activePOSTix = posHook.tickets.filter(t => t.trip_id === at?.trip_id);
   const activePOSCount = activePOSTix.reduce((s, t) => s + Number(t.ticket_count ?? 0), 0);
@@ -1364,6 +1618,7 @@ const TripScreen = () => {
         setShowTicketModal(true);
         showToast(`Ticket printed · ₹${item.fare ?? 0}`);
         await verifyTicketSupabase(item.ticket_id);
+        setOnlineTickets(prev => prev.map(t => t.ticket_id === item.ticket_id ? { ...t, is_verified: true } : t));
         clearTicket(item.ticket_id);
         return;
       }
@@ -1390,6 +1645,7 @@ const TripScreen = () => {
 
       showToast(`Ticket printed · ₹${item.fare ?? 0}`);
       await verifyTicketSupabase(item.ticket_id);
+      setOnlineTickets(prev => prev.map(t => t.ticket_id === item.ticket_id ? { ...t, is_verified: true } : t));
       clearTicket(item.ticket_id);
     } catch (e) {
       Alert.alert('Error', e?.message || 'Could not print ticket.');
@@ -1412,10 +1668,16 @@ const TripScreen = () => {
   return (
     <SafeAreaView className="flex-1 bg-zinc-950">
       {changing && <BlockingOverlay message={changingMessage} />}
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        style={{ flex: 1 }}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}
+      >
       <ScrollView
         className="flex-1"
         contentContainerStyle={{ padding: 16, paddingBottom: 32 }}
         showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#0ea5e9" colors={['#0ea5e9']} />
         }
@@ -1540,6 +1802,252 @@ const TripScreen = () => {
               onStartReturn={handleStartReturn}
               starting={startingReturn}
             />
+
+            {/* ── Online Tickets Section ── */}
+            <View className="bg-zinc-900 rounded-2xl p-4 border border-zinc-800 mb-4">
+              {/* Header */}
+              <View className="flex-row items-center justify-between mb-3">
+                <View className="flex-row items-center gap-2">
+                  <View className="w-6 h-6 rounded-full bg-sky-500/20 items-center justify-center">
+                    <Text className="text-sky-400 text-xs font-bold">{displayedOnlineTickets.length}</Text>
+                  </View>
+                  <Text className="text-zinc-300 text-sm font-bold">Online Tickets</Text>
+                  {/* Polling indicator */}
+                  <Animated.View
+                    style={{
+                      width: 6,
+                      height: 6,
+                      borderRadius: 3,
+                      backgroundColor: '#10b981',
+                      opacity: pollingAnim.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [0.3, 1],
+                      }),
+                      transform: [{
+                        scale: pollingAnim.interpolate({
+                          inputRange: [0, 1],
+                          outputRange: [0.8, 1.2],
+                        }),
+                      }],
+                    }}
+                  />
+                </View>
+                <TouchableOpacity
+                  onPress={() => setShowOnlineFilters(!showOnlineFilters)}
+                  className="flex-row items-center gap-1 px-2 py-1 rounded-lg bg-zinc-800"
+                >
+                  <Filter size={12} color="#71717a" />
+                  <Text className="text-zinc-500 text-xs">Filters</Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* Search Bar */}
+              <View className="flex-row items-center bg-zinc-800 rounded-xl px-3 py-2.5 mb-3">
+                <Search size={16} color="#71717a" />
+                <TextInput
+                  className="flex-1 ml-2 text-white text-sm"
+                  placeholder="Search by user, ID (last 3 chars), or place..."
+                  placeholderTextColor="#52525b"
+                  value={onlineSearchQuery}
+                  onChangeText={setOnlineSearchQuery}
+                />
+                {onlineSearchQuery.length > 0 && (
+                  <TouchableOpacity onPress={() => setOnlineSearchQuery('')}>
+                    <X size={14} color="#71717a" />
+                  </TouchableOpacity>
+                )}
+              </View>
+
+              {/* Filters & Sort */}
+              {showOnlineFilters && (
+                <View className="bg-zinc-800/50 rounded-xl p-3 mb-3">
+                  {/* Status Filter */}
+                  <View className="flex-row items-center justify-between mb-2">
+                    <Text className="text-zinc-500 text-xs">Status:</Text>
+                    <View className="flex-row gap-1">
+                      {[
+                        { key: 'all', label: 'All' },
+                        { key: 'verified', label: 'Verified' },
+                        { key: 'unverified', label: 'Pending' },
+                      ].map(f => (
+                        <TouchableOpacity
+                          key={f.key}
+                          onPress={() => setOnlineFilterStatus(f.key)}
+                          className={`px-2 py-1 rounded-lg ${onlineFilterStatus === f.key ? 'bg-emerald-500' : 'bg-zinc-700'}`}
+                        >
+                          <Text className={`text-xs ${onlineFilterStatus === f.key ? 'text-white' : 'text-zinc-400'}`}>
+                            {f.label}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  </View>
+
+                  {/* Time Range Filter */}
+                  <View>
+                    <View className="flex-row items-center justify-between mb-2">
+                      <Text className="text-zinc-500 text-xs">Time range:</Text>
+                      <TouchableOpacity
+                        onPress={() => setShowTimeRangeModal(true)}
+                        className="px-2 py-1 rounded bg-zinc-700"
+                      >
+                        <Text className="text-zinc-400 text-xs">Edit</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <View className="flex-row flex-wrap gap-1">
+                      <TouchableOpacity
+                        onPress={() => setOnlineTimeRange('all')}
+                        className={`px-2 py-1 rounded-lg ${onlineTimeRange === 'all' ? 'bg-sky-500' : 'bg-zinc-700'}`}
+                      >
+                        <Text className={`text-xs ${onlineTimeRange === 'all' ? 'text-white' : 'text-zinc-400'}`}>All</Text>
+                      </TouchableOpacity>
+                      {customTimeRanges.map(range => (
+                        <TouchableOpacity
+                          key={range.id}
+                          onPress={() => setOnlineTimeRange(range.id)}
+                          className={`px-2 py-1 rounded-lg ${onlineTimeRange === range.id ? 'bg-sky-500' : 'bg-zinc-700'}`}
+                        >
+                          <Text className={`text-xs ${onlineTimeRange === range.id ? 'text-white' : 'text-zinc-400'}`}>
+                            {range.label}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  </View>
+                </View>
+              )}
+
+              {/* Ticket List - Compact Table */}
+              {onlineTicketsLoading ? (
+                <View className="items-center py-4">
+                  <ActivityIndicator size="small" color="#0ea5e9" />
+                </View>
+              ) : displayedOnlineTickets.length === 0 ? (
+                <View className="items-center py-4">
+                  <Text className="text-zinc-500 text-xs">
+                    {onlineTickets.length === 0 ? 'No online tickets yet' : 'No tickets match filters'}
+                  </Text>
+                </View>
+              ) : (
+                <View>
+                  {/* Table Header */}
+                  {(() => {
+                    const handleSort = (key) => {
+                      if (onlineSortBy === key) {
+                        setOnlineSortOrder(o => o === 'asc' ? 'desc' : 'asc');
+                      } else {
+                        setOnlineSortBy(key);
+                        setOnlineSortOrder('desc');
+                      }
+                    };
+                    const sp = { activeSortKey: onlineSortBy, sortOrder: onlineSortOrder, onSort: handleSort };
+                    return (
+                      <View style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 6, paddingHorizontal: 6, borderBottomWidth: 1, borderBottomColor: '#27272a', marginBottom: 2 }}>
+                        <View style={{ width: 30 }} />
+                        <SortHeader label="ID" sortKey="username" width={40} {...sp} />
+                        <SortHeader label="From" sortKey="from_stage" width={40} {...sp} />
+                        <SortHeader label="To" sortKey="from_stage" width={40} {...sp} />
+                        <View style={{ flex: 1, flexDirection: 'row', justifyContent: 'center' }}>
+                          <SortHeader label="Time" sortKey="created_at" width={undefined} {...sp} />
+                        </View>
+                        <SortHeader label="Fare" sortKey="fare" width={50} align="right" {...sp} />
+                        <View style={{ width: 44, alignItems: 'center' }}>
+                          <MoreVertical size={12} color="#52525b" />
+                        </View>
+                      </View>
+                    );
+                  })()}
+
+                  {displayedOnlineTickets.map((ticket, index) => {
+                    const fromParsed = parseStopLabel(ticket.from);
+                    const toParsed = parseStopLabel(ticket.to);
+                    const fromStage = fromParsed.tripNum ?? '—';
+                    const toStage = toParsed.tripNum ?? '—';
+                    const rowBg = ticket.is_verified ? 'rgba(16,185,129,0.08)' : 'transparent';
+
+                    return (
+                      <TouchableOpacity
+                        key={ticket.ticket_id}
+                        onPress={() => setTicketDetailModal(ticket)}
+                        onLongPress={() => setTicketDetailModal(ticket)}
+                        delayLongPress={400}
+                        style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 6, paddingHorizontal: 6, borderRadius: 6, marginBottom: 1, backgroundColor: rowBg }}
+                        activeOpacity={0.8}
+                      >
+                        {/* Avatar */}
+                        <View style={{ width: 30, height: 30, borderRadius: 15, backgroundColor: '#27272a', justifyContent: 'center', alignItems: 'center', overflow: 'hidden' }}>
+                          {ticket.avatar_url ? (
+                            <Image source={{ uri: ticket.avatar_url }} style={{ width: 30, height: 30 }} />
+                          ) : (
+                            <Text style={{ color: '#71717a', fontSize: 9, fontWeight: 'bold' }}>{index + 1}</Text>
+                          )}
+                        </View>
+
+                        {/* User ID */}
+                        <View style={{ width: 40, alignItems: 'center' }}>
+                          <Text style={{ color: '#fff', fontFamily: 'monospace', fontWeight: 'bold', fontSize: 13, letterSpacing: 1 }}>
+                            {ticket.user_id_short}
+                          </Text>
+                        </View>
+
+                        {/* From Stage */}
+                        <View style={{ width: 40, alignItems: 'center' }}>
+                          <Text style={{ color: '#fb923c', fontWeight: 'bold', fontSize: 13 }}>{fromStage}</Text>
+                        </View>
+
+                        {/* To Stage */}
+                        <View style={{ width: 40, alignItems: 'center' }}>
+                          <Text style={{ color: '#fbbf24', fontWeight: 'bold', fontSize: 13 }}>{toStage}</Text>
+                        </View>
+
+                        {/* Time - flex-1 fills remaining space */}
+                        <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+                          <Text style={{ color: '#71717a', fontSize: 10, textAlign: 'center' }} numberOfLines={1}>
+                            {relativeTime(ticket.created_at).replace(' ago', '')}
+                          </Text>
+                        </View>
+
+                        {/* Fare */}
+                        <View style={{ width: 50, alignItems: 'flex-end', paddingRight: 6 }}>
+                          <Text style={{ color: '#fff', fontWeight: 'bold', fontSize: 13 }}>₹{ticket.fare.toFixed(0)}</Text>
+                          {ticket.ticket_count > 1 && (
+                            <Text style={{ color: '#71717a', fontSize: 9 }}>x{ticket.ticket_count}</Text>
+                          )}
+                        </View>
+
+                        {/* Action column (Printer) */}
+                        <View style={{ width: 44, alignItems: 'center', justifyContent: 'center' }}>
+                          {printingTicket === ticket.ticket_id ? (
+                            <ActivityIndicator size="small" color="#38bdf8" />
+                          ) : (
+                            <TouchableOpacity
+                              onPress={() => !ticket.is_verified && handlePrintVerification(ticket)}
+                              disabled={ticket.is_verified}
+                              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                              style={{ padding: 4 }}
+                            >
+                              <Printer size={18} color={ticket.is_verified ? '#3f3f46' : '#38bdf8'} />
+                            </TouchableOpacity>
+                          )}
+                        </View>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              )}
+
+              {/* Summary Footer */}
+              {displayedOnlineTickets.length > 0 && (
+                <View className="flex-row justify-between items-center pt-3 mt-2 border-t border-zinc-800">
+                  <Text className="text-zinc-500 text-xs">
+                    Showing {displayedOnlineTickets.length} of {onlineTickets.length} tickets
+                  </Text>
+                  <Text className="text-emerald-400 text-sm font-bold">
+                    Total: ₹{displayedOnlineTickets.reduce((s, t) => s + t.fare, 0).toFixed(0)}
+                  </Text>
+                </View>
+              )}
+            </View>
           </>
         ) : (
           /* ── No Trip: Direct Start Buttons ── */
@@ -1741,6 +2249,233 @@ const TripScreen = () => {
           </View>
         </View>
       </Modal>
+
+      {/* ── Ticket Detail Modal (Long Press) ── */}
+      <Modal
+        visible={!!ticketDetailModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setTicketDetailModal(null)}
+      >
+        <View className="flex-1 bg-black/85 justify-center items-center px-6">
+          <View className="bg-zinc-900 rounded-2xl p-5 w-full max-w-xs border border-zinc-700">
+            {ticketDetailModal && (
+              <>
+                {/* Avatar */}
+                <View className="items-center mb-4">
+                  {ticketDetailModal.avatar_url ? (
+                    <Image
+                      source={{ uri: ticketDetailModal.avatar_url }}
+                      className="w-20 h-20 rounded-full"
+                    />
+                  ) : (
+                    <View className="w-20 h-20 rounded-full bg-sky-500/20 items-center justify-center">
+                      <Text className="text-sky-400 text-3xl font-bold">
+                        {ticketDetailModal.username ? ticketDetailModal.username[0].toUpperCase() : '?'}
+                      </Text>
+                    </View>
+                  )}
+                </View>
+
+                {/* User ID */}
+                <View className="items-center mb-4">
+                  <Text className="text-zinc-500 text-xs mb-1">User ID</Text>
+                  <Text className="text-white text-2xl font-mono font-bold tracking-wider">
+                    {ticketDetailModal.user_id_short}
+                  </Text>
+                </View>
+
+                {/* Username */}
+                <View className="bg-zinc-800 rounded-xl p-3 mb-3">
+                  <Text className="text-zinc-500 text-xs mb-1">Username</Text>
+                  <Text className="text-white text-base font-semibold" numberOfLines={1}>
+                    {ticketDetailModal.username}
+                  </Text>
+                </View>
+
+                {/* Route */}
+                <View className="bg-zinc-800 rounded-xl p-3 mb-3">
+                  <View className="flex-row items-center">
+                    <Text className="text-white text-sm flex-1" numberOfLines={1}>{parseStopLabel(ticketDetailModal.from).tamil}</Text>
+                    <ArrowRight size={16} color="#52525b" className="mx-2" />
+                    <Text className="text-white text-sm flex-1" numberOfLines={1}>{parseStopLabel(ticketDetailModal.to).tamil}</Text>
+                  </View>
+                </View>
+
+                {/* Details */}
+                <View className="flex-row justify-between mb-4">
+                  <View className="bg-zinc-800 rounded-xl p-3 flex-1 mr-2">
+                    <Text className="text-zinc-500 text-xs">Fare</Text>
+                    <Text className="text-white text-lg font-bold">₹{ticketDetailModal.fare.toFixed(0)}</Text>
+                  </View>
+                  <View className="bg-zinc-800 rounded-xl p-3 flex-1">
+                    <Text className="text-zinc-500 text-xs">Status</Text>
+                    <Text className={ticketDetailModal.is_verified ? 'text-emerald-400 text-lg font-bold' : 'text-zinc-400 text-lg font-bold'}>
+                      {ticketDetailModal.is_verified ? 'Verified ✓' : 'Pending'}
+                    </Text>
+                  </View>
+                </View>
+
+                <TouchableOpacity
+                  onPress={() => setTicketDetailModal(null)}
+                  className="bg-sky-500 rounded-xl py-3 items-center"
+                >
+                  <Text className="text-white font-bold">Close</Text>
+                </TouchableOpacity>
+              </>
+            )}
+          </View>
+        </View>
+      </Modal>
+
+      {/* ── Time Range Edit Modal ── */}
+      <Modal
+        visible={showTimeRangeModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => {
+          setShowTimeRangeModal(false);
+          setEditingTimeRange(null);
+          setNewTimeRangeLabel('');
+          setNewTimeRangeSeconds('');
+        }}
+      >
+        <View className="flex-1 bg-black/80 justify-center items-center px-4">
+          <View className="bg-zinc-900 rounded-2xl p-5 w-full max-w-sm border border-white/20">
+            <View className="flex-row justify-between items-center mb-4">
+              <Text className="text-white text-lg font-bold">Edit Time Ranges</Text>
+              <TouchableOpacity onPress={() => {
+                setShowTimeRangeModal(false);
+                setEditingTimeRange(null);
+                setNewTimeRangeLabel('');
+                setNewTimeRangeSeconds('');
+              }}>
+                <Text className="text-sky-400 font-semibold">Close</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Add New Time Range */}
+            <View className="bg-zinc-800 rounded-xl p-3 mb-4">
+              <Text className="text-zinc-400 text-xs font-semibold mb-2">Add New Range</Text>
+              <View className="flex-row gap-2 mb-2">
+                <TextInput
+                  className="flex-1 bg-zinc-700 rounded-lg px-3 py-2 text-white text-sm"
+                  placeholder="Label (e.g., 20s, 2m)"
+                  placeholderTextColor="#52525b"
+                  value={newTimeRangeLabel}
+                  onChangeText={setNewTimeRangeLabel}
+                />
+                <TextInput
+                  className="flex-1 bg-zinc-700 rounded-lg px-3 py-2 text-white text-sm"
+                  placeholder="Seconds"
+                  placeholderTextColor="#52525b"
+                  keyboardType="numeric"
+                  value={newTimeRangeSeconds}
+                  onChangeText={setNewTimeRangeSeconds}
+                />
+              </View>
+              <TouchableOpacity
+                onPress={() => {
+                  const seconds = parseInt(newTimeRangeSeconds, 10);
+                  if (newTimeRangeLabel.trim() && !isNaN(seconds) && seconds > 0) {
+                    const newId = `custom_${Date.now()}`;
+                    setCustomTimeRanges(prev => [...prev, { id: newId, label: newTimeRangeLabel.trim(), seconds }]);
+                    setNewTimeRangeLabel('');
+                    setNewTimeRangeSeconds('');
+                  }
+                }}
+                disabled={!newTimeRangeLabel.trim() || !newTimeRangeSeconds.trim()}
+                className={`py-2 rounded-lg items-center ${newTimeRangeLabel.trim() && newTimeRangeSeconds.trim() ? 'bg-sky-500' : 'bg-zinc-700'}`}
+              >
+                <Text className="text-white font-semibold text-sm">Add Range</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Existing Ranges List */}
+            <Text className="text-zinc-400 text-xs font-semibold mb-2">Current Ranges</Text>
+            <ScrollView className="max-h-64">
+              {customTimeRanges.map((range, index) => (
+                <View key={range.id} className="flex-row items-center justify-between bg-zinc-800 rounded-lg p-3 mb-2">
+                  {editingTimeRange?.id === range.id ? (
+                    <View className="flex-1 flex-row gap-2">
+                      <TextInput
+                        className="flex-1 bg-zinc-700 rounded-lg px-2 py-1 text-white text-sm"
+                        value={editingTimeRange.label}
+                        onChangeText={(text) => setEditingTimeRange({ ...editingTimeRange, label: text })}
+                      />
+                      <TextInput
+                        className="w-20 bg-zinc-700 rounded-lg px-2 py-1 text-white text-sm"
+                        keyboardType="numeric"
+                        value={String(editingTimeRange.seconds)}
+                        onChangeText={(text) => setEditingTimeRange({ ...editingTimeRange, seconds: parseInt(text, 10) || 0 })}
+                      />
+                    </View>
+                  ) : (
+                    <View className="flex-1">
+                      <Text className="text-white font-semibold">{range.label}</Text>
+                      <Text className="text-zinc-500 text-xs">{range.seconds} seconds</Text>
+                    </View>
+                  )}
+                  <View className="flex-row gap-1">
+                    {editingTimeRange?.id === range.id ? (
+                      <>
+                        <TouchableOpacity
+                          onPress={() => {
+                            setCustomTimeRanges(prev => prev.map(r => r.id === range.id ? { ...editingTimeRange } : r));
+                            setEditingTimeRange(null);
+                          }}
+                          className="px-2 py-1 rounded bg-emerald-500/20"
+                        >
+                          <Text className="text-emerald-400 text-xs">Save</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          onPress={() => setEditingTimeRange(null)}
+                          className="px-2 py-1 rounded bg-zinc-700"
+                        >
+                          <Text className="text-zinc-400 text-xs">Cancel</Text>
+                        </TouchableOpacity>
+                      </>
+                    ) : (
+                      <>
+                        <TouchableOpacity
+                          onPress={() => setEditingTimeRange(range)}
+                          className="px-2 py-1 rounded bg-zinc-700"
+                        >
+                          <Text className="text-zinc-400 text-xs">Edit</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          onPress={() => {
+                            setCustomTimeRanges(prev => prev.filter(r => r.id !== range.id));
+                            if (onlineTimeRange === range.id) {
+                              setOnlineTimeRange('all');
+                            }
+                          }}
+                          className="px-2 py-1 rounded bg-red-500/20"
+                        >
+                          <Text className="text-red-400 text-xs">Remove</Text>
+                        </TouchableOpacity>
+                      </>
+                    )}
+                  </View>
+                </View>
+              ))}
+            </ScrollView>
+
+            <TouchableOpacity
+              onPress={() => {
+                setShowTimeRangeModal(false);
+                setEditingTimeRange(null);
+                setNewTimeRangeLabel('');
+                setNewTimeRangeSeconds('');
+              }}
+              className="bg-sky-500 rounded-xl py-3 items-center mt-4"
+            >
+              <Text className="text-white font-bold">Done</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 };

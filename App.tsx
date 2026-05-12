@@ -10,7 +10,7 @@ import {SafeAreaView} from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {NavigationContainer} from '@react-navigation/native';
 import {createBottomTabNavigator} from '@react-navigation/bottom-tabs';
-import {Home, Bus, Ticket, Settings} from 'lucide-react-native';
+import {Home, Bus, Ticket, Settings, FlaskConical} from 'lucide-react-native';
 
 import './global.css';
 
@@ -21,6 +21,7 @@ import TripScreen  from './src/screens/TripScreen';
 import TicketScreen from './src/screens/TicketScreen';
 import ReportScreen from './src/components/ReportScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
+import TestScreen from './src/screens/Test';
 
 const Tab = createBottomTabNavigator();
 
@@ -31,6 +32,7 @@ const HomeIcon = ({color, size}: {color: string; size: number}) => <Home size={s
 const BusIcon = ({color, size}: {color: string; size: number}) => <Bus size={size} color={color} />;
 const TicketIcon = ({color, size}: {color: string; size: number}) => <Ticket size={size} color={color} />;
 const SettingsIcon = ({color, size}: {color: string; size: number}) => <Settings size={size} color={color} />;
+const TestIcon = ({color, size}: {color: string; size: number}) => <FlaskConical size={size} color={color} />;
 
 // Tab Navigator Component
 function TabNavigator() {
@@ -81,6 +83,17 @@ function TabNavigator() {
           tabBarIcon: SettingsIcon,
         }}
       />
+      {__DEV__ && (
+        <Tab.Screen
+          name="Test"
+          component={TestScreen}
+          options={{
+            tabBarLabel: 'Test',
+            tabBarIcon: TestIcon,
+            tabBarBadge: 'DEV',
+          }}
+        />
+      )}
     </Tab.Navigator>
   );
 }
