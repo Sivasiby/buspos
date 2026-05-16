@@ -49,7 +49,7 @@ export const places = [
   },
   {
     key: 'annur_mettu_pal',
-    label: 'Annur Mettupalayam-10-அன்னூர் மேட்டுப்பாளையம்',
+    label: 'Annur Mettupalayam-010-அன்னூர் மேட்டுப்பாளையம்',
     lat: 11.232709359016178,
     lon: 77.1021368496934,
   },
