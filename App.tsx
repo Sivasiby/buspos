@@ -13,6 +13,7 @@ import {createBottomTabNavigator} from '@react-navigation/bottom-tabs';
 import {Home, Bus, Ticket, Settings, FlaskConical} from 'lucide-react-native';
 
 import './global.css';
+import { requestNotificationPermission } from './src/services/ticketNotification';
 
 import LoginScreen from './src/screens/LoginScreen';
 import {TripProvider} from './src/context/TripContext';
@@ -35,7 +36,7 @@ const SettingsIcon = ({color, size}: {color: string; size: number}) => <Settings
 const TestIcon = ({color, size}: {color: string; size: number}) => <FlaskConical size={size} color={color} />;
 
 // Tab Navigator Component
-function TabNavigator() {
+function TabNavigator({ onLogout }: { onLogout: () => void }) {
   return (
     <Tab.Navigator
       id="main-tabs"
@@ -77,12 +78,12 @@ function TabNavigator() {
       />
       <Tab.Screen
         name="Settings"
-        component={SettingsScreen}
         options={{
           tabBarLabel: 'Settings',
           tabBarIcon: SettingsIcon,
-        }}
-      />
+        }}>
+        {() => <SettingsScreen onLogout={onLogout} />}
+      </Tab.Screen>
       {__DEV__ && (
         <Tab.Screen
           name="Test"
@@ -105,7 +106,12 @@ export default function App() {
   // Restore saved session on launch
   useEffect(() => {
     AsyncStorage.getItem(STORAGE_KEY)
-      .then(raw => { if (raw) setUser(JSON.parse(raw)); })
+      .then(raw => {
+        if (raw) {
+          setUser(JSON.parse(raw));
+          requestNotificationPermission().catch(() => {});
+        }
+      })
       .catch(() => {})
       .finally(() => setChecking(false));
   }, []);
@@ -114,7 +120,15 @@ export default function App() {
     try {
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(userData));
     } catch {}
+    requestNotificationPermission().catch(() => {});
     setUser(userData);
+  };
+
+  const handleLogout = async () => {
+    try {
+      await AsyncStorage.multiRemove([STORAGE_KEY, 'access_token', 'selected_bus']);
+    } catch {}
+    setUser(null);
   };
 
   // Splash / checking state
@@ -134,7 +148,7 @@ export default function App() {
     <TripProvider>
       <SafeAreaView style={{flex: 1, backgroundColor: '#000000'}}>
         <NavigationContainer>
-          <TabNavigator />
+          <TabNavigator onLogout={handleLogout} />
         </NavigationContainer>
       </SafeAreaView>
     </TripProvider>

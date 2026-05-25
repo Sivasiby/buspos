@@ -2199,7 +2199,12 @@ const CollectionReportTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
   const [customExpense, setCustomExpense] = useState('');
 
   const recentTrips = dashboard?.recent_trips ?? [];
-  const posByTrip = posHook.todayByTrip();
+  const posByTrip = (posHook?.tickets ?? []).reduce((acc, t) => {
+    const key = t.trip_id ?? 'no_trip';
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(t);
+    return acc;
+  }, {});
 
   const todayTripIds = recentTrips
     .filter(t => {

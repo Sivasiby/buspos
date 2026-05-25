@@ -1035,14 +1035,18 @@ const SelectBusHome = ({ onSelected }: { onSelected: (bus: any) => void }) => {
   useEffect(() => {
     const load = async () => {
       try {
+        console.log('[SelectBus] Starting bus load...');
         const { data, error } = await supabase
           .from('buses')
           .select('*')
-          .eq('is_active', true)
           .order('bus_number');
+        console.log('[SelectBus] Raw data:', JSON.stringify(data, null, 2));
+        console.log('[SelectBus] Error:', JSON.stringify(error, null, 2));
+        console.log('[SelectBus] Bus count:', data?.length ?? 0);
         if (!error) setBuses(data || []);
+        else console.error('[SelectBus] Supabase error fetching buses:', error);
       } catch (e) {
-        console.error('[SelectBus] Failed to load buses:', e);
+        console.error('[SelectBus] Failed to load buses (exception):', e);
       } finally {
         setLoading(false);
       }

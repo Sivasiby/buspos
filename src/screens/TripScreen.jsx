@@ -3,20 +3,26 @@ import { Easing } from 'react-native';
 import {
   Text, TouchableOpacity, View, ScrollView, Image,
   Platform, Alert, ActivityIndicator, ToastAndroid, RefreshControl,
-  Animated, Modal, TextInput, PanResponder, Dimensions, KeyboardAvoidingView,
+  Animated, Modal, TextInput, PanResponder, Dimensions, KeyboardAvoidingView, Vibration,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   Bus, Play, Square,
   Clock, Timer, ArrowLeftRight, FileText,
-  Printer, Search, Filter, ArrowUpDown, X, ArrowRight, ArrowUp, ArrowDown, MoreVertical,
+  Printer, Search, Filter, ArrowUpDown, X, ArrowRight, ArrowUp, ArrowDown,
 } from 'lucide-react-native';
 import { useNavigation } from '@react-navigation/native';
 import { supabase } from '../../lib/supabase';
 import { useVerificationRealtime } from '../hooks/useVerificationRealtime';
 import { useTripContext } from '../context/TripContext';
 import { getRandomFortune } from '../utils/fortune';
+import {
+  sendNewTicketNotification,
+  registerForegroundHandler,
+  cancelTicketNotification,
+  ensureChannels,
+} from '../services/ticketNotification';
 
 let NyxPrinter = null;
 let PrinterStatus = null;
@@ -387,9 +393,15 @@ const PendingVerifyRow = ({ item, onVerify, onDismiss, onPrint, verifying, print
 
             {/* Name + time */}
             <View style={{ flex: 1 }}>
-              <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }} numberOfLines={1}>
-                {item.username || 'Passenger'}
-              </Text>
+              {item.tamil_name ? (
+                <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }} numberOfLines={1}>
+                  {item.tamil_name}
+                </Text>
+              ) : item.user_app_id ? (
+                <Text style={{ color: '#fff', fontSize: 18, fontWeight: '900' }} numberOfLines={1}>
+                  {item.user_app_id}
+                </Text>
+              ) : null}
               <Text style={{ color: '#52525b', fontSize: 10, marginTop: 2 }}>
                 {relativeTime(item.requested_at)}
               </Text>
@@ -423,6 +435,172 @@ const PendingVerifyRow = ({ item, onVerify, onDismiss, onPrint, verifying, print
         </Animated.View>
       </View>
     </Animated.View>
+  );
+};
+
+// ─── Online Ticket Swipeable Row ──────────────────────────────────────────────
+const OnlineTicketRow = ({ ticket, index, onVerify, onPrint, verifying, printing, onLongPress }) => {
+  const translateX   = useRef(new Animated.Value(0)).current;
+  const dragProgress = useRef(new Animated.Value(0)).current;
+  const actionLock   = useRef(false);
+  const [printedState, setPrintedState] = useState(false); // "Printed" flash state
+  const [localVerified, setLocalVerified] = useState(ticket.is_verified);
+  const localVerifiedRef = useRef(ticket.is_verified);
+
+  useEffect(() => {
+    setLocalVerified(ticket.is_verified);
+    localVerifiedRef.current = ticket.is_verified;
+  }, [ticket.is_verified]);
+
+  useEffect(() => {
+    const id = translateX.addListener(({ value }) => {
+      dragProgress.setValue(value / SWIPE_THRESHOLD);
+    });
+    return () => translateX.removeListener(id);
+  }, [translateX, dragProgress]);
+
+  const isVerifying = verifying === ticket.ticket_id;
+  const isPrinting  = printing  === ticket.ticket_id;
+  const isAnyBusy   = isVerifying || isPrinting;
+
+  const fromParsed = parseStopLabel(ticket.from);
+  const toParsed   = parseStopLabel(ticket.to);
+  const fromStage  = fromParsed.tripNum ?? '—';
+  const toStage    = toParsed.tripNum   ?? '—';
+
+  const rowBg = localVerified ? 'rgba(16,185,129,0.08)' : '#111113';
+
+  const flyOut = (toValue, cb) => {
+    Animated.timing(translateX, { toValue, duration: 220, useNativeDriver: true }).start(() => cb());
+  };
+
+  const snapBack = (cb) => {
+    translateX.setValue(-SCREEN_W);
+    Animated.spring(translateX, { toValue: 0, useNativeDriver: true, tension: 80, friction: 12 }).start(() => cb && cb());
+  };
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => !actionLock.current && !isAnyBusy && !localVerifiedRef.current,
+      onMoveShouldSetPanResponder: (_, g) => !actionLock.current && !isAnyBusy && !localVerifiedRef.current && Math.abs(g.dx) > Math.abs(g.dy) && Math.abs(g.dx) > 6,
+      onPanResponderMove: (_, g) => { translateX.setValue(g.dx); },
+      onPanResponderRelease: (_, g) => {
+        if (actionLock.current) return;
+        if (g.dx > SWIPE_THRESHOLD) {
+          // Right swipe → verify (fly off permanently)
+          actionLock.current = true;
+          flyOut(SCREEN_W, () => { actionLock.current = false; onVerify(ticket.ticket_id); });
+        } else if (g.dx < -SWIPE_THRESHOLD) {
+          // Left swipe → print → snap back → show "Printed" 3s → go green
+          actionLock.current = true;
+          flyOut(-SCREEN_W, async () => {
+            await onPrint(ticket);
+            snapBack(() => {
+              setPrintedState(true);
+              setTimeout(() => {
+                setPrintedState(false);
+                setLocalVerified(true);
+                localVerifiedRef.current = true;
+                actionLock.current = false;
+              }, 3000);
+            });
+          });
+        } else {
+          Animated.spring(translateX, { toValue: 0, useNativeDriver: true, tension: 120, friction: 10 }).start();
+        }
+      },
+      onPanResponderTerminate: () => {
+        Animated.spring(translateX, { toValue: 0, useNativeDriver: true, tension: 120, friction: 10 }).start();
+      },
+    })
+  ).current;
+
+  const verifyOpacity  = dragProgress.interpolate({ inputRange: [0, 1],  outputRange: [0, 1], extrapolate: 'clamp' });
+  const printOpacity   = dragProgress.interpolate({ inputRange: [-1, 0], outputRange: [1, 0], extrapolate: 'clamp' });
+  const verifyBg       = dragProgress.interpolate({ inputRange: [0, 1],  outputRange: ['rgba(16,185,129,0)', 'rgba(16,185,129,0.18)'], extrapolate: 'clamp' });
+  const printBg        = dragProgress.interpolate({ inputRange: [-1, 0], outputRange: ['rgba(14,165,233,0.18)', 'rgba(14,165,233,0)'],  extrapolate: 'clamp' });
+
+  return (
+    <View style={{ borderRadius: 6, overflow: 'hidden', marginBottom: 1, position: 'relative' }}>
+      {/* Green layer (verify – right swipe) */}
+      <Animated.View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: verifyBg, justifyContent: 'center', paddingLeft: 12 }}>
+        <Animated.Text style={{ color: '#10b981', fontSize: 10, fontWeight: '800', letterSpacing: 0.5, opacity: verifyOpacity }}>VERIFY ✓</Animated.Text>
+      </Animated.View>
+      {/* Blue layer (print – left swipe) */}
+      <Animated.View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: printBg, justifyContent: 'center', alignItems: 'flex-end', paddingRight: 12 }}>
+        <Animated.Text style={{ color: '#38bdf8', fontSize: 10, fontWeight: '800', letterSpacing: 0.5, opacity: printOpacity }}>PRINT ⬤</Animated.Text>
+      </Animated.View>
+
+      {/* Swipeable card */}
+      <Animated.View
+        {...panResponder.panHandlers}
+        style={[{ backgroundColor: rowBg }, { transform: [{ translateX }] }]}
+      >
+        <TouchableOpacity
+          onLongPress={() => onLongPress(ticket)}
+          delayLongPress={400}
+          activeOpacity={0.85}
+          style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 10, paddingHorizontal: 6 }}
+        >
+          {/* Avatar / index */}
+          <View style={{ width: 30, height: 30, borderRadius: 15, backgroundColor: '#27272a', justifyContent: 'center', alignItems: 'center', overflow: 'hidden' }}>
+            {ticket.avatar_url ? (
+              <Image source={{ uri: ticket.avatar_url }} style={{ width: 30, height: 30 }} />
+            ) : (
+              <Text style={{ color: '#71717a', fontSize: 9, fontWeight: 'bold' }}>{index + 1}</Text>
+            )}
+          </View>
+
+          {/* User App ID */}
+          <View style={{ width: 44, alignItems: 'center' }}>
+            <Text style={{ color: '#fff', fontFamily: 'monospace', fontWeight: 'bold', fontSize: 13, letterSpacing: 1 }}>
+              {ticket.user_app_id ?? ticket.user_id_short}
+            </Text>
+          </View>
+
+          {/* From Stage */}
+          <View style={{ width: 40, alignItems: 'center' }}>
+            <Text style={{ color: '#fb923c', fontWeight: 'bold', fontSize: 13 }}>{fromStage}</Text>
+          </View>
+
+          {/* To Stage */}
+          <View style={{ width: 40, alignItems: 'center' }}>
+            <Text style={{ color: '#fbbf24', fontWeight: 'bold', fontSize: 13 }}>{toStage}</Text>
+          </View>
+
+          {/* Time */}
+          <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+            {printedState ? (
+              <Text style={{ color: '#38bdf8', fontSize: 10, fontWeight: '800', letterSpacing: 0.4 }}>Printed ✓</Text>
+            ) : (
+              <Text style={{ color: '#71717a', fontSize: 10, textAlign: 'center' }} numberOfLines={1}>
+                {relativeTime(ticket.created_at).replace(' ago', '')}
+              </Text>
+            )}
+          </View>
+
+          {/* Fare */}
+          <View style={{ width: 50, alignItems: 'flex-end', paddingRight: 6 }}>
+            <Text style={{ color: '#fff', fontWeight: 'bold', fontSize: 13 }}>₹{ticket.fare.toFixed(0)}</Text>
+            {ticket.ticket_count > 1 && (
+              <Text style={{ color: '#71717a', fontSize: 9 }}>x{ticket.ticket_count}</Text>
+            )}
+          </View>
+
+          {/* Status indicator */}
+          <View style={{ width: 20, alignItems: 'center' }}>
+            {isVerifying || isPrinting
+              ? <ActivityIndicator size="small" color={isVerifying ? '#10b981' : '#38bdf8'} />
+              : printedState
+                ? <Text style={{ color: '#38bdf8', fontSize: 10, fontWeight: '800' }}>⬤</Text>
+                : localVerified
+                  ? <Text style={{ color: '#10b981', fontSize: 10, fontWeight: '800' }}>✓</Text>
+                  : null
+            }
+          </View>
+        </TouchableOpacity>
+      </Animated.View>
+    </View>
   );
 };
 
@@ -741,15 +919,16 @@ const TripScreen = () => {
   ]);
   const [showTimeRangeModal, setShowTimeRangeModal] = useState(false);
   const [editingTimeRange, setEditingTimeRange] = useState(null);
-  const [newTimeRangeLabel, setNewTimeRangeLabel] = useState('');
-  const [newTimeRangeSeconds, setNewTimeRangeSeconds] = useState('');
+  const [newTimeRangeValue, setNewTimeRangeValue] = useState('');
+  const [newTimeRangeUnit, setNewTimeRangeUnit] = useState('seconds'); // seconds | minutes | hours
 
   // Ticket detail modal (long press)
   const [ticketDetailModal, setTicketDetailModal] = useState(null);
 
-  // Polling animation
+  // Realtime indicator animation (blinks only when a new ticket arrives)
   const pollingAnim = useRef(new Animated.Value(0)).current;
-  const lastTicketCountRef = useRef(0);
+  const onlineChannelRef = useRef(null);
+  const knownTicketIdsRef = useRef(new Set());
 
   const at = dashboard?.active_trip;
 
@@ -771,10 +950,12 @@ const TripScreen = () => {
           booking_status,
           is_verified,
           created_at,
+          verification_requested_at,
           from_stop_id,
           to_stop_id,
           payment_method,
-          users:user_id (username, email, avatar_url)
+          users:user_id (username, email, avatar_url, tamil_name, user_app_id),
+          ver_meta_data
         `)
         .eq('trip_id', at.trip_id)
         .or('payment_method.neq.pos,payment_method.is.null');
@@ -792,23 +973,29 @@ const TripScreen = () => {
         (stops || []).forEach(s => { stopMap[s.id] = s.stop_name; });
       }
 
-      const mapped = (data || []).map(t => ({
-        ticket_id: t.id,
-        user_id: t.user_id,
-        user_id_short: t.user_id ? t.user_id.slice(-3).toUpperCase() : 'N/A',
-        username: t.users?.username || t.users?.email || 'Unknown',
-        avatar_url: t.users?.avatar_url || null,
-        fare: parseFloat(t.total_fare ?? t.fare ?? 0),
-        ticket_count: t.ticket_count ?? 1,
-        booking_status: t.booking_status || 'booked',
-        is_verified: t.is_verified,
-        created_at: t.created_at,
-        from: stopMap[t.from_stop_id] || 'Unknown',
-        to: stopMap[t.to_stop_id] || 'Unknown',
-        from_stop_id: t.from_stop_id,
-        to_stop_id: t.to_stop_id,
-        payment_method: t.payment_method || 'online',
-      }));
+      const mapped = (data || []).map(t => {
+        const meta = t.ver_meta_data ? (typeof t.ver_meta_data === 'string' ? JSON.parse(t.ver_meta_data) : t.ver_meta_data) : {};
+        return {
+          ticket_id: t.id,
+          user_id: t.user_id,
+          user_id_short: t.user_id ? t.user_id.slice(-3).toUpperCase() : 'N/A',
+          user_app_id: meta?.user_app_id ?? t.users?.user_app_id ?? null,
+          username: meta?.username || null,
+          tamil_name: meta?.tamil_name || null,
+          avatar_url: meta?.avatar_url || t.users?.avatar_url || null,
+          fare: parseFloat(t.total_fare ?? t.fare ?? 0),
+          ticket_count: t.ticket_count ?? 1,
+          booking_status: t.booking_status || 'booked',
+          is_verified: t.is_verified,
+          created_at: t.created_at,
+          verification_requested_at: t.verification_requested_at || null,
+          from: stopMap[t.from_stop_id] || 'Unknown',
+          to: stopMap[t.to_stop_id] || 'Unknown',
+          from_stop_id: t.from_stop_id,
+          to_stop_id: t.to_stop_id,
+          payment_method: t.payment_method || 'online',
+        };
+      });
 
       setOnlineTickets(mapped);
     } catch (e) {
@@ -823,68 +1010,178 @@ const TripScreen = () => {
     fetchOnlineTickets();
   }, [fetchOnlineTickets, ticketRefreshKey]);
 
-  // Check count only - for polling
-  const checkTicketCount = useCallback(async () => {
-    if (!at?.trip_id) return 0;
-    try {
-      const { count, error } = await supabase
-        .from('tickets')
-        .select('*', { count: 'exact', head: true })
-        .eq('trip_id', at.trip_id)
-        .or('payment_method.neq.pos,payment_method.is.null');
+  // Blink + vibrate when a new ticket arrives
+  const triggerNewTicketAlert = useCallback(() => {
+    try { Vibration.vibrate([0, 80, 60, 80]); } catch { /* permission not granted */ }
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pollingAnim, {
+          toValue: 1,
+          duration: 250,
+          easing: Easing.ease,
+          useNativeDriver: true,
+        }),
+        Animated.timing(pollingAnim, {
+          toValue: 0,
+          duration: 250,
+          easing: Easing.ease,
+          useNativeDriver: true,
+        }),
+      ]),
+      { iterations: 6 }
+    ).start(() => {
+      pollingAnim.setValue(0);
+    });
+  }, [pollingAnim]);
 
-      if (error) throw error;
-      return count || 0;
-    } catch (e) {
-      console.error('Error checking ticket count:', e);
-      return lastTicketCountRef.current;
-    }
-  }, [at?.trip_id]);
-
-  // Polling effect - check count first, only fetch if changed
+  // Supabase realtime subscription for online tickets
   useEffect(() => {
-    if (!at?.trip_id) return;
+    const tripId = at?.trip_id;
 
-    const poll = async () => {
-      // Start blinking animation
-      Animated.loop(
-        Animated.sequence([
-          Animated.timing(pollingAnim, {
-            toValue: 1,
-            duration: 300,
-            easing: Easing.ease,
-            useNativeDriver: true,
-          }),
-          Animated.timing(pollingAnim, {
-            toValue: 0,
-            duration: 300,
-            easing: Easing.ease,
-            useNativeDriver: true,
-          }),
-        ]),
-        { iterations: 3 }
-      ).start();
+    // Cleanup previous channel
+    if (onlineChannelRef.current) {
+      supabase.removeChannel(onlineChannelRef.current);
+      onlineChannelRef.current = null;
+    }
 
-      const currentCount = await checkTicketCount();
-      // Only fetch full data if count changed
-      if (currentCount !== lastTicketCountRef.current) {
-        lastTicketCountRef.current = currentCount;
-        await fetchOnlineTickets();
+    if (!tripId) return;
+
+    // Initial full fetch
+    fetchOnlineTickets().then(() => {
+      // Seed known IDs from current state (avoid false-triggering on mount)
+      setOnlineTickets(prev => {
+        knownTicketIdsRef.current = new Set(prev.map(t => t.ticket_id));
+        return prev;
+      });
+    });
+
+    const channel = supabase
+      .channel(`online-tickets-${tripId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'tickets',
+          filter: `trip_id=eq.${tripId}`,
+        },
+        async (payload) => {
+          const isOnline = (row) => {
+            const pm = row?.payment_method;
+            return !pm || pm !== 'pos';
+          };
+
+          if (payload.eventType === 'INSERT') {
+            const row = payload.new;
+            if (!isOnline(row)) return;
+            const isNew = !knownTicketIdsRef.current.has(row.id);
+            if (!isNew) return;
+            knownTicketIdsRef.current.add(row.id);
+            triggerNewTicketAlert();
+
+            // Resolve stop names for just this ticket
+            const stopIds = [row.from_stop_id, row.to_stop_id].filter(Boolean);
+            let stopMap = {};
+            if (stopIds.length > 0) {
+              const { data: stops } = await supabase
+                .from('stops')
+                .select('id, stop_name')
+                .in('id', stopIds);
+              (stops || []).forEach(s => { stopMap[s.id] = s.stop_name; });
+            }
+
+            // Parse ver_meta_data for user info (only source for name/username)
+            const meta = row.ver_meta_data ? (typeof row.ver_meta_data === 'string' ? JSON.parse(row.ver_meta_data) : row.ver_meta_data) : {};
+
+            const newTicket = {
+              ticket_id: row.id,
+              user_id: row.user_id,
+              user_id_short: row.user_id ? row.user_id.slice(-3).toUpperCase() : 'N/A',
+              user_app_id: meta?.user_app_id ?? null,
+              username: meta?.username || null,
+              tamil_name: meta?.tamil_name || null,
+              avatar_url: meta?.avatar_url || null,
+              fare: parseFloat(row.total_fare ?? row.fare ?? 0),
+              ticket_count: row.ticket_count ?? 1,
+              booking_status: row.booking_status || 'booked',
+              is_verified: row.is_verified ?? false,
+              created_at: row.created_at,
+              verification_requested_at: row.verification_requested_at || null,
+              from: stopMap[row.from_stop_id] || 'Unknown',
+              to: stopMap[row.to_stop_id] || 'Unknown',
+              from_stop_id: row.from_stop_id,
+              to_stop_id: row.to_stop_id,
+              payment_method: row.payment_method || 'online',
+            };
+
+            // Prepend new ticket to top of list (no full reload)
+            setOnlineTickets(prev => [newTicket, ...prev]);
+
+            // Send notification only if setting is enabled
+            const notifSetting = await AsyncStorage.getItem('notif_new_tickets');
+            if (notifSetting !== 'false') {
+              sendNewTicketNotification(newTicket).catch(() => {});
+            }
+
+          } else if (payload.eventType === 'UPDATE') {
+            const row = payload.new;
+            if (!isOnline(row)) return;
+            // Patch the ticket in-place — no full reload
+            setOnlineTickets(prev => prev.map(t => {
+              if (t.ticket_id !== row.id) return t;
+              return {
+                ...t,
+                is_verified: row.is_verified ?? t.is_verified,
+                booking_status: row.booking_status || t.booking_status,
+                verification_requested_at: row.verification_requested_at ?? t.verification_requested_at,
+                fare: parseFloat(row.total_fare ?? row.fare ?? t.fare),
+              };
+            }));
+          } else if (payload.eventType === 'DELETE') {
+            const oldId = payload.old?.id;
+            if (oldId) {
+              knownTicketIdsRef.current.delete(oldId);
+              cancelTicketNotification(`new_ticket_${oldId}`).catch(() => {});
+              setOnlineTickets(prev => prev.filter(t => t.ticket_id !== oldId));
+            }
+          }
+        },
+      )
+      .subscribe();
+
+    onlineChannelRef.current = channel;
+
+    return () => {
+      supabase.removeChannel(channel);
+      onlineChannelRef.current = null;
+    };
+  }, [at?.trip_id, fetchOnlineTickets, triggerNewTicketAlert]);
+
+  // Ensure notification channels exist
+  useEffect(() => {
+    ensureChannels().catch(() => {});
+  }, []);
+
+  // Foreground notification handler — handles Print button on notification
+  useEffect(() => {
+    const unsub = registerForegroundHandler((notifId, ticket, result) => {
+      // Update local state after a successful print from notification
+      if (ticket?.ticket_id) {
+        setOnlineTickets(prev =>
+          prev.map(t =>
+            t.ticket_id === ticket.ticket_id ? { ...t, is_verified: true } : t,
+          ),
+        );
+        clearTicket(ticket.ticket_id);
+        showToast(`Ticket printed · ₹${ticket.fare ?? 0}`);
       }
-    };
-
-    // Do initial full fetch to set baseline
-    const init = async () => {
-      await fetchOnlineTickets();
-      const count = await checkTicketCount();
-      lastTicketCountRef.current = count;
-    };
-    init();
-
-    const interval = setInterval(poll, 5000);
-
-    return () => clearInterval(interval);
-  }, [at?.trip_id, fetchOnlineTickets, pollingAnim, checkTicketCount]);
+      if (result?.isTestingMode && result?.ticketInfo) {
+        setTicketData(result.ticketInfo);
+        setShowTicketModal(true);
+      }
+    });
+    return () => unsub();
+  }, [clearTicket]);
 
   // Filter and sort online tickets
   const filteredOnlineTickets = useCallback(() => {
@@ -937,6 +1234,10 @@ const TripScreen = () => {
         case 'from_stage':
           valA = parseInt(parseStopLabel(a.from).tripNum || '0', 10);
           valB = parseInt(parseStopLabel(b.from).tripNum || '0', 10);
+          break;
+        case 'verification_requested_at':
+          valA = new Date(a.verification_requested_at || 0).getTime();
+          valB = new Date(b.verification_requested_at || 0).getTime();
           break;
         case 'created_at':
         default:
@@ -1016,6 +1317,7 @@ const TripScreen = () => {
       const dbTripNumber = Number(data?.active_trip?.trip_number ?? 0);
       if (dbTripNumber > 0) {
         setLocalTripNumber(dbTripNumber);
+        AsyncStorage.setItem('active_trip_number', String(dbTripNumber)).catch(() => {});
         if (shouldResetTripNumber) {
           setResetNextTripNumber(false);
           resetNextTripNumberRef.current = false;
@@ -1024,6 +1326,7 @@ const TripScreen = () => {
         const nextNum = await assignTripNumber(tripId, conductorId, shouldResetTripNumber ? 1 : null, sessionStartRef.current);
         setLocalTripNumber(nextNum);
         setCtxTripNumber(nextNum);
+        AsyncStorage.setItem('active_trip_number', String(nextNum)).catch(() => {});
         if (shouldResetTripNumber) {
           setResetNextTripNumber(false);
           resetNextTripNumberRef.current = false;
@@ -1082,6 +1385,7 @@ const TripScreen = () => {
         const dbTripNumber = Number(dash?.active_trip?.trip_number ?? 0);
         if (dbTripNumber > 0) {
           setLocalTripNumber(dbTripNumber);
+          AsyncStorage.setItem('active_trip_number', String(dbTripNumber)).catch(() => {});
           if (shouldResetTripNumber) {
             setResetNextTripNumber(false);
             resetNextTripNumberRef.current = false;
@@ -1090,6 +1394,7 @@ const TripScreen = () => {
           const nextNum = await assignTripNumber(tripId, conductorId, shouldResetTripNumber ? 1 : null, sessionStartRef.current);
           setLocalTripNumber(nextNum);
           setCtxTripNumber(nextNum);
+          AsyncStorage.setItem('active_trip_number', String(nextNum)).catch(() => {});
           if (shouldResetTripNumber) {
             setResetNextTripNumber(false);
             resetNextTripNumberRef.current = false;
@@ -1506,6 +1811,7 @@ const TripScreen = () => {
       setCtxTrip(null);
       setCtxTripNumber(0);
       setLocalTripNumber(0);
+      AsyncStorage.setItem('active_trip_number', '0').catch(() => {});
       showToast('Trip ended');
       await handleTripStarted();
     } catch (e) {
@@ -1554,6 +1860,19 @@ const TripScreen = () => {
       clearTicket(id);
       showToast('Ticket verified ✓');
       fetchDashboard();
+    } catch (e) {
+      Alert.alert('Error', e?.message || 'Could not verify ticket.');
+    } finally {
+      setVerifyingTicket(null);
+    }
+  };
+
+  const handleVerifyOnlineTicket = async (id) => {
+    setVerifyingTicket(id);
+    try {
+      await verifyTicketSupabase(id);
+      setOnlineTickets(prev => prev.map(t => t.ticket_id === id ? { ...t, is_verified: true } : t));
+      showToast('Ticket verified ✓');
     } catch (e) {
       Alert.alert('Error', e?.message || 'Could not verify ticket.');
     } finally {
@@ -1717,8 +2036,8 @@ const TripScreen = () => {
                   <TouchableOpacity
                     onPress={() => navigation?.navigate?.('Reports')}
                     className="flex-row items-center gap-1.5 bg-sky-500/10 border border-sky-500/30 px-3 py-1.5 rounded-full">
-                    <FileText size={13} color="#38bdf8" />
-                    <Text className="text-sky-400 text-[11px] font-bold">Print</Text>
+                    {/* <FileText size={13} color="#38bdf8" /> */}
+                    <Text className="text-sky-400 text-[11px] font-bold">Running</Text>
                   </TouchableOpacity>
                 ) : (
                   <StatusBadge status={at.status} />
@@ -1832,13 +2151,26 @@ const TripScreen = () => {
                     }}
                   />
                 </View>
-                <TouchableOpacity
-                  onPress={() => setShowOnlineFilters(!showOnlineFilters)}
-                  className="flex-row items-center gap-1 px-2 py-1 rounded-lg bg-zinc-800"
-                >
-                  <Filter size={12} color="#71717a" />
-                  <Text className="text-zinc-500 text-xs">Filters</Text>
-                </TouchableOpacity>
+                <View className="flex-row items-center gap-2">
+                  <TouchableOpacity
+                    onPress={() => fetchOnlineTickets()}
+                    disabled={onlineTicketsLoading}
+                    className="flex-row items-center gap-1 px-2 py-1 rounded-lg bg-zinc-800"
+                  >
+                    {onlineTicketsLoading
+                      ? <ActivityIndicator size={10} color="#71717a" />
+                      : <ArrowRight size={12} color="#71717a" style={{ transform: [{ rotate: '-90deg' }] }} />
+                    }
+                    <Text className="text-zinc-500 text-xs">Refresh</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={() => setShowOnlineFilters(!showOnlineFilters)}
+                    className="flex-row items-center gap-1 px-2 py-1 rounded-lg bg-zinc-800"
+                  >
+                    <Filter size={12} color="#71717a" />
+                    <Text className="text-zinc-500 text-xs">Filters</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
 
               {/* Search Bar */}
@@ -1917,6 +2249,31 @@ const TripScreen = () => {
                 </View>
               )}
 
+              {/* Verify-request sort toggle */}
+              <View className="flex-row items-center mb-2 gap-2">
+                <TouchableOpacity
+                  onPress={() => {
+                    if (onlineSortBy === 'verification_requested_at') {
+                      setOnlineSortBy('created_at');
+                      setOnlineSortOrder('desc');
+                    } else {
+                      setOnlineSortBy('verification_requested_at');
+                      setOnlineSortOrder('asc');
+                    }
+                  }}
+                  className={`flex-row items-center gap-1 px-3 py-1.5 rounded-full border ${
+                    onlineSortBy === 'verification_requested_at'
+                      ? 'bg-amber-500/20 border-amber-500/50'
+                      : 'bg-zinc-800 border-zinc-700'
+                  }`}
+                >
+                  <ArrowUpDown size={10} color={onlineSortBy === 'verification_requested_at' ? '#f59e0b' : '#71717a'} />
+                  <Text className={`text-xs font-semibold ${
+                    onlineSortBy === 'verification_requested_at' ? 'text-amber-400' : 'text-zinc-500'
+                  }`}>Sort by request time</Text>
+                </TouchableOpacity>
+              </View>
+
               {/* Ticket List - Compact Table */}
               {onlineTicketsLoading ? (
                 <View className="items-center py-4">
@@ -1951,88 +2308,23 @@ const TripScreen = () => {
                           <SortHeader label="Time" sortKey="created_at" width={undefined} {...sp} />
                         </View>
                         <SortHeader label="Fare" sortKey="fare" width={50} align="right" {...sp} />
-                        <View style={{ width: 44, alignItems: 'center' }}>
-                          <MoreVertical size={12} color="#52525b" />
-                        </View>
+                        <View style={{ width: 20 }} />
                       </View>
                     );
                   })()}
 
-                  {displayedOnlineTickets.map((ticket, index) => {
-                    const fromParsed = parseStopLabel(ticket.from);
-                    const toParsed = parseStopLabel(ticket.to);
-                    const fromStage = fromParsed.tripNum ?? '—';
-                    const toStage = toParsed.tripNum ?? '—';
-                    const rowBg = ticket.is_verified ? 'rgba(16,185,129,0.08)' : 'transparent';
-
-                    return (
-                      <TouchableOpacity
-                        key={ticket.ticket_id}
-                        onPress={() => setTicketDetailModal(ticket)}
-                        onLongPress={() => setTicketDetailModal(ticket)}
-                        delayLongPress={400}
-                        style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 6, paddingHorizontal: 6, borderRadius: 6, marginBottom: 1, backgroundColor: rowBg }}
-                        activeOpacity={0.8}
-                      >
-                        {/* Avatar */}
-                        <View style={{ width: 30, height: 30, borderRadius: 15, backgroundColor: '#27272a', justifyContent: 'center', alignItems: 'center', overflow: 'hidden' }}>
-                          {ticket.avatar_url ? (
-                            <Image source={{ uri: ticket.avatar_url }} style={{ width: 30, height: 30 }} />
-                          ) : (
-                            <Text style={{ color: '#71717a', fontSize: 9, fontWeight: 'bold' }}>{index + 1}</Text>
-                          )}
-                        </View>
-
-                        {/* User ID */}
-                        <View style={{ width: 40, alignItems: 'center' }}>
-                          <Text style={{ color: '#fff', fontFamily: 'monospace', fontWeight: 'bold', fontSize: 13, letterSpacing: 1 }}>
-                            {ticket.user_id_short}
-                          </Text>
-                        </View>
-
-                        {/* From Stage */}
-                        <View style={{ width: 40, alignItems: 'center' }}>
-                          <Text style={{ color: '#fb923c', fontWeight: 'bold', fontSize: 13 }}>{fromStage}</Text>
-                        </View>
-
-                        {/* To Stage */}
-                        <View style={{ width: 40, alignItems: 'center' }}>
-                          <Text style={{ color: '#fbbf24', fontWeight: 'bold', fontSize: 13 }}>{toStage}</Text>
-                        </View>
-
-                        {/* Time - flex-1 fills remaining space */}
-                        <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-                          <Text style={{ color: '#71717a', fontSize: 10, textAlign: 'center' }} numberOfLines={1}>
-                            {relativeTime(ticket.created_at).replace(' ago', '')}
-                          </Text>
-                        </View>
-
-                        {/* Fare */}
-                        <View style={{ width: 50, alignItems: 'flex-end', paddingRight: 6 }}>
-                          <Text style={{ color: '#fff', fontWeight: 'bold', fontSize: 13 }}>₹{ticket.fare.toFixed(0)}</Text>
-                          {ticket.ticket_count > 1 && (
-                            <Text style={{ color: '#71717a', fontSize: 9 }}>x{ticket.ticket_count}</Text>
-                          )}
-                        </View>
-
-                        {/* Action column (Printer) */}
-                        <View style={{ width: 44, alignItems: 'center', justifyContent: 'center' }}>
-                          {printingTicket === ticket.ticket_id ? (
-                            <ActivityIndicator size="small" color="#38bdf8" />
-                          ) : (
-                            <TouchableOpacity
-                              onPress={() => !ticket.is_verified && handlePrintVerification(ticket)}
-                              disabled={ticket.is_verified}
-                              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                              style={{ padding: 4 }}
-                            >
-                              <Printer size={18} color={ticket.is_verified ? '#3f3f46' : '#38bdf8'} />
-                            </TouchableOpacity>
-                          )}
-                        </View>
-                      </TouchableOpacity>
-                    );
-                  })}
+                  {displayedOnlineTickets.map((ticket, index) => (
+                    <OnlineTicketRow
+                      key={ticket.ticket_id}
+                      ticket={ticket}
+                      index={index}
+                      onVerify={handleVerifyOnlineTicket}
+                      onPrint={handlePrintVerification}
+                      verifying={verifyingTicket}
+                      printing={printingTicket}
+                      onLongPress={setTicketDetailModal}
+                    />
+                  ))}
                 </View>
               )}
 
@@ -2271,27 +2563,31 @@ const TripScreen = () => {
                   ) : (
                     <View className="w-20 h-20 rounded-full bg-sky-500/20 items-center justify-center">
                       <Text className="text-sky-400 text-3xl font-bold">
-                        {ticketDetailModal.username ? ticketDetailModal.username[0].toUpperCase() : '?'}
+                        {ticketDetailModal.user_app_id ? ticketDetailModal.user_app_id[0].toUpperCase() : '?'}
                       </Text>
                     </View>
                   )}
+                  {ticketDetailModal.tamil_name ? (
+                    <Text className="text-white text-2xl font-black mt-3 text-center" numberOfLines={2}>
+                      {ticketDetailModal.tamil_name}
+                    </Text>
+                  ) : null}
+                  {ticketDetailModal.username ? (
+                    <Text className="text-zinc-500 text-sm mt-1" numberOfLines={1}>
+                      {ticketDetailModal.username}
+                    </Text>
+                  ) : null}
                 </View>
 
                 {/* User ID */}
                 <View className="items-center mb-4">
                   <Text className="text-zinc-500 text-xs mb-1">User ID</Text>
                   <Text className="text-white text-2xl font-mono font-bold tracking-wider">
-                    {ticketDetailModal.user_id_short}
+                    {ticketDetailModal.user_app_id ?? ticketDetailModal.user_id_short}
                   </Text>
                 </View>
 
                 {/* Username */}
-                <View className="bg-zinc-800 rounded-xl p-3 mb-3">
-                  <Text className="text-zinc-500 text-xs mb-1">Username</Text>
-                  <Text className="text-white text-base font-semibold" numberOfLines={1}>
-                    {ticketDetailModal.username}
-                  </Text>
-                </View>
 
                 {/* Route */}
                 <View className="bg-zinc-800 rounded-xl p-3 mb-3">
@@ -2336,8 +2632,8 @@ const TripScreen = () => {
         onRequestClose={() => {
           setShowTimeRangeModal(false);
           setEditingTimeRange(null);
-          setNewTimeRangeLabel('');
-          setNewTimeRangeSeconds('');
+          setNewTimeRangeValue('');
+          setNewTimeRangeUnit('seconds');
         }}
       >
         <View className="flex-1 bg-black/80 justify-center items-center px-4">
@@ -2347,8 +2643,8 @@ const TripScreen = () => {
               <TouchableOpacity onPress={() => {
                 setShowTimeRangeModal(false);
                 setEditingTimeRange(null);
-                setNewTimeRangeLabel('');
-                setNewTimeRangeSeconds('');
+                setNewTimeRangeValue('');
+                setNewTimeRangeUnit('seconds');
               }}>
                 <Text className="text-sky-400 font-semibold">Close</Text>
               </TouchableOpacity>
@@ -2359,33 +2655,44 @@ const TripScreen = () => {
               <Text className="text-zinc-400 text-xs font-semibold mb-2">Add New Range</Text>
               <View className="flex-row gap-2 mb-2">
                 <TextInput
-                  className="flex-1 bg-zinc-700 rounded-lg px-3 py-2 text-white text-sm"
-                  placeholder="Label (e.g., 20s, 2m)"
-                  placeholderTextColor="#52525b"
-                  value={newTimeRangeLabel}
-                  onChangeText={setNewTimeRangeLabel}
-                />
-                <TextInput
-                  className="flex-1 bg-zinc-700 rounded-lg px-3 py-2 text-white text-sm"
-                  placeholder="Seconds"
+                  className="flex-1 bg-zinc-700 rounded-l-lg px-3 py-2 text-white text-sm"
+                  placeholder="Value"
                   placeholderTextColor="#52525b"
                   keyboardType="numeric"
-                  value={newTimeRangeSeconds}
-                  onChangeText={setNewTimeRangeSeconds}
+                  value={newTimeRangeValue}
+                  onChangeText={setNewTimeRangeValue}
                 />
+                <TouchableOpacity
+                  onPress={() => {
+                    const units = ['seconds', 'minutes', 'hours'];
+                    const currentIndex = units.indexOf(newTimeRangeUnit);
+                    const nextUnit = units[(currentIndex + 1) % units.length];
+                    setNewTimeRangeUnit(nextUnit);
+                  }}
+                  className="bg-zinc-600 rounded-r-lg px-4 py-2 justify-center"
+                >
+                  <Text className="text-white text-sm font-semibold">
+                    {newTimeRangeUnit === 'seconds' ? 's' : newTimeRangeUnit === 'minutes' ? 'm' : 'h'}
+                  </Text>
+                </TouchableOpacity>
               </View>
               <TouchableOpacity
                 onPress={() => {
-                  const seconds = parseInt(newTimeRangeSeconds, 10);
-                  if (newTimeRangeLabel.trim() && !isNaN(seconds) && seconds > 0) {
+                  const value = parseInt(newTimeRangeValue, 10);
+                  if (!isNaN(value) && value > 0) {
+                    let seconds = value;
+                    const unitChar = newTimeRangeUnit === 'seconds' ? 's' : newTimeRangeUnit === 'minutes' ? 'm' : 'h';
+                    if (newTimeRangeUnit === 'minutes') seconds = value * 60;
+                    else if (newTimeRangeUnit === 'hours') seconds = value * 3600;
                     const newId = `custom_${Date.now()}`;
-                    setCustomTimeRanges(prev => [...prev, { id: newId, label: newTimeRangeLabel.trim(), seconds }]);
-                    setNewTimeRangeLabel('');
-                    setNewTimeRangeSeconds('');
+                    const label = `${value}${unitChar}`;
+                    setCustomTimeRanges(prev => [...prev, { id: newId, label, seconds }]);
+                    setNewTimeRangeValue('');
+                    setNewTimeRangeUnit('seconds');
                   }
                 }}
-                disabled={!newTimeRangeLabel.trim() || !newTimeRangeSeconds.trim()}
-                className={`py-2 rounded-lg items-center ${newTimeRangeLabel.trim() && newTimeRangeSeconds.trim() ? 'bg-sky-500' : 'bg-zinc-700'}`}
+                disabled={!newTimeRangeValue.trim()}
+                className={`py-2 rounded-lg items-center ${newTimeRangeValue.trim() ? 'bg-sky-500' : 'bg-zinc-700'}`}
               >
                 <Text className="text-white font-semibold text-sm">Add Range</Text>
               </TouchableOpacity>
@@ -2413,7 +2720,13 @@ const TripScreen = () => {
                   ) : (
                     <View className="flex-1">
                       <Text className="text-white font-semibold">{range.label}</Text>
-                      <Text className="text-zinc-500 text-xs">{range.seconds} seconds</Text>
+                      <Text className="text-zinc-500 text-xs">
+                        {range.seconds >= 3600
+                          ? `${Math.round(range.seconds / 3600 * 10) / 10}h`
+                          : range.seconds >= 60
+                            ? `${Math.floor(range.seconds / 60)}m ${range.seconds % 60}s`
+                            : `${range.seconds}s`}
+                      </Text>
                     </View>
                   )}
                   <View className="flex-row gap-1">
@@ -2465,8 +2778,8 @@ const TripScreen = () => {
               onPress={() => {
                 setShowTimeRangeModal(false);
                 setEditingTimeRange(null);
-                setNewTimeRangeLabel('');
-                setNewTimeRangeSeconds('');
+                setNewTimeRangeValue('');
+                setNewTimeRangeUnit('seconds');
               }}
               className="bg-sky-500 rounded-xl py-3 items-center mt-4"
             >

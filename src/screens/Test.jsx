@@ -1,173 +1,188 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   View,
   Text,
-  TextInput,
   TouchableOpacity,
   StyleSheet,
   ScrollView,
-  ActivityIndicator,
+  Platform,
+  Alert,
 } from 'react-native';
+import notifee, {
+  AndroidImportance,
+  AndroidStyle,
+  AuthorizationStatus,
+  EventType,
+} from '@notifee/react-native';
 
-const SAMPLE_NAMES = ['Arun', 'Priya', 'Soundarkumar', 'Karthik', 'Meena', 'Rajesh', 'Lakshmi'];
+// ─── Channel ID ───────────────────────────────────────────────────────────────
+const CHANNEL_ID = 'ticket_alerts';
 
-const translateToTamil = async (name) => {
-  try {
-    const response = await fetch(
-      `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ta&dt=t&q=${encodeURIComponent(name)}`
-    );
-    const data = await response.json();
-    return data[0][0][0]; // extract translated text
-  } catch (error) {
-    console.error('Translation error:', error);
-    return name;
-  }
-};
+// ─── Helper: create channel once ─────────────────────────────────────────────
+async function ensureChannel() {
+  if (Platform.OS !== 'android') return CHANNEL_ID;
+  await notifee.deleteChannel(CHANNEL_ID).catch(() => {});
+  await notifee.createChannel({
+    id: CHANNEL_ID,
+    name: 'Ticket Alerts',
+    importance: AndroidImportance.HIGH,
+    vibration: true,
+    sound: 'default',
+  });
+  return CHANNEL_ID;
+}
 
+// ─── Helper: request permission ───────────────────────────────────────────────
+async function requestPermission() {
+  const settings = await notifee.requestPermission();
+  return (
+    settings.authorizationStatus === AuthorizationStatus.AUTHORIZED ||
+    settings.authorizationStatus === AuthorizationStatus.PROVISIONAL
+  );
+}
+
+// ─── Helper: display notification ────────────────────────────────────────────
+async function sendTicketNotification({ title, body, ticketId }) {
+  const channelId = await ensureChannel();
+  await requestPermission();
+
+  await notifee.displayNotification({
+    id: ticketId ?? String(Date.now()),
+    title,
+    body,
+    android: {
+      channelId,
+      importance: AndroidImportance.HIGH,
+      style: { type: AndroidStyle.BIGTEXT, text: body },
+      pressAction: { id: 'default' },
+      actions: [
+        {
+          title: '🖨️ Print',
+          pressAction: { id: 'print', launchActivity: 'default' },
+        },
+        {
+          title: '✕ Cancel',
+          pressAction: { id: 'cancel' },
+        },
+      ],
+    },
+    ios: {
+      categoryId: 'ticket',
+      foregroundPresentationOptions: {
+        alert: true,
+        sound: true,
+        badge: true,
+      },
+    },
+  });
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
 export default function Test() {
-  const [inputName, setInputName] = useState('');
-  const [tamilName, setTamilName] = useState('');
-  const [history, setHistory] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+  const [log, setLog] = useState([]);
+  const [sending, setSending] = useState(false);
+  const counterRef = useRef(1);
 
-  const handleTranslate = async (name = inputName) => {
-    const trimmed = name.trim();
-    if (!trimmed) return;
+  const addLog = (msg) =>
+    setLog((prev) => [{ id: Date.now(), msg }, ...prev.slice(0, 19)]);
 
-    setLoading(true);
-    setError('');
-    setTamilName('');
+  // ── Foreground event handler ─────────────────────────────────────────────
+  useEffect(() => {
+    const unsub = notifee.onForegroundEvent(({ type, detail }) => {
+      const { notification, pressAction } = detail;
+      if (type === EventType.ACTION_PRESS) {
+        if (pressAction?.id === 'print') {
+          addLog(`✅ Print pressed — ticket #${notification?.id}`);
+          Alert.alert('Print', `Printing ticket #${notification?.id}`);
+        } else if (pressAction?.id === 'cancel') {
+          addLog(`❌ Cancel pressed — ticket #${notification?.id}`);
+          notifee.cancelNotification(notification.id);
+        }
+      } else if (type === EventType.PRESS) {
+        addLog(`👆 Notification tapped — #${notification?.id}`);
+      } else if (type === EventType.DISMISSED) {
+        addLog(`🗑️ Notification dismissed — #${notification?.id}`);
+      }
+    });
+    return () => unsub();
+  }, []);
 
+  // ── Test button handler ──────────────────────────────────────────────────
+  const handleTest = async () => {
+    setSending(true);
     try {
-      const result = await translateToTamil(trimmed);
-      setTamilName(result);
-      setHistory((prev) => [
-        { english: trimmed, tamil: result, id: Date.now() },
-        ...prev.slice(0, 9),
-      ]);
-    } catch (err) {
-      setError('Translation failed. Check your internet connection.');
+      const num = counterRef.current++;
+      const ticketId = `ticket_${num}`;
+      await sendTicketNotification({
+        title: `🎫 New Ticket #${num}`,
+        body: `Passenger: Kumar  •  Stage 5 → 12  •  ₹24`,
+        ticketId,
+      });
+      addLog(`📤 Sent notification #${num}`);
+    } catch (e) {
+      addLog(`⚠️ Error: ${e?.message ?? String(e)}`);
+      Alert.alert('Error', e?.message ?? 'Failed to send notification');
     } finally {
-      setLoading(false);
+      setSending(false);
     }
   };
 
-  const handleSamplePress = (name) => {
-    setInputName(name);
-    handleTranslate(name);
-  };
-
-  const handleClear = () => {
-    setInputName('');
-    setTamilName('');
-    setError('');
-  };
-
   return (
-    <ScrollView style={styles.container} keyboardShouldPersistTaps="handled">
+    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
       {/* Header */}
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Tamil Translator</Text>
-        <Text style={styles.headerSubtitle}>English → தமிழ்  •  Powered by MyMemory</Text>
+        <Text style={styles.headerTitle}>Notifee Test</Text>
+        <Text style={styles.headerSubtitle}>Push notifications with action buttons</Text>
       </View>
 
-      {/* Input Section */}
-      <View style={styles.card}>
-        <Text style={styles.label}>Enter Name (English)</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="e.g. Soundarkumar"
-          placeholderTextColor="#aaa"
-          value={inputName}
-          onChangeText={(text) => {
-            setInputName(text);
-            setError('');
-          }}
-          onSubmitEditing={() => handleTranslate()}
-          returnKeyType="done"
-          autoCapitalize="words"
-        />
-
-        {/* Error */}
-        {error !== '' && (
-          <Text style={styles.errorText}>⚠️ {error}</Text>
-        )}
-
-        <View style={styles.buttonRow}>
-          <TouchableOpacity
-            style={[
-              styles.button,
-              styles.primaryButton,
-              (!inputName.trim() || loading) && styles.disabledButton,
-            ]}
-            onPress={() => handleTranslate()}
-            disabled={!inputName.trim() || loading}
-          >
-            {loading ? (
-              <ActivityIndicator color="#fff" size="small" />
-            ) : (
-              <Text style={styles.primaryButtonText}>Translate →</Text>
-            )}
-          </TouchableOpacity>
-
-          <TouchableOpacity style={[styles.button, styles.clearButton]} onPress={handleClear}>
-            <Text style={styles.clearButtonText}>Clear</Text>
-          </TouchableOpacity>
-        </View>
+      {/* Test button */}
+      <View style={styles.section}>
+        <Text style={styles.sectionLabel}>Send a test notification</Text>
+        <Text style={styles.hint}>
+          Press the button below. A notification will appear with{' '}
+          <Text style={styles.bold}>Print</Text> and{' '}
+          <Text style={styles.bold}>Cancel</Text> action buttons.
+        </Text>
+        <TouchableOpacity
+          style={[styles.testBtn, sending && styles.testBtnBusy]}
+          onPress={handleTest}
+          disabled={sending}
+          activeOpacity={0.8}
+        >
+          <Text style={styles.testBtnText}>
+            {sending ? 'Sending…' : '🔔  Send Test Notification'}
+          </Text>
+        </TouchableOpacity>
       </View>
 
-      {/* Result */}
-      {tamilName !== '' && (
-        <View style={styles.resultCard}>
-          <Text style={styles.resultLabel}>Translation Result</Text>
-          <Text style={styles.resultEnglish}>{inputName}</Text>
-          <Text style={styles.arrow}>↓</Text>
-          <Text style={styles.resultTamil}>{tamilName}</Text>
-        </View>
-      )}
-
-      {/* Sample Names */}
-      <View style={styles.card}>
-        <Text style={styles.label}>Try Sample Names</Text>
-        <View style={styles.chipContainer}>
-          {SAMPLE_NAMES.map((name) => (
-            <TouchableOpacity
-              key={name}
-              style={styles.chip}
-              onPress={() => handleSamplePress(name)}
-              disabled={loading}
-            >
-              <Text style={styles.chipText}>{name}</Text>
+      {/* Action log */}
+      {log.length > 0 && (
+        <View style={styles.section}>
+          <View style={styles.logHeader}>
+            <Text style={styles.sectionLabel}>Event Log</Text>
+            <TouchableOpacity onPress={() => setLog([])}>
+              <Text style={styles.clearBtn}>Clear</Text>
             </TouchableOpacity>
-          ))}
-        </View>
-      </View>
-
-      {/* History */}
-      {history.length > 0 && (
-        <View style={styles.card}>
-          <Text style={styles.label}>Recent Translations</Text>
-          {history.map((item) => (
-            <View key={item.id} style={styles.historyRow}>
-              <Text style={styles.historyEnglish}>{item.english}</Text>
-              <Text style={styles.historyArrow}>→</Text>
-              <Text style={styles.historyTamil}>{item.tamil}</Text>
+          </View>
+          {log.map((entry) => (
+            <View key={entry.id} style={styles.logRow}>
+              <Text style={styles.logText}>{entry.msg}</Text>
             </View>
           ))}
         </View>
       )}
 
-      {/* Note */}
-      <View style={styles.noteCard}>
-        <Text style={styles.noteTitle}>💡 Note</Text>
-        <Text style={styles.noteText}>
-          MyMemory API is free with a limit of 1000 words/day. No API key or billing required.
-          Requires internet connection to translate.
+      {/* Info */}
+      <View style={styles.infoCard}>
+        <Text style={styles.infoTitle}>ℹ️ How it works</Text>
+        <Text style={styles.infoText}>
+          • Tap the button → notification pops up{'\n'}
+          • Tap <Text style={styles.bold}>Print</Text> → action fires (foreground & background){'\n'}
+          • Tap <Text style={styles.bold}>Cancel</Text> → notification dismissed{'\n'}
+          • Swipe away → DISMISSED event logged{'\n'}
+          • Works foreground, background & killed state
         </Text>
       </View>
-
-      <View style={{ height: 40 }} />
     </ScrollView>
   );
 }
@@ -175,194 +190,111 @@ export default function Test() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F4F6FB',
+    backgroundColor: '#0d0d0f',
+  },
+  scrollContent: {
+    paddingBottom: 40,
   },
   header: {
-    backgroundColor: '#0f4c81',
+    backgroundColor: '#111113',
     paddingTop: 60,
     paddingBottom: 28,
     paddingHorizontal: 24,
+    borderBottomWidth: 1,
+    borderBottomColor: '#27272a',
   },
   headerTitle: {
-    fontSize: 28,
+    fontSize: 26,
     fontWeight: '800',
     color: '#ffffff',
-    letterSpacing: 0.5,
+    letterSpacing: 0.4,
   },
   headerSubtitle: {
     fontSize: 13,
-    color: '#93c5fd',
-    marginTop: 5,
-    fontWeight: '500',
+    color: '#71717a',
+    marginTop: 4,
   },
-  card: {
-    backgroundColor: '#ffffff',
+  section: {
+    backgroundColor: '#111113',
     borderRadius: 16,
     padding: 20,
     marginHorizontal: 16,
     marginTop: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    elevation: 3,
+    borderWidth: 1,
+    borderColor: '#27272a',
   },
-  label: {
-    fontSize: 12,
+  sectionLabel: {
+    fontSize: 11,
     fontWeight: '700',
-    color: '#6b7280',
+    color: '#52525b',
     textTransform: 'uppercase',
-    letterSpacing: 0.8,
-    marginBottom: 12,
+    letterSpacing: 1,
+    marginBottom: 10,
   },
-  input: {
-    borderWidth: 1.5,
-    borderColor: '#e5e7eb',
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    fontSize: 18,
-    color: '#111827',
-    backgroundColor: '#fafafa',
+  hint: {
+    fontSize: 14,
+    color: '#a1a1aa',
+    lineHeight: 21,
+    marginBottom: 18,
   },
-  errorText: {
-    color: '#dc2626',
-    fontSize: 13,
-    marginTop: 8,
+  bold: {
+    fontWeight: '700',
+    color: '#e4e4e7',
   },
-  buttonRow: {
-    flexDirection: 'row',
-    gap: 10,
-    marginTop: 14,
-  },
-  button: {
-    flex: 1,
-    borderRadius: 12,
-    paddingVertical: 14,
+  testBtn: {
+    backgroundColor: '#0ea5e9',
+    borderRadius: 14,
+    paddingVertical: 16,
     alignItems: 'center',
-    justifyContent: 'center',
   },
-  primaryButton: {
-    backgroundColor: '#0f4c81',
-    flex: 2,
+  testBtnBusy: {
+    backgroundColor: '#0369a1',
   },
-  disabledButton: {
-    backgroundColor: '#93c5fd',
-  },
-  primaryButtonText: {
+  testBtnText: {
     color: '#ffffff',
     fontSize: 16,
     fontWeight: '700',
+    letterSpacing: 0.3,
   },
-  clearButton: {
-    backgroundColor: '#f3f4f6',
-    borderWidth: 1,
-    borderColor: '#e5e7eb',
+  logHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
   },
-  clearButtonText: {
-    color: '#6b7280',
-    fontSize: 15,
+  clearBtn: {
+    fontSize: 12,
+    color: '#ef4444',
     fontWeight: '600',
   },
-  resultCard: {
-    backgroundColor: '#0f4c81',
-    borderRadius: 16,
-    padding: 24,
-    marginHorizontal: 16,
-    marginTop: 16,
-    alignItems: 'center',
-    shadowColor: '#0f4c81',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 12,
-    elevation: 6,
-  },
-  resultLabel: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: '#93c5fd',
-    textTransform: 'uppercase',
-    letterSpacing: 1.2,
-    marginBottom: 12,
-  },
-  resultEnglish: {
-    fontSize: 20,
-    color: '#bfdbfe',
-    fontWeight: '500',
-  },
-  arrow: {
-    fontSize: 20,
-    color: '#60a5fa',
-    marginVertical: 8,
-  },
-  resultTamil: {
-    fontSize: 42,
-    color: '#ffffff',
-    fontWeight: '700',
-    textAlign: 'center',
-    lineHeight: 56,
-  },
-  chipContainer: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  chip: {
-    backgroundColor: '#eff6ff',
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderWidth: 1,
-    borderColor: '#bfdbfe',
-  },
-  chipText: {
-    color: '#1d4ed8',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  historyRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 10,
+  logRow: {
+    paddingVertical: 7,
     borderBottomWidth: 1,
-    borderBottomColor: '#f3f4f6',
-    gap: 10,
+    borderBottomColor: '#1f1f23',
   },
-  historyEnglish: {
-    fontSize: 15,
-    color: '#374151',
-    fontWeight: '500',
-    flex: 1,
+  logText: {
+    fontSize: 13,
+    color: '#a1a1aa',
+    fontFamily: Platform.OS === 'android' ? 'monospace' : 'Courier',
   },
-  historyArrow: {
-    fontSize: 14,
-    color: '#9ca3af',
-  },
-  historyTamil: {
-    fontSize: 20,
-    color: '#0f4c81',
-    fontWeight: '600',
-    flex: 1,
-    textAlign: 'right',
-  },
-  noteCard: {
-    backgroundColor: '#eff6ff',
-    borderRadius: 16,
+  infoCard: {
+    backgroundColor: '#0c1a2e',
+    borderRadius: 14,
     padding: 16,
     marginHorizontal: 16,
     marginTop: 16,
     borderWidth: 1,
-    borderColor: '#bfdbfe',
+    borderColor: '#1e3a5f',
   },
-  noteTitle: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#1e40af',
-    marginBottom: 6,
-  },
-  noteText: {
+  infoTitle: {
     fontSize: 13,
-    color: '#1d4ed8',
-    lineHeight: 20,
+    fontWeight: '700',
+    color: '#38bdf8',
+    marginBottom: 8,
+  },
+  infoText: {
+    fontSize: 13,
+    color: '#7dd3fc',
+    lineHeight: 22,
   },
 });

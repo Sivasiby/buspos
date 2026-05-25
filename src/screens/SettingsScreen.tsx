@@ -13,7 +13,7 @@ import {
   Modal,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Printer, RotateCcw, QrCode, Bus, ChevronRight, Check } from 'lucide-react-native';
+import { Printer, RotateCcw, QrCode, Bus, ChevronRight, Check, LogOut } from 'lucide-react-native';
 import ImageResizer from '@bam.tech/react-native-image-resizer';
 import RNFS from 'react-native-fs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -124,10 +124,11 @@ const Field = ({
 );
 
 // ─── Main Screen ──────────────────────────────────────────────────────────────
-export default function SettingsScreen() {
+export default function SettingsScreen({ onLogout }: { onLogout?: () => void }) {
   const [content, setContent] = useState({ ...DEFAULTS });
   const [printing, setPrinting] = useState(false);
   const [testingMode, setTestingMode] = useState(false);
+  const [newTicketNotif, setNewTicketNotif] = useState(false);
   const [buses, setBuses] = useState<any[]>([]);
   const [currentBus, setCurrentBus] = useState<any>(null);
   const [loadingBuses, setLoadingBuses] = useState(false);
@@ -135,15 +136,19 @@ export default function SettingsScreen() {
   const [updatingBus, setUpdatingBus] = useState(false);
 
   useEffect(() => {
-    const loadTestingMode = async () => {
+    const loadSettings = async () => {
       try {
         const saved = await AsyncStorage.getItem('testing_mode');
         setTestingMode(saved === 'true');
       } catch (e) {
         console.error('Failed to load testing mode:', e);
       }
+      try {
+        const saved = await AsyncStorage.getItem('notif_new_tickets');
+        setNewTicketNotif(saved === 'true');
+      } catch {}
     };
-    loadTestingMode();
+    loadSettings();
   }, []);
 
   useEffect(() => {
@@ -248,6 +253,15 @@ export default function SettingsScreen() {
     } catch (e) {
       console.error('Failed to save testing mode:', e);
     }
+  };
+
+  const toggleNewTicketNotif = async () => {
+    const newValue = !newTicketNotif;
+    setNewTicketNotif(newValue);
+    try {
+      await AsyncStorage.setItem('notif_new_tickets', String(newValue));
+      showToast(newValue ? 'New ticket notifications on' : 'New ticket notifications off');
+    } catch {}
   };
 
   const update = (key: keyof typeof DEFAULTS) => (val: string) =>
@@ -393,6 +407,33 @@ await NyxPrinter.printText(content.footer, { textSize: 30, align: PrintAlign.CEN
           )}
         </View>
 
+        {/* ── Notification Settings ── */}
+        <View className="bg-zinc-900/50 border border-white/10 rounded-2xl p-4 mb-4">
+          <Text className="text-white text-sm font-bold mb-4 tracking-wide">Notifications</Text>
+
+          <View className="flex-row items-center justify-between mb-4">
+            <View className="flex-1 pr-4">
+              <Text className="text-white text-sm font-semibold">New App Ticket Alerts</Text>
+              <Text className="text-zinc-500 text-xs mt-0.5">Notify when a passenger books via the app</Text>
+            </View>
+            <TouchableOpacity
+              onPress={toggleNewTicketNotif}
+              className={`w-12 h-7 rounded-full p-1 ${newTicketNotif ? 'bg-sky-500' : 'bg-zinc-700'}`}>
+              <View className={`w-5 h-5 rounded-full bg-white ${newTicketNotif ? 'translate-x-5' : 'translate-x-0'}`} />
+            </TouchableOpacity>
+          </View>
+
+          <View className="flex-row items-center justify-between">
+            <View className="flex-1 pr-4">
+              <Text className="text-white text-sm font-semibold">Verification Requests</Text>
+              <Text className="text-zinc-500 text-xs mt-0.5">Always on — cannot be disabled</Text>
+            </View>
+            <View className="w-12 h-7 rounded-full p-1 bg-sky-500/40">
+              <View className="w-5 h-5 rounded-full bg-white/50 translate-x-5" />
+            </View>
+          </View>
+        </View>
+
         {/* ── Testing Mode Toggle ── */}
         <View className="bg-zinc-900/50 border border-white/10 rounded-2xl p-4 mb-4">
           <View className="flex-row items-center justify-between">
@@ -422,6 +463,21 @@ await NyxPrinter.printText(content.footer, { textSize: 30, align: PrintAlign.CEN
             in black & white for best scan accuracy.
           </Text>
         </View>
+
+        {/* ── Logout ── */}
+        {onLogout && (
+          <TouchableOpacity
+            onPress={() =>
+              Alert.alert('Logout', 'Are you sure you want to logout?', [
+                { text: 'Cancel', style: 'cancel' },
+                { text: 'Logout', style: 'destructive', onPress: onLogout },
+              ])
+            }
+            className="flex-row items-center justify-center gap-2 border border-red-500/40 bg-red-950/30 rounded-2xl py-4 mb-2">
+            <LogOut size={18} color="#f87171" />
+            <Text className="text-red-400 text-base font-bold tracking-wide">Logout</Text>
+          </TouchableOpacity>
+        )}
       </ScrollView>
 
       {/* ── Sticky print button ── */}
