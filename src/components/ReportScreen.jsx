@@ -705,6 +705,13 @@ const TripSheetTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
   const [showFilterEndDrop, setShowFilterEndDrop] = useState(false);
   const [tableTab, setTableTab] = useState('full');
 
+  // Reload POS data when screen comes into focus (fresh tickets may have been issued)
+  useFocusEffect(
+    useCallback(() => {
+      posHook.reload?.();
+    }, [posHook]),
+  );
+
   const at = dashboard?.active_trip;
 
   // Build trip list: active first, then recent
@@ -905,6 +912,19 @@ const posTix = (posHook?.tickets ?? []).filter(
     const printCombinedTotal = isFiltered ? printGrandCollection : combinedTotal;
 
     if (isTestingMode) {
+      // Calculate ticket number range
+      const today = new Date().toDateString();
+      const todayAllTicketNums = (posHook?.tickets ?? [])
+        .filter(t => new Date(t.issued_at).toDateString() === today)
+        .map(t => Number(t.ticket_number))
+        .filter(n => !isNaN(n) && n > 0);
+      const currentTripTicketNums = posTix.map(t => Number(t.ticket_number)).filter(n => !isNaN(n) && n > 0);
+      const firstTicketNum = todayAllTicketNums.length > 0 ? Math.min(...todayAllTicketNums) : null;
+      const lastTicketNum = currentTripTicketNums.length > 0 ? Math.max(...currentTripTicketNums) : null;
+      const ticketRangeStr = firstTicketNum && lastTicketNum
+        ? `${firstTicketNum} - ${lastTicketNum}`
+        : (firstTicketNum || lastTicketNum || null);
+
       setPrintModalData({
         title: 'TRIP SHEET',
         busNo: _busNo,
@@ -919,6 +939,7 @@ const posTix = (posHook?.tickets ?? []).filter(
         combinedTotal: printCombinedTotal,
         type: 'tripsheet',
         filterLabel: isFiltered ? `FILTERED: ${getFilterDisplayName(filterStart)} → ${getFilterDisplayName(filterEnd)}` : null,
+        ticketRange: ticketRangeStr,
       });
       setShowPrintModal(true);
       return;
@@ -1535,7 +1556,7 @@ const posTix = (posHook?.tickets ?? []).filter(
       <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.80)', justifyContent: 'center', alignItems: 'center', padding: 16 }}>
         <View style={{ backgroundColor: '#18181b', borderRadius: 20, padding: 20, width: '100%', maxWidth: 380, borderWidth: 1, borderColor: '#3f3f46', maxHeight: '90%' }}>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '800' }}>Print ---Preview</Text>
+            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '800' }}>Print Preview</Text>
             <TouchableOpacity onPress={() => setShowPrintModal(false)}>
               <Text style={{ color: '#38bdf8', fontWeight: '700', fontSize: 14 }}>Close</Text>
             </TouchableOpacity>
@@ -1550,6 +1571,7 @@ const posTix = (posHook?.tickets ?? []).filter(
                   <Text style={{ color: '#000', textAlign: 'center', fontSize: 10, fontWeight: '700', marginBottom: 2 }}>{printModalData.filterLabel}</Text>
                 )}
                 <Text style={{ color: '#000', textAlign: 'center', fontSize: 12, marginBottom: 2 }}>BUS: {printModalData.busNo}  TRIP #: {printModalData.tripNum}</Text>
+                <Text style={{ color: '#000', textAlign: 'center', fontSize: 12, marginBottom: 2 }}>TKT: {printModalData.ticketRange ?? '—'}</Text>
                 <Text style={{ color: '#000', textAlign: 'center', fontSize: 12, marginBottom: 2 }}>WB: {printModalData.wayBill}</Text>
                 <Text style={{ color: '#000', textAlign: 'center', fontSize: 12, marginBottom: 6 }}>{printModalData.dateStr}  {printModalData.timeStr}</Text>
                 <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginBottom: 4 }}>{'- - - - - - - - - - - - - - - -'}</Text>
@@ -1602,6 +1624,13 @@ const StatusReportTab = ({ dashboard, posHook, refreshing, onRefresh }) => {
   const [filteredData, setFilteredData] = useState(null);
   const [showStatusModal, setShowStatusModal] = useState(false);
   const [statusModalData, setStatusModalData] = useState(null);
+
+  // Reload POS data when screen comes into focus
+  useFocusEffect(
+    useCallback(() => {
+      posHook.reload?.();
+    }, [posHook]),
+  );
 
 const STORAGE_KEY_DEST = 'report_dest_place';
   const STORAGE_KEY_OVERRIDE_START = 'report_override_start_place';
@@ -1791,12 +1820,21 @@ useEffect(() => {
       const grandCollection = stageRows.reduce((s, r) => s + r.amt, 0);
       const totalTickets = grandFull + grandHalf;
 
+      // Ticket number range: from all POS tickets for this trip
+      const allTripTicketNums = allPosTix.map(t => Number(t.ticket_number)).filter(n => !isNaN(n) && n > 0);
+      const firstTktNum = allTripTicketNums.length > 0 ? Math.min(...allTripTicketNums) : null;
+      const lastTktNum = allTripTicketNums.length > 0 ? Math.max(...allTripTicketNums) : null;
+      const tktRangeStr = firstTktNum && lastTktNum
+        ? `${firstTktNum} - ${lastTktNum}`
+        : (firstTktNum || lastTktNum || null);
+
       setFilteredData({
         stageRows,
         grandFull,
         grandHalf,
         grandCollection,
         totalTickets,
+        ticketRange: tktRangeStr,
       });
     } catch (e) {
       console.error('Error filtering tickets:', e);
@@ -1829,6 +1867,7 @@ useEffect(() => {
         stageRows: filteredData.stageRows,
         grandFull: filteredData.grandFull,
         grandCollection: filteredData.grandCollection,
+        ticketRange: filteredData.ticketRange ?? null,
       });
       setShowStatusModal(true);
       return;
@@ -1856,6 +1895,9 @@ useEffect(() => {
       await NyxPrinter.printText('SPS TRANSPORT', { textSize: 22, align: PrintAlign.CENTER });
       await NyxPrinter.printText('STATUS REPORT', { textSize: 26, align: PrintAlign.CENTER, bold: true });
       await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
+      if (filteredData.ticketRange) {
+        await NyxPrinter.printText(`TKT: ${filteredData.ticketRange}`, { textSize: 22, align: PrintAlign.CENTER });
+      }
 
       const COL = { ss:6, es:6, f:5, h:5, l:5, p:5, amt:8 };
       const hdr =
@@ -2140,6 +2182,7 @@ useEffect(() => {
                 <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 15, marginBottom: 4 }}>SPS TRANSPORT</Text>
                 <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 17, marginBottom: 6 }}>STATUS REPORT</Text>
                 <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginBottom: 6 }}>{'--------------------------------'}</Text>
+                <Text style={{ color: '#000', textAlign: 'center', fontSize: 12, marginBottom: 2 }}>TKT: {statusModalData.ticketRange ?? '—'}</Text>
                 <View style={{ flexDirection: 'row', marginBottom: 2 }}>
                   {['SS','ES','F','H','L','P','AMT'].map((h, i) => (
                     <Text key={i} style={{ flex: i === 6 ? 2 : 1, textAlign: i === 6 ? 'right' : 'center', fontSize: 10, fontWeight: '800', color: '#333' }}>{h}</Text>

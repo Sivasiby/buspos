@@ -1191,10 +1191,11 @@ const TripScreen = () => {
     if (onlineSearchQuery.trim()) {
       const query = onlineSearchQuery.toLowerCase().trim();
       result = result.filter(t =>
-        t.username.toLowerCase().includes(query) ||
-        t.user_id_short.toLowerCase().includes(query) ||
-        t.from.toLowerCase().includes(query) ||
-        t.to.toLowerCase().includes(query)
+        (t.username ?? '').toLowerCase().includes(query) ||
+        (t.user_app_id != null ? String(t.user_app_id).toLowerCase() : '').includes(query) ||
+        (t.user_id_short ?? '').toLowerCase().includes(query) ||
+        (t.from ?? '').toLowerCase().includes(query) ||
+        (t.to ?? '').toLowerCase().includes(query)
       );
     }
 
@@ -1228,8 +1229,8 @@ const TripScreen = () => {
           valB = b.fare;
           break;
         case 'username':
-          valA = a.username.toLowerCase();
-          valB = b.username.toLowerCase();
+          valA = (a.username ?? '').toLowerCase();
+          valB = (b.username ?? '').toLowerCase();
           break;
         case 'from_stage':
           valA = parseInt(parseStopLabel(a.from).tripNum || '0', 10);
