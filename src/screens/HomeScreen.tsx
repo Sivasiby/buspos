@@ -6,7 +6,7 @@ import {
 } from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
 import {
-  ArrowUpDown, Minus, Plus, Play,
+  ArrowUpDown, Play,
   Bus, AlertCircle, Download, CloudOff, WifiOff, Bell,
 } from 'lucide-react-native';
 import {getRandomFortune} from '../utils/fortune';
@@ -265,36 +265,6 @@ const getNextTicketNumber = async (busId) => {
   }
 };
 
-// ─── Counter Component ────────────────────────────────────────────────────────
-const Counter = ({label, sublabel, value, onChange, accentColor = '#ffffff'}) => (
-  <View className="flex-1 items-center gap-1.5">
-    <Text className="text-zinc-500 text-[10px] font-bold tracking-widest uppercase">{label}</Text>
-    {sublabel ? <Text className="text-zinc-600 text-[10px]">{sublabel}</Text> : <View className="h-3.5" />}
-    <View className="flex-row items-center bg-zinc-900 rounded-2xl border border-white/10 overflow-hidden">
-      <TouchableOpacity
-        onPress={() => onChange(Math.max(0, value - 1))}
-        disabled={value <= 0}
-        className="w-10 h-10 items-center justify-center bg-zinc-800"
-        activeOpacity={0.7}>
-        <Minus size={14} color={value <= 0 ? '#52525b' : '#ffffff'} />
-      </TouchableOpacity>
-      <TextInput
-        style={{color: accentColor}}
-        className="text-center text-lg font-black w-10"
-        keyboardType="numeric"
-        value={String(value)}
-        onChangeText={v => onChange(Math.max(0, Number(v.replace(/[^0-9]/g, '')) || 0))}
-      />
-      <TouchableOpacity
-        onPress={() => onChange(value + 1)}
-        className="w-10 h-10 items-center justify-center bg-zinc-800"
-        activeOpacity={0.7}>
-        <Plus size={14} color="#ffffff" />
-      </TouchableOpacity>
-    </View>
-  </View>
-);
-
 // ─── TicketTab ────────────────────────────────────────────────────────────────
 const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}) => {
   const tripDirection = activeTrip?.direction ?? 'up';
@@ -309,9 +279,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
   const [activeDrop, setActiveDrop] = useState<string | null>('start');
   const [dirErr, setDirErr] = useState(null);
   const [issuing, setIssuing] = useState(false);
-  const [luggageInput, setLuggageInput] = useState('0');
-  const [fullCount, setFullCount] = useState(1);
-  const [halfCount, setHalfCount] = useState(0);
+  const [ticketType, setTicketType] = useState<'full' | 'half' | 'luggage' | null>('full');
   const [showTicketModal, setShowTicketModal] = useState(false);
   const [ticketData, setTicketData] = useState<any>(null);
   const [isConnected, setIsConnected] = useState(true);
@@ -385,7 +353,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
       }
       setDirErr(null);
       if (!isFirstMount.current) {
-        setFullCount(1); setHalfCount(0); setLuggageInput('0');
+        setTicketType('full');
       }
       isFirstMount.current = false;
     };
@@ -396,13 +364,13 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
 
   const baseFullFare = selStart?.key && selDest?.key ? getFare(selStart.key, selDest.key) : 0;
   const baseHalfFare = halfFare(baseFullFare);
-  const fullTotal = baseFullFare * fullCount;
-  const halfTotal = baseHalfFare * halfCount;
-  const luggageAmount = parseAmount(luggageInput);
+  const LUGGAGE_FIXED_FARE = 10;
+  const luggageAmount = ticketType === 'luggage' ? LUGGAGE_FIXED_FARE : 0;
+  const fullTotal = ticketType === 'full' ? baseFullFare : 0;
+  const halfTotal = ticketType === 'half' ? baseHalfFare : 0;
   const grandTotal = fullTotal + halfTotal + luggageAmount;
-  const totalTickets = fullCount + halfCount + (luggageAmount > 0 ? 1 : 0);
-  const hasPassengerTickets = fullCount > 0 || halfCount > 0;
-  const isReady = !!(selStart && selDest && !dirErr && (luggageAmount > 0 || (hasPassengerTickets && baseFullFare > 0)) && isConnected);
+  const totalTickets = ticketType ? 1 : 0;
+  const isReady = !!(selStart && selDest && !dirErr && ticketType && isConnected);
 
   useEffect(() => {
     setDirErr(null);
@@ -450,9 +418,9 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
       const tnum = selDest?.label?.split('-')[1] ?? '';
 
       let cFull = 0, cHalf = 0, cLug = 0;
-      if (fullCount > 0) cFull = 1;
-      else if (halfCount > 0) cHalf = 1;
-      else if (luggageAmount > 0) cLug = luggageAmount;
+      if (ticketType === 'full') cFull = 1;
+      else if (ticketType === 'half') cHalf = 1;
+      else if (ticketType === 'luggage') cLug = luggageAmount;
 
       const cFullTotal = cFull * baseFullFare;
       const cHalfTotal = cHalf * baseHalfFare;
@@ -549,10 +517,10 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
             to_stop: `${tnum}-${tn}`,
             from_key: selStart?.key || '',
             to_key: selDest?.key || '',
-            ticket_count: 0,
+            ticket_count: 1,
             fare: cLug,
-            unit_fare: 0,
-            ticket_type: 'full',
+            unit_fare: cLug,
+            ticket_type: 'luggage',
             luggage_amount: cLug,
             ticket_number: fullTicketNum,
             trip_number: effectiveTripNumber > 0 ? effectiveTripNumber : null,
@@ -564,22 +532,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
 
         showToast(`Ticket issued · ₹${cGrandTotal}`);
 
-        const nextFull = fullCount - cFull;
-        const nextHalf = halfCount - cHalf;
-        const nextLug = luggageAmount - cLug;
-
-        if (nextFull === 0 && nextHalf === 0) {
-          setFullCount(1);
-          setHalfCount(0);
-        } else {
-          setFullCount(nextFull);
-          setHalfCount(nextHalf);
-        }
-        if (cLug > 0) setLuggageInput('0');
-
-        if (nextFull === 0 && nextHalf === 0 && nextLug === 0) {
-          setActiveDrop(null);
-        }
+        // Reset to full ticket type after issuing
 
         // Show modal instead of printing
         setTicketData(ticketInfo);
@@ -664,10 +617,10 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
           to_stop: `${tnum}-${tn}`,
           from_key: selStart?.key || '',
           to_key: selDest?.key || '',
-          ticket_count: 0,
+          ticket_count: 1,
           fare: cLug,
-          unit_fare: 0,
-          ticket_type: 'full',
+          unit_fare: cLug,
+          ticket_type: 'luggage',
           luggage_amount: cLug,
           ticket_number: fullTicketNum,
           trip_number: effectiveTripNumber > 0 ? effectiveTripNumber : null,
@@ -679,24 +632,7 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
 
       showToast(`Ticket issued · ₹${cGrandTotal}`);
 
-      const nextFull = fullCount - cFull;
-      const nextHalf = halfCount - cHalf;
-      const nextLug = luggageAmount - cLug;
-
-      if (nextFull === 0 && nextHalf === 0) {
-        // All queued tickets done — reset to ready state so the next
-        // passenger for the same route doesn't require pressing + again.
-        setFullCount(1);
-        setHalfCount(0);
-      } else {
-        setFullCount(nextFull);
-        setHalfCount(nextHalf);
-      }
-      if (cLug > 0) setLuggageInput('0');
-
-      if (nextFull === 0 && nextHalf === 0 && nextLug === 0) {
-        setActiveDrop(null);
-      }
+      // Ticket issued - keep current selection for next passenger
     } catch (e) {
       Alert.alert('Error', e.message || 'Unknown');
     } finally {
@@ -864,23 +800,28 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
             {(activeDrop === 'start' || activeDrop === 'destination') && (
               <View className="bg-black rounded-xl border border-white/20 mb-4 overflow-hidden">
                 <View className="flex-row flex-wrap">
-                  {(activeDrop === 'destination'
-                    ? getPlaces().filter((_, idx) => {
-                        if (!selStart) return true;
-                        const si = getPlaces().findIndex(p => p.key === selStart.key);
-                        return idx > si;
-                      })
-                    : getPlaces()
-                  ).map((p, idx) => {
+                  {getPlaces().map((p, idx) => {
                     const isSel = activeDrop === 'start' ? selStart?.key === p.key : selDest?.key === p.key;
                     const isDis = activeDrop === 'start' ? selDest?.key === p.key : selStart?.key === p.key;
                     const isNotLastInRow = (idx + 1) % 3 !== 0;
                     return (
                       <TouchableOpacity
                         key={p.key}
-                        disabled={isDis}
                         onPress={() => {
-                          if (activeDrop === 'start') {
+                          if (isDis) {
+                            // Pressing the already-selected "other" place clears it
+                            if (activeDrop === 'start') {
+                              setSelDest(null);
+                              saveStops(p, null, tripDirection);
+                              setSelStart(p);
+                              setActiveDrop('destination');
+                            } else {
+                              setSelStart(null);
+                              saveStops(null, p, tripDirection);
+                              setSelDest(p);
+                              setActiveDrop(null);
+                            }
+                          } else if (activeDrop === 'start') {
                             setSelStart(p);
                             saveStops(p, selDest, tripDirection);
                             setActiveDrop('destination');
@@ -896,12 +837,11 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
                           isNotLastInRow ? 'border-r border-white/20' : '',
                           isSel && activeDrop === 'start' ? 'bg-sky-950' : '',
                           isSel && activeDrop === 'destination' ? 'bg-orange-950' : '',
-                          isDis ? 'opacity-30' : '',
                         ].join(' ')}>
                         <Text
                           numberOfLines={1}
                           adjustsFontSizeToFit
-                          className={`text-2xl font-black text-center ${isSel && activeDrop === 'start' ? 'text-sky-400' : isSel && activeDrop === 'destination' ? 'text-orange-400' : 'text-white'}`}>
+                          className={`text-2xl font-black text-center ${isSel && activeDrop === 'start' ? 'text-sky-400' : isSel && activeDrop === 'destination' ? 'text-orange-400' : isDis ? 'text-orange-400' : 'text-white'}`}>
                           {stopNum(p)}
                         </Text>
                         <Text className={`text-[11px] font-medium text-center w-full px-1 ${isSel ? 'text-white' : 'text-white'}`} numberOfLines={1}>
@@ -914,50 +854,30 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
               </View>
             )}
 
-            {/* ── Passenger Counts + Luggage ── */}
+            {/* ── Ticket Type Toggle ── */}
             <View className="flex-row gap-2 mb-6 px-1">
-              <Counter
-                label="Full"
-                sublabel={baseFullFare > 0 ? `₹${fareStr(baseFullFare)}` : null}
-                value={fullCount}
-                onChange={setFullCount}
-                accentColor="#38bdf8"
-              />
-              <View className="w-px bg-white/10 my-2" />
-              <Counter
-                label="Half"
-                sublabel={baseHalfFare > 0 ? `₹${fareStr(baseHalfFare)}` : null}
-                value={halfCount}
-                onChange={setHalfCount}
-                accentColor="#a78bfa"
-              />
-              <View className="w-px bg-white/10 my-2" />
-              <View className="flex-1 items-center gap-1.5">
-                <Text className="text-zinc-500 text-[10px] font-bold tracking-widest uppercase">Luggage</Text>
-                <Text className="text-zinc-600 text-[10px]">₹ charge</Text>
-                <View className="flex-row items-center bg-zinc-900 rounded-2xl border border-white/10 overflow-hidden">
-                  <TouchableOpacity
-                    onPress={() => setLuggageInput(v => String(Math.max(0, Number(v) - 10)))}   
-                    className="w-10 h-10 items-center justify-center bg-zinc-800"
-                    activeOpacity={0.7}>
-                    <Minus size={14} color={Number(luggageInput) <= 0 ? '#52525b' : '#ffffff'} />
-                  </TouchableOpacity>
-                  <TextInput
-                    className="text-center text-lg font-black text-emerald-400 w-10"
-                    keyboardType="numeric"
-                    value={luggageInput}
-                    onChangeText={setLuggageInput}
-                    placeholder="0"
-                    placeholderTextColor="#52525b"
-                  />
-                  <TouchableOpacity
-                    onPress={() => setLuggageInput(v => String(Number(v) + 10))}
-                    className="w-10 h-10 items-center justify-center bg-zinc-800"
-                    activeOpacity={0.7}>
-                    <Plus size={14} color="#ffffff" />
-                  </TouchableOpacity>
-                </View>
-              </View>
+             
+              <TouchableOpacity
+                onPress={() => setTicketType('half')}
+                className={`flex-1 items-center py-3 rounded-2xl border ${ticketType === 'half' ? 'bg-violet-950 border-violet-500' : 'bg-zinc-900 border-white/10'}`}
+                activeOpacity={0.8}>
+                <Text className={`text-[10px] font-bold tracking-widest uppercase mb-1 ${ticketType === 'half' ? 'text-violet-400' : 'text-zinc-500'}`}>Half</Text>
+                <Text className={`text-lg font-black ${ticketType === 'half' ? 'text-violet-400' : 'text-white'}`}>₹{fareStr(baseHalfFare)}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => setTicketType('full')}
+                className={`flex-1 items-center py-3 rounded-2xl border ${ticketType === 'full' ? 'bg-sky-950 border-sky-500' : 'bg-zinc-900 border-white/10'}`}
+                activeOpacity={0.8}>
+                <Text className={`text-[10px] font-bold tracking-widest uppercase mb-1 ${ticketType === 'full' ? 'text-sky-400' : 'text-zinc-500'}`}>Full</Text>
+                <Text className={`text-lg font-black ${ticketType === 'full' ? 'text-sky-400' : 'text-white'}`}>₹{fareStr(baseFullFare)}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => setTicketType('luggage')}
+                className={`flex-1 items-center py-3 rounded-2xl border ${ticketType === 'luggage' ? 'bg-emerald-950 border-emerald-500' : 'bg-zinc-900 border-white/10'}`}
+                activeOpacity={0.8}>
+                <Text className={`text-[10px] font-bold tracking-widest uppercase mb-1 ${ticketType === 'luggage' ? 'text-emerald-400' : 'text-zinc-500'}`}>Luggage</Text>
+                <Text className={`text-lg font-black ${ticketType === 'luggage' ? 'text-emerald-400' : 'text-white'}`}>₹{fareStr(baseFullFare)}</Text>
+              </TouchableOpacity>
             </View>
 
             {/* ── Total ── */}

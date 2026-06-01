@@ -4,13 +4,20 @@
  * Flow:  splash → (check AsyncStorage) → LoginScreen or Tab Navigator (Home, Trip, Tickets)
  */
 
-import React, {useState, useEffect} from 'react';
-import {ActivityIndicator, StyleSheet} from 'react-native';
-import {SafeAreaView} from 'react-native-safe-area-context';
+import React, {useState, useEffect, useRef, useCallback} from 'react';
+import {
+  ActivityIndicator,
+  StyleSheet,
+  View,
+  TouchableOpacity,
+  Text,
+} from 'react-native';
+import {SafeAreaView, SafeAreaProvider, useSafeAreaInsets} from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {NavigationContainer} from '@react-navigation/native';
-import {createBottomTabNavigator} from '@react-navigation/bottom-tabs';
-import {Home, Bus, Ticket, Settings, FlaskConical} from 'lucide-react-native';
+import {useNavigationBuilder, createNavigatorFactory, TabRouter} from '@react-navigation/core';
+import {Home, Bus, Ticket, Settings, FlaskConical, Smartphone} from 'lucide-react-native';
+import PagerView from 'react-native-pager-view';
 
 import './global.css';
 import { requestNotificationPermission } from './src/services/ticketNotification';
@@ -24,78 +31,132 @@ import ReportScreen from './src/components/ReportScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
 import TestScreen from './src/screens/Test';
 
-const Tab = createBottomTabNavigator();
-
 const STORAGE_KEY = 'conductor_user';
 
-// Icon components for tabs
-const HomeIcon = ({color, size}: {color: string; size: number}) => <Home size={size} color={color} />;
-const BusIcon = ({color, size}: {color: string; size: number}) => <Bus size={size} color={color} />;
-const TicketIcon = ({color, size}: {color: string; size: number}) => <Ticket size={size} color={color} />;
-const SettingsIcon = ({color, size}: {color: string; size: number}) => <Settings size={size} color={color} />;
-const TestIcon = ({color, size}: {color: string; size: number}) => <FlaskConical size={size} color={color} />;
+const ACTIVE_COLOR   = '#00b7f3';
+const INACTIVE_COLOR = '#999';
+const TAB_BG         = '#000000';
+const TAB_BORDER     = '#333';
+const TAB_HEIGHT     = 60;
 
-// Tab Navigator Component
+// ─── Custom swipeable navigator ───────────────────────────────────────────────
+// Built with createNavigatorFactory + useNavigationBuilder so we own the full
+// layout. PagerView is the ONLY place screens render — no double rendering.
+// NavigationContainer is still in the tree so useNavigation / navigate() work.
+function SwipeableTabNavigator({ initialRouteName, children, screenOptions, onLogout }: any) {
+  const { state, navigation, descriptors, NavigationContent } = useNavigationBuilder(TabRouter, {
+    children,
+    screenOptions,
+    initialRouteName,
+  });
+
+  const insets   = useSafeAreaInsets();
+  const pagerRef = useRef<PagerView>(null);
+  const prevIndex = useRef(state.index);
+
+  useEffect(() => {
+    if (state.index !== prevIndex.current) {
+      pagerRef.current?.setPage(state.index);
+      prevIndex.current = state.index;
+    }
+  }, [state.index]);
+
+  const handlePageSelected = useCallback(
+    (e: {nativeEvent: {position: number}}) => {
+      const newIndex = e.nativeEvent.position;
+      if (newIndex !== state.index) {
+        navigation.navigate(state.routes[newIndex].name);
+      }
+    },
+    [state, navigation],
+  );
+
+  const handleTabPress = useCallback(
+    (index: number, routeName: string) => {
+      pagerRef.current?.setPage(index);
+      if (index !== state.index) {
+        navigation.navigate(routeName);
+      }
+    },
+    [state.index, navigation],
+  );
+
+  return (
+    <NavigationContent>
+      <View style={styles.container}>
+        {/* Swipeable pages — only place screens are rendered */}
+        <PagerView
+          ref={pagerRef}
+          style={styles.pager}
+          initialPage={state.index}
+          onPageSelected={handlePageSelected}
+          overdrag={false}>
+          {state.routes.map(route => (
+            <View key={route.key} style={styles.page}>
+              {descriptors[route.key].render()}
+            </View>
+          ))}
+        </PagerView>
+
+        {/* Bottom tab bar */}
+        <View style={[styles.tabBar, {paddingBottom: insets.bottom > 0 ? insets.bottom : 5}]}>
+          {state.routes.map((route: any, index: number) => {
+            const { options } = descriptors[route.key];
+            const label  = (options.tabBarLabel as string) ?? route.name;
+            const active = state.index === index;
+            const color  = active ? ACTIVE_COLOR : INACTIVE_COLOR;
+            const IconComponent = options.tabBarIcon as
+              | React.ComponentType<{color: string; size: number}>
+              | undefined;
+            const badge = options.tabBarBadge as string | undefined;
+
+            return (
+              <TouchableOpacity
+                key={route.key}
+                style={styles.tabItem}
+                onPress={() => handleTabPress(index, route.name)}
+                activeOpacity={0.7}>
+                <View>
+                  {IconComponent && <IconComponent color={color} size={22} />}
+                  {badge != null && (
+                    <View style={styles.badge}>
+                      <Text style={styles.badgeText}>{badge}</Text>
+                    </View>
+                  )}
+                </View>
+                <Text style={[styles.tabLabel, {color}]}>{label}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </View>
+    </NavigationContent>
+  );
+}
+
+// Create the navigator ONCE at module level — never inside a component
+const createSwipeableTabs = createNavigatorFactory(SwipeableTabNavigator);
+const SwipeTabs = createSwipeableTabs();
+
+// ─── Tab Navigator ─────────────────────────────────────────────────────────────
 function TabNavigator({ onLogout }: { onLogout: () => void }) {
   return (
-    <Tab.Navigator
-      id="main-tabs"
-      screenOptions={{
-        tabBarActiveTintColor: '#00b7f3',
-        tabBarInactiveTintColor: '#999',
-        tabBarStyle: {
-          backgroundColor: '#000000',
-          borderTopWidth: 1,
-          borderTopColor: '#333',
-          paddingBottom: 5,
-          height: 60,
-        },
-        headerShown: false,
-      }}>
-      <Tab.Screen
-        name="Home"
-        component={HomeScreen}
-        options={{
-          tabBarLabel: 'Home',
-          tabBarIcon: HomeIcon,
-        }}
-      />
-      <Tab.Screen
-        name="Trip"
-        component={TripScreen}
-        options={{
-          tabBarLabel: 'Trip',
-          tabBarIcon: BusIcon,
-        }}
-      />
-      <Tab.Screen
-        name="Report"
-        component={ReportScreen}
-        options={{
-          tabBarLabel: 'Report',
-          tabBarIcon: TicketIcon,
-        }}
-      />
-      <Tab.Screen
-        name="Settings"
-        options={{
-          tabBarLabel: 'Settings',
-          tabBarIcon: SettingsIcon,
-        }}>
+    <SwipeTabs.Navigator initialRouteName="Home" onLogout={onLogout}>
+      <SwipeTabs.Screen name="Home"     component={HomeScreen}
+        options={{ tabBarLabel: 'Home',     tabBarIcon: ({color, size}: any) => <Home     color={color} size={size} /> }} />
+      <SwipeTabs.Screen name="Report"   component={ReportScreen}
+        options={{ tabBarLabel: 'Trips',   tabBarIcon: ({color, size}: any) => <Ticket   color={color} size={size} /> }} />
+      <SwipeTabs.Screen name="Trip"     component={TripScreen}
+        options={{ tabBarLabel: 'App',     tabBarIcon: ({color, size}: any) => <Smartphone      color={color} size={size} /> }} />
+      <SwipeTabs.Screen name="Settings"
+        options={{ tabBarLabel: 'Settings', tabBarIcon: ({color, size}: any) => <Settings color={color} size={size} /> }}>
         {() => <SettingsScreen onLogout={onLogout} />}
-      </Tab.Screen>
+      </SwipeTabs.Screen>
       {__DEV__ && (
-        <Tab.Screen
-          name="Test"
-          component={TestScreen}
-          options={{
-            tabBarLabel: 'Test',
-            tabBarIcon: TestIcon,
-            tabBarBadge: 'DEV',
-          }}
-        />
+        <SwipeTabs.Screen name="Test" component={TestScreen}
+          options={{ tabBarLabel: 'Test', tabBarIcon: ({color, size}: any) => <FlaskConical color={color} size={size} />, tabBarBadge: 'DEV' }} />
       )}
-    </Tab.Navigator>
+    </SwipeTabs.Navigator>
   );
 }
 
@@ -134,24 +195,32 @@ export default function App() {
   // Splash / checking state
   if (checking) {
     return (
-      <SafeAreaView style={styles.splash}>
-        <ActivityIndicator size="large" color="#00b7f3" />
-      </SafeAreaView>
+      <SafeAreaProvider>
+        <SafeAreaView style={styles.splash}>
+          <ActivityIndicator size="large" color="#00b7f3" />
+        </SafeAreaView>
+      </SafeAreaProvider>
     );
   }
 
   if (!user) {
-    return <LoginScreen onLoginSuccess={handleLoginSuccess} />;
+    return (
+      <SafeAreaProvider>
+        <LoginScreen onLoginSuccess={handleLoginSuccess} />
+      </SafeAreaProvider>
+    );
   }
 
   return (
-    <TripProvider>
-      <SafeAreaView style={{flex: 1, backgroundColor: '#000000'}}>
-        <NavigationContainer>
-          <TabNavigator onLogout={handleLogout} />
-        </NavigationContainer>
-      </SafeAreaView>
-    </TripProvider>
+    <SafeAreaProvider>
+      <TripProvider>
+        <View style={{flex: 1, backgroundColor: '#000000'}}>
+          <NavigationContainer>
+            <TabNavigator onLogout={handleLogout} />
+          </NavigationContainer>
+        </View>
+      </TripProvider>
+    </SafeAreaProvider>
   );
 }
 
@@ -161,5 +230,47 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     backgroundColor: '#000000',
+  },
+  container: {
+    flex: 1,
+    backgroundColor: '#000000',
+  },
+  pager: {
+    flex: 1,
+  },
+  page: {
+    flex: 1,
+  },
+  tabBar: {
+    flexDirection: 'row',
+    backgroundColor: TAB_BG,
+    borderTopWidth: 1,
+    borderTopColor: TAB_BORDER,
+    paddingTop: 8,
+    alignItems: 'center',
+  },
+  tabItem: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 2,
+  },
+  tabLabel: {
+    fontSize: 10,
+    marginTop: 2,
+  },
+  badge: {
+    position: 'absolute',
+    top: -4,
+    right: -8,
+    backgroundColor: '#ef4444',
+    borderRadius: 6,
+    paddingHorizontal: 3,
+    paddingVertical: 1,
+  },
+  badgeText: {
+    color: '#fff',
+    fontSize: 7,
+    fontWeight: '700',
   },
 });

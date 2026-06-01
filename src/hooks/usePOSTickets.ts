@@ -2,9 +2,8 @@
  * usePOSTickets
  *
  * Saves POS (conductor-printed) tickets to:
- *   1. AsyncStorage  — instant, works offline
- *   2. Supabase `tickets` table — via the existing supabase client
- *      so they appear in the Bus Owner dashboard automatically
+ *   1. WatermelonDB  — instant, works offline (SQLite on-device)
+ *   2. Supabase `tickets` table — synced in background when online
  *
  * ── SUPABASE RLS ──────────────────────────────────────────────────────────────
  * Run once in Supabase SQL Editor so authenticated conductors can insert:
@@ -13,18 +12,10 @@
  *     ON tickets FOR INSERT TO authenticated
  *     WITH CHECK (true);
  *
- * ── ticket_type column ───────────────────────────────────────────────────────
- * Make sure your `tickets` table has this column (run once):
- *
- *   ALTER TABLE tickets
- *     ADD COLUMN IF NOT EXISTS ticket_type TEXT DEFAULT 'full';
- *
- * ── COLUMN MAPPING (your schema) ─────────────────────────────────────────────
+ * ── COLUMN MAPPING (Supabase schema) ─────────────────────────────────────────
  *   tickets.trip_id        ← trip_id  (uuid | null)
- *   tickets.from_stop_id   ← resolved stop uuid  (fk → stops.id, nullable)
- *   tickets.to_stop_id     ← resolved stop uuid  (fk → stops.id, nullable)
- *   tickets.from_stop      ← UUID FK (same column as from_stop_id in some schemas)
- *   tickets.to_stop        ← UUID FK (same column as to_stop_id in some schemas)
+ *   tickets.from_stop      ← resolved stop uuid  (fk → stops.id, nullable)
+ *   tickets.to_stop        ← resolved stop uuid  (fk → stops.id, nullable)
  *   tickets.fare           ← unit_fare  (per-ticket amount)
  *   tickets.ticket_count   ← ticket_count
  *   tickets.total_fare     ← fare  (unit_fare × ticket_count)
@@ -37,31 +28,31 @@
  */
 
 import {useState, useEffect, useCallback} from 'react';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import {supabase}   from '../../lib/supabase'; // ← adjust path to match your project
-
-const STORAGE_KEY = 'pos_tickets_v2'; // bumped so old records don't interfere
+import {Q} from '@nozbe/watermelondb';
+import {database} from '../local_db/index';
+import {supabase} from '../../lib/supabase';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 export interface POSTicket {
-  id:           string;              // local id  e.g. "pos_1711012345_abc12"
-  trip_id:      string | null;       // activeTrip.trip_id
-  from_stop:    string;              // full label "Athipalayam-017-அதிபாளையம்"
-  to_stop:      string;
-  from_key:     string;              // fareMatrix key
-  to_key:       string;
-  ticket_count: number;
-  fare:         number;              // total = unit_fare × ticket_count
-  unit_fare:    number;
-  ticket_type:  'full' | 'half';    // NEW — full adult / half child
+  id:             string;            // local id  e.g. "pos_1711012345_abc12"
+  trip_id:        string | null;     // activeTrip.trip_id
+  from_stop:      string;            // full label "Athipalayam-017-அதிபாளையம்"
+  to_stop:        string;
+  from_key:       string;            // fareMatrix key
+  to_key:         string;
+  ticket_count:   number;
+  fare:           number;            // total = unit_fare × ticket_count
+  unit_fare:      number;
+  ticket_type:    'full' | 'half' | 'luggage';   // full adult / half child / luggage
   luggage_amount?: number;
-  ticket_number: number | null;
-  bus_number:   string;
-  direction:    string;              // 'up' | 'dn'
-  issued_at:    string;              // ISO timestamp
-  synced:       boolean;             // true once written to Supabase
+  ticket_number:  number | null;
+  bus_number:     string;
+  trip_number?:   number | null;     // trip sequence number
+  direction:      string;            // 'up' | 'dn'
+  issued_at:      string;            // ISO timestamp
+  synced:         boolean;           // true once written to Supabase
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -121,9 +112,8 @@ async function insertToSupabase(ticket: POSTicket): Promise<boolean> {
       fare:           ticket.unit_fare,
       ticket_count:   ticket.ticket_count,
       total_fare:     ticket.fare,
-      // Ticket type for full/half breakdown
+      // Ticket type for full/half/luggage breakdown
       ticket_type:    ticket.ticket_type,
-      luggage_amount: Number(ticket.luggage_amount ?? 0),
       // Meta
       ticket_number:  ticket.ticket_number,
       payment_method: 'pos',
@@ -134,17 +124,6 @@ async function insertToSupabase(ticket: POSTicket): Promise<boolean> {
     const {error} = await supabase.from('tickets').insert(payload);
 
     if (error) {
-      // Backward compatibility: if DB does not yet have `luggage_amount`, retry without it.
-      if ((error.message || '').toLowerCase().includes('luggage_amount')) {
-        const payloadWithoutLuggage = { ...payload } as any;
-        delete payloadWithoutLuggage.luggage_amount;
-        const { error: retryError } = await supabase.from('tickets').insert({
-          ...payloadWithoutLuggage,
-        });
-        if (!retryError) return true;
-        console.warn('[POS] Supabase insert retry error:', retryError.message);
-        return false;
-      }
       console.warn('[POS] Supabase insert error:', error.message);
       return false;
     }
@@ -156,174 +135,139 @@ async function insertToSupabase(ticket: POSTicket): Promise<boolean> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// WatermelonDB helper — map a DB row to the POSTicket shape the UI expects
+// ─────────────────────────────────────────────────────────────────────────────
+function rowToTicket(row: any): POSTicket {
+  return {
+    id:             row.localId   ?? row.id,
+    trip_id:        row.tripId    ?? null,
+    from_stop:      row.fromStop  ?? '',
+    to_stop:        row.toStop    ?? '',
+    from_key:       row.fromKey   ?? '',
+    to_key:         row.toKey     ?? '',
+    ticket_count:   Number(row.ticketCount  ?? 0),
+    fare:           Number(row.fare         ?? 0),
+    unit_fare:      Number(row.unitFare     ?? 0),
+    ticket_type:    (row.ticketType ?? 'full') as 'full' | 'half' | 'luggage',
+    luggage_amount: Number(row.luggageAmount ?? 0),
+    ticket_number:  row.ticketNumber ?? null,
+    bus_number:     row.busNumber   ?? '',
+    trip_number:    row.tripNumber  ?? null,
+    direction:      row.direction   ?? '',
+    issued_at:      row.issuedAt    ?? new Date().toISOString(),
+    synced:         !!row.synced,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Hook
 // ─────────────────────────────────────────────────────────────────────────────
 export function usePOSTickets() {
   const [tickets, setTickets] = useState<POSTicket[]>([]);
   const [syncing, setSyncing] = useState(false);
 
-  // Load persisted tickets on mount — with 48hr auto-cleanup and v1→v2 migration
   useEffect(() => { load(); }, []);
 
+  // ── load ───────────────────────────────────────────────────────────────────
+  // Reads all tickets from WatermelonDB, purges those older than 48 h.
   const load = async () => {
     try {
-      const raw = await AsyncStorage.getItem(STORAGE_KEY);
-      let parsed: POSTicket[] = raw ? JSON.parse(raw) : [];
+      const col = database.get('tickets');
+      const rows = await col.query().fetch();
 
-      // Migrate incorrectly saved v2 tickets from HomeScreen back to the correct format
-      parsed = parsed.flatMap((t: any) => {
-        if (t.from && !t.from_stop) {
-          // This is a ticket saved with the incorrect schema
-          const migratedTickets: POSTicket[] = [];
-          
-          if (t.full_count > 0) {
-            migratedTickets.push({
-              ...t,
-              id: t.id + '_f',
-              from_stop: t.from,
-              to_stop: t.to,
-              ticket_count: t.full_count,
-              fare: (t.total || 0) * (t.full_count / (t.full_count + (t.half_count || 0) + (t.luggage ? 1 : 0) || 1)),
-              unit_fare: 0,
-              ticket_type: 'full',
-              luggage_amount: t.luggage,
-              synced: false
-            });
-            t.luggage = 0; // only attach luggage once
-          }
-          
-          if (t.half_count > 0) {
-            migratedTickets.push({
-              ...t,
-              id: t.id + '_h',
-              from_stop: t.from,
-              to_stop: t.to,
-              ticket_count: t.half_count,
-              fare: (t.total || 0) * (t.half_count / ((t.full_count || 0) + t.half_count + (t.luggage ? 1 : 0) || 1)),
-              unit_fare: 0,
-              ticket_type: 'half',
-              luggage_amount: t.luggage,
-              synced: false
-            });
-            t.luggage = 0;
-          }
-          
-          if (!t.full_count && !t.half_count && t.luggage > 0) {
-             migratedTickets.push({
-              ...t,
-              id: t.id + '_l',
-              from_stop: t.from,
-              to_stop: t.to,
-              ticket_count: 0,
-              fare: t.luggage,
-              unit_fare: 0,
-              ticket_type: 'full',
-              luggage_amount: t.luggage,
-              synced: false
-            });
-          }
-          
-          return migratedTickets;
-        }
-        return [t];
+      // Auto-cleanup: permanently destroy tickets older than 48 hours
+      const cutoff = Date.now() - (48 * 60 * 60 * 1000);
+      const stale = rows.filter((r: any) => {
+        try { return new Date(r.issuedAt).getTime() <= cutoff; } catch { return false; }
       });
-
-      // Migrate old pos_tickets_v1 records if v2 is empty
-      if (parsed.length === 0) {
-        const oldRaw = await AsyncStorage.getItem('pos_tickets_v1');
-        if (oldRaw) {
-          const oldParsed: any[] = JSON.parse(oldRaw);
-          parsed = oldParsed.map((t: any) => ({
-            ...t,
-            ticket_type: t.ticket_type ?? 'full',
-            luggage_amount: Number(t.luggage_amount ?? 0),
-            synced: t.synced ?? true,
-          }));
-          console.log(`[POS] Migrated ${parsed.length} tickets from v1 to v2`);
-        }
+      if (stale.length > 0) {
+        await database.write(async () => {
+          for (const r of stale) await (r as any).destroyPermanently();
+        });
+        console.log(`[POS] Cleaned up ${stale.length} tickets older than 48h`);
       }
 
-      // ── Auto-cleanup: remove tickets older than 48 hours ────────────────
-      // This prevents stale records from accumulating and causing duplicate
-      // counting between local AsyncStorage and the Supabase DB.
-      const cutoff = Date.now() - (48 * 60 * 60 * 1000); // 48 hours ago
-      const fresh = parsed.filter(t => {
-        try { return new Date(t.issued_at).getTime() > cutoff; }
-        catch { return false; }
+      const fresh = rows.filter((r: any) => !stale.includes(r));
+      setTickets(fresh.map(rowToTicket));
+    } catch (e) {
+      console.warn('[POS] load error:', e);
+    }
+  };
+
+  // ── saveTicket ─────────────────────────────────────────────────────────────
+  // Writes one ticket to WatermelonDB instantly (works offline).
+  // Auto-triggers Supabase sync in the background when 10+ unsynced.
+  const saveTicket = useCallback(async (
+    ticket: Omit<POSTicket, 'synced'> & {ticket_type: 'full' | 'half' | 'luggage'},
+  ) => {
+    try {
+      await database.write(async () => {
+        await database.get('tickets').create((row: any) => {
+          row.localId       = ticket.id;
+          row.tripId        = ticket.trip_id   ?? null;
+          row.fromStop      = ticket.from_stop ?? '';
+          row.toStop        = ticket.to_stop   ?? '';
+          row.fromKey       = ticket.from_key  ?? '';
+          row.toKey         = ticket.to_key    ?? '';
+          row.ticketCount   = ticket.ticket_count  ?? 0;
+          row.fare          = ticket.fare          ?? 0;
+          row.unitFare      = ticket.unit_fare     ?? 0;
+          row.ticketType    = ticket.ticket_type   ?? 'full';
+          row.luggageAmount = ticket.luggage_amount ?? 0;
+          row.ticketNumber  = ticket.ticket_number ?? null;
+          row.busNumber     = ticket.bus_number    ?? '';
+          row.tripNumber    = ticket.trip_number   ?? null;
+          row.direction     = ticket.direction     ?? '';
+          row.issuedAt      = ticket.issued_at     ?? new Date().toISOString();
+          row.synced        = false;
+        });
       });
 
-      if (fresh.length !== parsed.length) {
-        console.log(`[POS] Cleaned up ${parsed.length - fresh.length} tickets older than 48h`);
-        parsed = fresh;
+      // Reload in-memory list
+      const col  = database.get('tickets');
+      const rows = await col.query().fetch();
+      const mapped = rows.map(rowToTicket);
+      setTickets(mapped);
+
+      const unsyncedNow = mapped.filter(t => !t.synced).length;
+      if (unsyncedNow >= 10) {
+        syncToDb();
       }
-
-      // Always persist the cleaned list (handles both migration and cleanup)
-      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
-      setTickets(parsed);
-    } catch { /* silent */ }
-  };
-
-  const persist = async (updated: POSTicket[]) => {
-    setTickets(updated);
-    try { await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updated)); }
-    catch { /* silent */ }
-  };
+    } catch (e) {
+      console.warn('[POS] saveTicket error:', e);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── syncToDb ────────────────────────────────────────────────────────────────
-  // Flushes all unsynced tickets to Supabase in the background.
-  // Safe to call at any time — silently skips if nothing pending or already syncing.
-  const syncToDb = useCallback(async (list?: POSTicket[]) => {
-    const raw = await AsyncStorage.getItem(STORAGE_KEY);
-    const latest: POSTicket[] = raw ? JSON.parse(raw) : (list ?? []);
-    const unsynced = latest.filter(t => !t.synced);
-    if (unsynced.length === 0) return;
+  // Flushes all unsynced WatermelonDB rows to Supabase.
+  const syncToDb = useCallback(async () => {
+    const col = database.get('tickets');
+    const rows = await col.query(Q.where('synced', false)).fetch();
+    if (rows.length === 0) return;
     setSyncing(true);
-    let updated = [...latest];
     try {
-      for (const t of unsynced) {
+      for (const row of rows) {
+        const t = rowToTicket(row);
         const ok = await insertToSupabase(t);
-        if (ok) updated = updated.map(x => x.id === t.id ? {...x, synced: true} : x);
+        if (ok) {
+          await database.write(async () => {
+            await (row as any).update((r: any) => { r.synced = true; });
+          });
+        }
       }
-      await persist(updated);
+      // Refresh in-memory list
+      const fresh = await col.query().fetch();
+      setTickets(fresh.map(rowToTicket));
     } finally {
       setSyncing(false);
     }
   }, []);
 
-  // ── saveTicket ─────────────────────────────────────────────────────────────
-  // Writes only to AsyncStorage (instant, non-blocking).
-  // Auto-triggers syncToDb in the background when unsynced count hits 10.
-  const saveTicket = useCallback(async (ticket: Omit<POSTicket, 'synced'> & {ticket_type: 'full'|'half'}) => {
-    const newTicket: POSTicket = {...ticket, synced: false};
-    const updated = [...tickets, newTicket];
-    await persist(updated);
-
-    const unsyncedCount = updated.filter(t => !t.synced).length;
-    if (unsyncedCount >= 10) {
-      syncToDb(updated);
-    }
-  }, [tickets, syncToDb]);
-
-  // ── syncPending — retries all unsynced tickets ────────────────────────────
+  // ── syncPending ─────────────────────────────────────────────────────────────
   const syncPending = useCallback(async () => {
-    const unsynced = tickets.filter(t => !t.synced);
-    if (unsynced.length === 0) return;
-    setSyncing(true);
-    try {
-      const raw     = await AsyncStorage.getItem(STORAGE_KEY);
-      const latest: POSTicket[] = raw ? JSON.parse(raw) : [];
-      let updated   = [...latest];
-      for (const t of latest.filter(x => !x.synced)) {
-        const ok = await insertToSupabase(t);
-        if (ok) {
-          updated = updated.map(x => x.id === t.id ? {...x, synced: true} : x);
-        }
-      }
-      await persist(updated);
-    } finally {
-      setSyncing(false);
-    }
-  }, [tickets]);
+    await syncToDb();
+  }, [syncToDb]);
 
   // ── Query helpers ─────────────────────────────────────────────────────────
 
@@ -356,7 +300,6 @@ export function usePOSTickets() {
       count: number; fare: number;
     }> = {};
 
-    // UUID pattern — old tickets stored stop UUIDs instead of labels
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const stopLabel = (s: string) => {
       if (!s || s.trim() === '' || UUID_RE.test(s.trim())) return '?';
@@ -373,7 +316,6 @@ export function usePOSTickets() {
         count:     0,
         fare:      0,
       };
-      // Split by ticket_type — default to 'full' for old records
       if ((t.ticket_type ?? 'full') === 'half') {
         map[key].halfCount += t.ticket_count;
       } else {
@@ -386,25 +328,19 @@ export function usePOSTickets() {
   }, []);
 
   /**
-   * Today's summary — split into full/half passenger counts.
-   * `rows`    = number of POSTicket records (for backend row subtraction)
-   * `count`   = total passengers (full + half)
-   * `full`    = adult passenger count
-   * `half`    = child passenger count
-   * `total`   = total fare collected
-   * `unsynced`= records not yet in Supabase
+   * Today's summary — full/half split + totals.
    */
   const todaySummary = useCallback(() => {
     const today    = todayTickets();
     const trips    = new Set(today.map(t => t.trip_id).filter(Boolean)).size;
     const rows     = today.length;
-    const luggage  = today.reduce((s, t) => s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0), 0);
+    const luggage  = today.filter(t => t.ticket_type === 'luggage').reduce((s, t) => s + Number(t.ticket_count || 1), 0);
     const full     = today
       .filter(t => (t.ticket_type ?? 'full') === 'full')
-      .reduce((s, t) => s + Math.max(0, Number(t.ticket_count || 1) - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
+      .reduce((s, t) => s + Number(t.ticket_count || 0), 0);
     const half     = today
       .filter(t => t.ticket_type === 'half')
-      .reduce((s, t) => s + Math.max(0, Number(t.ticket_count || 1) - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
+      .reduce((s, t) => s + Number(t.ticket_count || 0), 0);
     const count    = full + half + luggage;
     const total    = today.reduce((s, t) => s + Number(t.fare || 0), 0);
     const unsynced = today.filter(t => !t.synced).length;
@@ -412,17 +348,17 @@ export function usePOSTickets() {
   }, [todayTickets]);
 
   /**
-   * Summary for a specific trip — full/half split + totals.
+   * Summary for a specific trip.
    */
   const tripSummary = useCallback((tripId: string) => {
-    const list  = tickets.filter(t => t.trip_id === tripId);
-    const luggage = list.reduce((s, t) => s + (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0), 0);
-    const full  = list
+    const list    = tickets.filter(t => t.trip_id === tripId);
+    const luggage = list.filter(t => t.ticket_type === 'luggage').reduce((s, t) => s + Number(t.ticket_count || 1), 0);
+    const full    = list
       .filter(t => (t.ticket_type ?? 'full') === 'full')
-      .reduce((s, t) => s + Math.max(0, Number(t.ticket_count || 1) - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
-    const half  = list
+      .reduce((s, t) => s + Number(t.ticket_count || 0), 0);
+    const half    = list
       .filter(t => t.ticket_type === 'half')
-      .reduce((s, t) => s + Math.max(0, Number(t.ticket_count || 1) - (Number(t.luggage_amount ?? 0) > 0 ? 1 : 0)), 0);
+      .reduce((s, t) => s + Number(t.ticket_count || 0), 0);
     return {
       rows:  list.length,
       count: full + half + luggage,
@@ -433,7 +369,19 @@ export function usePOSTickets() {
     };
   }, [tickets]);
 
-  const clearAll = useCallback(async () => { await persist([]); }, []);
+  // ── clearAll ───────────────────────────────────────────────────────────────
+  const clearAll = useCallback(async () => {
+    try {
+      const col  = database.get('tickets');
+      const rows = await col.query().fetch();
+      await database.write(async () => {
+        for (const r of rows) await (r as any).destroyPermanently();
+      });
+      setTickets([]);
+    } catch (e) {
+      console.warn('[POS] clearAll error:', e);
+    }
+  }, []);
 
   const unsyncedCount = tickets.filter(t => !t.synced).length;
 
