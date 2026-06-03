@@ -151,23 +151,7 @@ const routeLabel = (name, dir) => {
     .split(/\s*(?:->|→|-)\s*/)
     .map(p => p.trim())
     .filter(Boolean);
-  return parts.length >= 2 ? [...parts].reverse() : parts;
-};
-
-const RouteWithArrow = ({ name, dir, textClass = 'text-white', iconSize = 16, iconColor = '#ffffff' }) => {
-  const parts = routeLabel(name, dir);
-  if (!parts || parts.length < 2) {
-    return <Text className={textClass}>{name || ''}</Text>;
-  }
-  return (
-    <View className="flex-row items-center">
-      <Text className={textClass}>{parts[0]}</Text>
-      <View className="mx-1">
-        <ArrowRight size={iconSize} color={iconColor} />
-      </View>
-      <Text className={textClass}>{parts[1]}</Text>
-    </View>
-  );
+  return parts.length >= 2 ? [...parts].reverse().join(' → ') : name;
 };
 
 const RESET_REPORT_CUTOFF_KEY = 'trip_report_reset_after_iso';
@@ -938,6 +922,14 @@ const TripTabContent = ({ dashboard, onRefreshDashboard, posHook, onNavigateToCo
   const appTripFare = Number(at?.collection ?? 0);
   const totalFare = appTripFare + posTripFare;
 
+  const isDown = (d) => ['dn', 'down', 'return'].includes((d ?? '').toString().trim().toLowerCase());
+  const routeParts = (at?.route_name ?? '').split(/\s*(?:->|→|-)\s*/).map(p => p.trim()).filter(Boolean);
+  const tripDisplay = at
+    ? (routeParts.length >= 2
+        ? (isDown(at.direction) ? `${routeParts[1]} → ${routeParts[0]}` : `${routeParts[0]} → ${routeParts[1]}`)
+        : (at.route_name ?? ''))
+    : '';
+
   return (
     <View className="px-4 pb-4">
       {at ? (
@@ -948,7 +940,7 @@ const TripTabContent = ({ dashboard, onRefreshDashboard, posHook, onNavigateToCo
               {at.trip_number > 0 && (
                 <Text className="text-white text-2xl font-bold tracking-widest">#{at.trip_number} -{' '}</Text>
               )}
-              <RouteWithArrow name={at?.route_name} dir={at?.direction} textClass="text-white text-2xl font-black leading-tight" iconSize={20} iconColor="#ffffff" />
+              <Text className="text-white text-2xl font-black leading-tight">{tripDisplay}</Text>
             </View>
             <View className="flex-row items-center gap-1.5 bg-sky-500/10 border border-sky-500/30 px-3 py-1.5 rounded-full">
               <Text className="text-sky-400 text-[11px] font-bold">Running</Text>
@@ -1489,7 +1481,9 @@ const posTix = (posHook?.tickets ?? []).filter(
           <View className="bg-sky-500/10 border-b border-sky-500/20 px-5 py-4">
             <View className="flex-row items-start justify-between">
               <View className="flex-1 mr-3">
-                <RouteWithArrow name={report?.route_name} dir={report?.direction} textClass="text-white text-xl font-black leading-tight" iconSize={18} iconColor="#ffffff" />
+                <Text className="text-white text-xl font-black leading-tight">
+                  {routeLabel(report.route_name, report.direction)}
+                </Text>
               </View>
               <View className="flex-row items-center gap-3">
                 <View className="flex-row items-center gap-1">
@@ -3439,13 +3433,9 @@ const ReportScreen = () => {
       {/* ── Top header: title + active trip info + refresh ── */}
       <View className="flex-row items-center justify-between px-4 pt-2 pb-1">
         <View>
-          <View className="flex-row items-center">
-            {at?.route_name ? (
-              <RouteWithArrow name={at.route_name} dir={at.direction} textClass="text-white text-lg font-black tracking-wide" iconSize={16} iconColor="#ffffff" />
-            ) : (
-              <Text className="text-white text-lg font-black tracking-wide">REPORTS</Text>
-            )}
-          </View>
+          <Text className="text-white text-lg font-black tracking-wide">
+            {at?.route_name ? routeLabel(at.route_name, at.direction) : 'REPORTS'}
+          </Text>
           <Text className="text-zinc-500 text-[10px] font-bold">
             {new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}
           </Text>

@@ -379,8 +379,8 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
     const fromIndex = placesList.findIndex(p => p.key === selStart.key);
     const toIndex = placesList.findIndex(p => p.key === selDest.key);
 
-    // Wrong direction: destination comes before start in the current trip direction
-    const wrongDir = toIndex <= fromIndex;
+    // Wrong direction: for down trips dest index must be > start index; for up trips dest index must be < start index
+    const wrongDir = isDownDirection(tripDirection) ? toIndex <= fromIndex : toIndex >= fromIndex;
 
     if (wrongDir) {
       setSelDest(null);
@@ -798,7 +798,8 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
                     const placesList = getPlaces();
                     const fromIndex = selStart ? placesList.findIndex(pl => pl.key === selStart.key) : -1;
                     const currentIndex = placesList.findIndex(pl => pl.key === p.key);
-                    const isWrongDirection = activeDrop === 'destination' && selStart && currentIndex <= fromIndex;
+                    const isWrongDirection = activeDrop === 'destination' && selStart &&
+                      (isDownDirection(tripDirection) ? currentIndex <= fromIndex : currentIndex >= fromIndex);
                     const isDisabled = p.disabled === true;
                     const isDis = isOtherSel || isWrongDirection || isDisabled;
                     const isNotLastInRow = (idx + 1) % 3 !== 0;
@@ -808,7 +809,32 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
                         key={p.key}
                         disabled={isDisabled}
                         onPress={() => {
-                          if (isOtherSel) {
+                          if (isSel) {
+                            // Double-tap: move this stop to the other field, clear current field, focus other field
+                            if (activeDrop === 'start') {
+                              // Currently selected as FROM → move to TO (if direction valid), clear FROM, focus FROM
+                              const pIdx = placesList.findIndex(pl => pl.key === p.key);
+                              const destIdx = selDest ? placesList.findIndex(pl => pl.key === selDest?.key) : -1;
+                              const wouldBeWrong = isDownDirection(tripDirection) ? pIdx <= destIdx : pIdx >= destIdx;
+                              if (destIdx !== -1 && wouldBeWrong) {
+                                // Can't be a valid TO given existing dest — clear both, restart
+                                setSelStart(null); setSelDest(null);
+                                saveStops(null, null, tripDirection);
+                                setActiveDrop('start');
+                              } else {
+                                setSelDest(p);
+                                setSelStart(null);
+                                saveStops(null, p, tripDirection);
+                                setActiveDrop('start');
+                              }
+                            } else {
+                              // Currently selected as TO → move to FROM, clear TO, focus TO
+                              setSelStart(p);
+                              setSelDest(null);
+                              saveStops(p, null, tripDirection);
+                              setActiveDrop('destination');
+                            }
+                          } else if (isOtherSel) {
                             // Conflicting selection: clear the other field and select in current field
                             if (activeDrop === 'start') {
                               setSelDest(null);
@@ -822,7 +848,6 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
                               setActiveDrop('start');
                             }
                           } else if (isWrongDirection) {
-                            // Wrong direction: do nothing (or could show toast)
                             return;
                           } else if (activeDrop === 'start') {
                             setSelStart(p);
@@ -831,7 +856,6 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
                           } else {
                             setSelDest(p);
                             saveStops(selStart, p, tripDirection);
-                            // Stay on destination mode after selecting "To" place
                           }
                         }}
                         style={{
