@@ -25,18 +25,13 @@ import {
   Clock,
   Timer,
   Square,
-  ArrowUpDown,
+  Layers,
+  ArrowRight,
   FileText,
+  Navigation,
   DollarSign,
   Ticket,
   CreditCard,
-  ChevronRight,
-  ChevronLeft,
-  RotateCcw,
-  ChevronDown,
-  ChevronUp,
-  Navigation,
-  ArrowRight,
 } from 'lucide-react-native';
 import { supabase } from '../../lib/supabase';
 import { useTripContext } from '../context/TripContext';
@@ -54,39 +49,6 @@ if (Platform.OS === 'android') {
   PrinterStatus = nyx.PrinterStatus;
   PrintAlign = nyx.PrintAlign;
 }
-
-// ─── Printer row builder (mirrors Test.jsx exactly) ──────────────────────────
-const PRINT_COLS = [
-  { key: 'ss',  w: 4 },
-  { key: 'es',  w: 4 },
-  { key: 'f',   w: 4 },
-  { key: 'h',   w: 4 },
-  { key: 'l',   w: 4 },
-  { key: 'p',   w: 4 },
-  { key: 'amt', w: 8 },
-];
-const FHLP_KEYS_P = new Set(['f', 'h', 'l', 'p']);
-const padPrint = (val, width) => String(val).padStart(width, '0').slice(-width);
-const normalizePrintRow = row =>
-  Object.fromEntries(
-    Object.entries(row).map(([k, v]) => {
-      if (FHLP_KEYS_P.has(k)) return [k, padPrint(v, 2)];
-      if (k === 'amt') return [k, padPrint(Math.round(Number(v)), 4)];
-      if (k === 'ss' || k === 'es') return [k, String(Number(v)).padStart(2, '0')]; // strip leading zeros, keep 2-digit max
-      return [k, v];
-    })
-  );
-const buildPrintRow = (values = {}, normalize = false) => {
-  const v = normalize ? normalizePrintRow(values) : values;
-  return PRINT_COLS.map(col => {
-    const raw = v[col.key] != null ? String(v[col.key]) : '';
-    const padded = raw.slice(0, col.w).padEnd(col.w, ' ');
-    return col.key === 'amt' ? padded.padStart(col.w + 1, ' ') : ' ' + padded;
-  }).join('');
-};
-const PRINT_HEADER_VALUES = { ss: 'SS', es: 'ES', f: ' F', h: ' H', l: ' L', p: ' P', amt: ' AMT' };
-const PRINT_DASH = '--------------------------------';
-const PRINT_DASH_LIGHT = '- - - - - - - - - - - - - - - -';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -151,27 +113,10 @@ const routeLabel = (name, dir) => {
     .split(/\s*(?:->|→|-)\s*/)
     .map(p => p.trim())
     .filter(Boolean);
-  return parts.length >= 2 ? [...parts].reverse() : parts;
-};
-
-const RouteWithArrow = ({ name, dir, textClass = 'text-white', iconSize = 16, iconColor = '#ffffff' }) => {
-  const parts = routeLabel(name, dir);
-  if (!parts || parts.length < 2) {
-    return <Text className={textClass}>{name || ''}</Text>;
-  }
-  return (
-    <View className="flex-row items-center">
-      <Text className={textClass}>{parts[0]}</Text>
-      <View className="mx-1">
-        <ArrowRight size={iconSize} color={iconColor} />
-      </View>
-      <Text className={textClass}>{parts[1]}</Text>
-    </View>
-  );
+  return parts.length >= 2 ? [...parts].reverse().join(' → ') : name;
 };
 
 const RESET_REPORT_CUTOFF_KEY = 'trip_report_reset_after_iso';
-const COLLECTION_REPORT_PRINTED_AT_KEY = 'collection_report_printed_at';
 
 const isOnOrAfterCutoff = (iso, cutoffIso) => {
   if (!iso) return false;
@@ -204,18 +149,12 @@ const buildStageRows = (appBreakdown, posTix) => {
     const k = `${ss}|||${es}`;
     if (!map[k]) map[k] = { ss, es, f: 0, h: 0, l: 0, p: 0, amt: 0 };
     const cnt = Number(t.ticket_count ?? 0);
-    const tt = (t.ticket_type ?? 'full').toLowerCase();
-    if (tt === 'luggage') {
-      map[k].l += cnt;
-    } else if (tt === 'half') {
-      map[k].h += cnt;
-      const luggCnt = Number(t.luggage_amount ?? 0) > 0 ? 1 : 0;
-      map[k].l += luggCnt;
-    } else {
-      map[k].f += cnt;
-      const luggCnt = Number(t.luggage_amount ?? 0) > 0 ? 1 : 0;
-      map[k].l += luggCnt;
-    }
+    const hasLuggage = Number(t.luggage_amount ?? 0) > 0;
+    const luggCnt = hasLuggage ? 1 : 0;
+    const passCnt = Math.max(0, cnt - luggCnt);
+    if (t.ticket_type === 'half') map[k].h += passCnt;
+    else map[k].f += passCnt;
+    map[k].l += luggCnt;
     map[k].amt += Number(t.fare || 0);
   }
   return Object.values(map).sort((a, b) => {
@@ -525,8 +464,7 @@ const fetchTripReportWithAppTripFromSupabase = async tripId => {
     const toName = stopMap[String(row.to_stop_id)] ?? 'Unknown';
     const isFree = pm === 'fr';
     const isHalf = !isFree && tt === 'half';
-    const isLuggage = !isFree && tt === 'luggage';
-    const fullCount = isFree || isHalf || isLuggage ? 0 : cnt;
+    const fullCount = isFree || isHalf ? 0 : cnt;
     const halfCount = isHalf ? cnt : 0;
     const freeCount = isFree ? cnt : 0;
 
@@ -756,7 +694,7 @@ const StageTable = ({ rows }) => {
 };
 
 // ─── Trip Tab Content ─────────────────────────────────────────────────────────
-const TripTabContent = ({ dashboard, onRefreshDashboard, posHook, onNavigateToCollection }) => {
+const TripTabContent = ({ dashboard, onRefreshDashboard, posHook }) => {
   const { setActiveTrip: setCtxTrip, setTripNumber: setCtxTripNumber, setBusNumber: setCtxBusNumber } = useTripContext();
   const [routes, setRoutes] = useState([]);
   const [startingReturn, setStartingReturn] = useState(false);
@@ -811,40 +749,8 @@ const TripTabContent = ({ dashboard, onRefreshDashboard, posHook, onNavigateToCo
     }
   };
 
-  const isCollectionReportPrintedRecently = async () => {
-    try {
-      const printedAt = await AsyncStorage.getItem(COLLECTION_REPORT_PRINTED_AT_KEY);
-      if (!printedAt) return false;
-      const printedTime = new Date(printedAt).getTime();
-      const now = Date.now();
-      const tenMinutes = 10 * 60 * 1000;
-      return now - printedTime <= tenMinutes;
-    } catch {
-      return false;
-    }
-  };
-
-  const handleEndTrip = async () => {
+  const handleEndTrip = () => {
     if (!at) return;
-
-    const printedRecently = await isCollectionReportPrintedRecently();
-    if (!printedRecently) {
-      Alert.alert(
-        'Collection report is not taken',
-        'Please print the collection report before ending the trip.',
-        [
-          { text: 'Cancel', style: 'cancel' },
-          {
-            text: 'Print',
-            onPress: () => {
-              onNavigateToCollection?.();
-            },
-          },
-        ]
-      );
-      return;
-    }
-
     Alert.alert(
       'End trip?',
       'Are you sure you want to end the current trip?',
@@ -860,26 +766,8 @@ const TripTabContent = ({ dashboard, onRefreshDashboard, posHook, onNavigateToCo
                 .from('trips')
                 .update({ status: 'completed', expected_end_time: new Date().toISOString() })
                 .eq('id', at.trip_id);
-
-              // ── Full session reset (mirrors old TripScreen.handleEndTripWithMandatoryReport) ──
-              const resetIso = new Date().toISOString();
-              await AsyncStorage.setItem('trip_report_reset_after_iso', resetIso).catch(() => {});
-              await AsyncStorage.setItem('active_trip_number', '0').catch(() => {});
-              await AsyncStorage.multiRemove([
-                'pos_tickets_v2',
-                'pos_tickets_v1',
-                'ticket_stops_up',
-                'ticket_stops_dn',
-                COLLECTION_REPORT_PRINTED_AT_KEY,
-              ]).catch(() => {});
-              if (posHook?.clearAll) await posHook.clearAll();
-
-              // Clear context immediately
-              setCtxTrip(null);
-              setCtxTripNumber(0);
-
               showToast('Trip ended');
-              await onRefreshDashboard();
+              await syncContextAfterTrip();
             } catch (e) {
               Alert.alert('Error', e?.message || 'Could not end trip.');
             } finally {
@@ -891,9 +779,8 @@ const TripTabContent = ({ dashboard, onRefreshDashboard, posHook, onNavigateToCo
     );
   };
 
-  const handleStartReturn = async (dir) => {
+  const handleStartReturn = (dir) => {
     if (!at) return;
-
     Alert.alert(
       'Start return trip?',
       `This will end the current trip and start the return direction.`,
@@ -911,7 +798,6 @@ const TripTabContent = ({ dashboard, onRefreshDashboard, posHook, onNavigateToCo
               const route = routes.find(r => r.name === at.route_name) ?? routes[0];
               if (!route) throw new Error('Route not found');
               await startTripFromSupabase({ routeId: route.id, direction: dir, busId: at.bus_id ?? null });
-              await AsyncStorage.removeItem(COLLECTION_REPORT_PRINTED_AT_KEY).catch(() => {});
               showToast('Return trip started!');
               await syncContextAfterTrip();
             } catch (e) {
@@ -938,6 +824,14 @@ const TripTabContent = ({ dashboard, onRefreshDashboard, posHook, onNavigateToCo
   const appTripFare = Number(at?.collection ?? 0);
   const totalFare = appTripFare + posTripFare;
 
+  const isDown = (d) => ['dn', 'down', 'return'].includes((d ?? '').toString().trim().toLowerCase());
+  const routeParts = (at?.route_name ?? '').split(/\s*(?:->|→|-)\s*/).map(p => p.trim()).filter(Boolean);
+  const tripDisplay = at
+    ? (routeParts.length >= 2
+        ? (isDown(at.direction) ? `${routeParts[1]} → ${routeParts[0]}` : `${routeParts[0]} → ${routeParts[1]}`)
+        : (at.route_name ?? ''))
+    : '';
+
   return (
     <View className="px-4 pb-4">
       {at ? (
@@ -948,7 +842,7 @@ const TripTabContent = ({ dashboard, onRefreshDashboard, posHook, onNavigateToCo
               {at.trip_number > 0 && (
                 <Text className="text-white text-2xl font-bold tracking-widest">#{at.trip_number} -{' '}</Text>
               )}
-              <RouteWithArrow name={at?.route_name} dir={at?.direction} textClass="text-white text-2xl font-black leading-tight" iconSize={20} iconColor="#ffffff" />
+              <Text className="text-white text-2xl font-black leading-tight">{tripDisplay}</Text>
             </View>
             <View className="flex-row items-center gap-1.5 bg-sky-500/10 border border-sky-500/30 px-3 py-1.5 rounded-full">
               <Text className="text-sky-400 text-[11px] font-bold">Running</Text>
@@ -991,6 +885,17 @@ const TripTabContent = ({ dashboard, onRefreshDashboard, posHook, onNavigateToCo
             </View>
           </View>
 
+          {/* End Trip */}
+          <TouchableOpacity
+            className={`flex-row items-center justify-center gap-2 bg-red-500/10 border border-red-500/30 py-3 rounded-xl ${endingTrip ? 'opacity-50' : ''}`}
+            onPress={handleEndTrip}
+            disabled={endingTrip}
+          >
+            {endingTrip
+              ? <ActivityIndicator size="small" color="#f87171" />
+              : <Square size={16} color="#f87171" />}
+            <Text className="text-red-400 text-sm font-bold">End Trip</Text>
+          </TouchableOpacity>
         </View>
       ) : null}
 
@@ -1001,29 +906,13 @@ const TripTabContent = ({ dashboard, onRefreshDashboard, posHook, onNavigateToCo
         onStartReturn={handleStartReturn}
         onStarted={handleStarted}
       />
-
-      {/* End Trip */}
-      {at && (
-        <TouchableOpacity
-          className={`flex-row items-center justify-center gap-2 bg-red-500/10 border border-red-500/30 py-3 rounded-xl mt-4 ${endingTrip ? 'opacity-50' : ''}`}
-          onPress={handleEndTrip}
-          disabled={endingTrip}
-        >
-          {endingTrip
-            ? <ActivityIndicator size="small" color="#f87171" />
-            : <Square size={16} color="#f87171" />}
-          <Text className="text-red-400 text-sm font-bold">End Trip</Text>
-        </TouchableOpacity>
-      )}
     </View>
   );
 };
 
 // ─── Trip Sheet Tab Content ───────────────────────────────────────────────────
-const TripSheetTabContent = ({ dashboard, posHook, onRefresh, refreshKey }) => {
+const TripSheetTabContent = ({ dashboard, posHook }) => {
   const [selectedTripId, setSelectedTripId] = useState(null);
-  const [tripPage, setTripPage] = useState(0);
-  const TRIPS_PER_PAGE = 4;
   const [report, setReport] = useState(null);
   const [appTrip, setAppTrip] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -1060,16 +949,29 @@ const TripSheetTabContent = ({ dashboard, posHook, onRefresh, refreshKey }) => {
     [at, dashboard?.recent_trips],
   );
 
-  // Static sort, always showing all (matches HomeScreen) — fixed 001→018 order
-  const filterPlaces = useMemo(() => places, []);
+  // Direction-aware place ordering (mirrors HomeScreen)
+  const selectedTripDir = (
+    trips.find(t => t.trip_id === selectedTripId)?.direction ??
+    at?.direction ??
+    'up'
+  );
+  const filterPlaces = useMemo(
+    () => (isDownDirection(selectedTripDir) ? [...places].reverse() : places),
+    [selectedTripDir],
+  );
 
-  // Quick filter ranges (static)
   const quickFilterRanges = useMemo(
-    () => [
-      { from: 18, to: 11 },
-      { from: 11, to: 3 },
-    ],
-    [],
+    () =>
+      isDownDirection(selectedTripDir)
+        ? [
+          { from: 3, to: 11 },
+          { from: 11, to: 18 },
+          ]
+        : [
+          { from: 18, to: 11 },
+          { from: 11, to: 3 },
+          ],
+    [selectedTripDir],
   );
 
   const stageNumFromPlace = place =>
@@ -1147,7 +1049,7 @@ const TripSheetTabContent = ({ dashboard, posHook, onRefresh, refreshKey }) => {
         setLoading(false);
       }
     })();
-  }, [selectedTripId, refreshKey]);
+  }, [selectedTripId]);
 
   useEffect(() => {
     setTableTab('full');
@@ -1162,26 +1064,10 @@ const posTix = (posHook?.tickets ?? []).filter(
   const stageRows = buildStageRows(appBreakdown, posTix);
   const grandFull = stageRows.reduce((s, r) => s + r.f, 0);
   const grandHalf = stageRows.reduce((s, r) => s + r.h, 0);
-  const grandLugg = stageRows.reduce((s, r) => s + (r.l ?? 0), 0);
   const grandCollection = stageRows.reduce((s, r) => s + r.amt, 0);
   const posTotal = posTix.reduce((s, t) => s + Number(t.fare || 0), 0);
   const appTotal = Number(appTrip?.collection ?? 0);
   const combinedTotal = appTotal + posTotal;
-
-  // Stage-based amount split (003-011 and 011-018)
-  // Note: 011 is only counted in the first split to avoid double counting
-  const { amount003to011, amount011to018 } = (() => {
-    let amt003to011 = 0;
-    let amt011to018 = 0;
-    for (const row of stageRows) {
-      const ssNum = parseInt(row.ss, 10);
-      if (!isNaN(ssNum)) {
-        if (ssNum >= 3 && ssNum <= 11) amt003to011 += row.amt;
-        if (ssNum >= 12 && ssNum <= 18) amt011to018 += row.amt;
-      }
-    }
-    return { amount003to011: amt003to011, amount011to018: amt011to018 };
-  })();
 
   // Filtered stage rows (when filter panel is open and both places selected)
   const filteredStageRows = (() => {
@@ -1246,17 +1132,6 @@ const posTix = (posHook?.tickets ?? []).filter(
     // For filtered mode, only show trip collection (no combined total)
     const printCombinedTotal = isFiltered ? printGrandCollection : combinedTotal;
 
-    // Calculate stage-based splits for print
-    // Note: 011 is only counted in the first split to avoid double counting
-    const printAmount003to011 = rowsToPrint.reduce((s, r) => {
-      const ssNum = parseInt(r.ss, 10);
-      return s + (!isNaN(ssNum) && ssNum >= 3 && ssNum <= 11 ? r.amt : 0);
-    }, 0);
-    const printAmount011to018 = rowsToPrint.reduce((s, r) => {
-      const ssNum = parseInt(r.ss, 10);
-      return s + (!isNaN(ssNum) && ssNum >= 12 && ssNum <= 18 ? r.amt : 0);
-    }, 0);
-
     if (isTestingMode) {
       // Calculate ticket number range
       const today = new Date().toDateString();
@@ -1268,10 +1143,9 @@ const posTix = (posHook?.tickets ?? []).filter(
       const firstTicketNum = todayAllTicketNums.length > 0 ? Math.min(...todayAllTicketNums) : null;
       const lastTicketNum = currentTripTicketNums.length > 0 ? Math.max(...currentTripTicketNums) : null;
       const ticketRangeStr = firstTicketNum && lastTicketNum
-        ? `${firstTicketNum} - ${lastTicketNum} = ${lastTicketNum - firstTicketNum + 1}`
+        ? `${firstTicketNum} - ${lastTicketNum}`
         : (firstTicketNum || lastTicketNum || null);
 
-      const printGrandLuggModal = rowsToPrint.reduce((s, r) => s + (r.l ?? 0), 0);
       setPrintModalData({
         title: 'TRIP SHEET',
         busNo: _busNo,
@@ -1282,11 +1156,8 @@ const posTix = (posHook?.tickets ?? []).filter(
         stageRows: rowsToPrint,
         grandFull: printGrandFull,
         grandHalf: printGrandHalf,
-        grandLugg: printGrandLuggModal,
         grandCollection: printGrandCollection,
         combinedTotal: printCombinedTotal,
-        amount003to011: printAmount003to011,
-        amount011to018: printAmount011to018,
         type: 'tripsheet',
         filterLabel: isFiltered ? `FILTERED: ${getFilterDisplayName(filterStart)} → ${getFilterDisplayName(filterEnd)}` : null,
         ticketRange: ticketRangeStr,
@@ -1306,16 +1177,26 @@ const posTix = (posHook?.tickets ?? []).filter(
         return;
       }
 
-      const opts = { textSize: 27 };
-      const boldOpts = { textSize: 27, bold: true };
+      // Helper: pad string to fixed width (left-aligned)
+      const padL = (s, w) => String(s).padEnd(w, ' ');
+      // Helper: pad string to fixed width (right-aligned)
+      const padR = (s, w) => String(s).padStart(w, ' ');
+      // Helper: center string within fixed width
+      const padC = (s, w) => { const str = String(s); const tot = w - str.length; const l = Math.floor(tot / 2); return ' '.repeat(l) + str + ' '.repeat(tot - l); };
+      // Amount formatting: always 2 decimal places
       const fmtAmt = n => Number(n).toFixed(2);
 
+      const DASH32 = '--------------------------------';
+      const DASH_LIGHT = '- - - - - - - - - - - - - - - -';
+
+      // Date/time from report start_time
       const startDt = report.start_time ? new Date(report.start_time) : new Date();
       const dateStr = startDt.toLocaleDateString('en-GB').replace(/\//g, '/');
       const timeStr = startDt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
 
       const selectedTrip = trips.find(t => t.trip_id === selectedTripId);
       const busNo = report.bus_number ?? dashboard?.bus?.vehicle_number ?? 'N/A';
+      const wayBill = report.way_bill_number ?? report.waybill ?? selectedTrip?.way_bill_number ?? '—';
       const tripNum = report.trip_number ?? selectedTrip?.trip_number ?? '—';
 
       const today = new Date().toDateString();
@@ -1327,46 +1208,81 @@ const posTix = (posHook?.tickets ?? []).filter(
       const firstTicketNum = todayAllTicketNums.length > 0 ? Math.min(...todayAllTicketNums) : null;
       const lastTicketNum = currentTripTicketNums.length > 0 ? Math.max(...currentTripTicketNums) : null;
       const ticketRangeStr = firstTicketNum && lastTicketNum
-        ? `${firstTicketNum} - ${lastTicketNum} = ${lastTicketNum - firstTicketNum + 1}`
+        ? `${firstTicketNum} - ${lastTicketNum}`
         : (firstTicketNum || lastTicketNum || null);
 
-      const center22 = { textSize: 22, align: PrintAlign.CENTER };
-      await NyxPrinter.printText('SPS TRANSPORT', center22);
+      // ── Header ──────────────────────────────────────────────────────────────
+      await NyxPrinter.printText('SPS TRANSPORT', { textSize: 22, align: PrintAlign.CENTER });
       await NyxPrinter.printText('TRIP SHEET', { textSize: 26, align: PrintAlign.CENTER, bold: true });
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
-      const headerBlock = [
-        PRINT_DASH,
-        isFiltered ? `FILTERED: ${getFilterDisplayName(filterStart)} -> ${getFilterDisplayName(filterEnd)}` : null,
-        `BUS:${busNo}  TRIP No.:${tripNum}`,
-        `${dateStr} ${timeStr}`,
-        ticketRangeStr ? `TKT:${ticketRangeStr}` : null,
-        PRINT_DASH,
-        buildPrintRow(PRINT_HEADER_VALUES),
-      ].filter(Boolean).join('\n');
-      await NyxPrinter.printText(headerBlock, { textSize: 27 });
+      if (isFiltered) {
+        const filterLabel = `FILTERED: ${getFilterDisplayName(filterStart)} → ${getFilterDisplayName(filterEnd)}`;
+        await NyxPrinter.printText(filterLabel, { textSize: 18, align: PrintAlign.CENTER });
+      }
 
-      const tableBody = rowsToPrint
-        .map(r => buildPrintRow({ ss: r.ss, es: r.es, f: r.f, h: r.h, l: r.l, p: r.p ?? 0, amt: r.amt }, true))
-        .join('\n');
-      await NyxPrinter.printText(tableBody, opts);
+      await NyxPrinter.printText(`BUS:${busNo}  TRIP No.:${tripNum}`, { textSize: 24 });
+      await NyxPrinter.printText(`${dateStr} ${timeStr}${ticketRangeStr ? `  TKT:${ticketRangeStr}` : ''}`, { textSize: 22 });
 
-      const printGrandLugg = rowsToPrint.reduce((s, r) => s + (r.l ?? 0), 0);
-      const footerLines = [
-        PRINT_DASH_LIGHT,
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
+
+      // ── Column headers: SS ES F H L P AMT ──────────────────────────────────
+      // textSize 26 fits ~24 chars. SS=3,ES=3,F=3,H=3,L=3,P=3,AMT=6 = 24
+     const COL = { 
+  ss:6, 
+  es:6, 
+  f:5, 
+  h:5, 
+  l:5, 
+  p:5, 
+  amt:8 
+};
+      const hdr =
+        padL('SS', COL.ss) +
+        padL('ES', COL.es) +
+        padC('F',  COL.f)  +
+        padC('H',  COL.h)  +
+        padC('L',  COL.l)  +
+        padC('P',  COL.p)  +
+        padR('AMT', COL.amt);
+      await NyxPrinter.printText(hdr, { textSize: 26 });
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
+
+      // ── Stage rows ───────────────────────────────────────────────────────────
+      for (const r of rowsToPrint) {
+        const row =
+          padL(r.ss,          COL.ss)  +
+          padL(r.es,          COL.es)  +
+          padC(r.f,           COL.f)   +
+          padC(r.h,           COL.h)   +
+          padC(r.l,           COL.l)   +
+          padC(r.p ?? 0,      COL.p)   +
+          padR(fmtAmt(r.amt), COL.amt);
+        await NyxPrinter.printText(row, { textSize: 26 });
+      }
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
+
+      // ── FULL total ───────────────────────────────────────────────────────────
+      await NyxPrinter.printText(
         `FULL : ${printGrandFull}`,
-        printGrandHalf > 0 ? `HALF : ${printGrandHalf}` : null,
-        printGrandLugg > 0 ? `LUGG : ${printGrandLugg}` : null,
-        PRINT_DASH,
-        `003-011:    ${fmtAmt(printAmount003to011)}`,
-        `011-018:    ${fmtAmt(printAmount011to018)}`,
-        PRINT_DASH_LIGHT,
-        `TRIP.COLL:  ${fmtAmt(printGrandCollection)}`,
-        `TOT.COLL:   ${fmtAmt(printCombinedTotal)}`,
-        PRINT_DASH,
-      ].filter(Boolean).join('\n');
-      await NyxPrinter.printText(footerLines, boldOpts);
+        { textSize: 26, align: PrintAlign.CENTER },
+      );
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
+
+      // ── TRIP.COLL + TOT.COLL ────────────────────────────────────────────────
+      // textSize 32 fits ~20 chars. label=12 + amount right-aligned in 8 = 20
+      await NyxPrinter.printText(
+        `${padL('TRIP.COLL:', 12)}${padR(fmtAmt(printGrandCollection), 8)}`,
+        { textSize: 32 },
+      );
+      await NyxPrinter.printText(
+        `${padL('TOT.COLL:', 12)}${padR(fmtAmt(printCombinedTotal), 8)}`,
+        { textSize: 32 },
+      );
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
       await NyxPrinter.printEndAutoOut();
+
       showToast('Trip sheet printed!');
     } catch (e) {
       Alert.alert('Print Error', e.message || 'Unknown');
@@ -1377,27 +1293,21 @@ const posTix = (posHook?.tickets ?? []).filter(
     <>
     <View className="px-4 pb-4">
       {/* Trip selector */}
-      <View className="mb-3">
-        <Text className="text-zinc-500 text-[10px] font-bold tracking-widest">
-          SELECT TRIP
-        </Text>
-      </View>
-      <View className="flex-row items-center gap-2 mb-5">
-        {tripPage > 0 && (
-          <TouchableOpacity
-            onPress={() => setTripPage(p => p - 1)}
-            className="justify-center items-center px-2 py-3 rounded-2xl bg-zinc-900 border border-zinc-800"
-          >
-            <ChevronLeft size={20} color="#d4d4d8" />
-          </TouchableOpacity>
-        )}
-        <View className="flex-1 flex-row gap-2">
+      <Text className="text-zinc-500 text-[10px] font-bold tracking-widest mb-3">
+        SELECT TRIP
+      </Text>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        className="mb-5"
+      >
+        <View className="flex-row gap-2">
           {trips.length === 0 && (
-            <View className="bg-zinc-900 border border-zinc-800 rounded-2xl px-5 py-3 flex-1">
+            <View className="bg-zinc-900 border border-zinc-800 rounded-2xl px-5 py-3">
               <Text className="text-zinc-500 text-sm">No trips found</Text>
             </View>
           )}
-          {trips.slice(tripPage * TRIPS_PER_PAGE, (tripPage + 1) * TRIPS_PER_PAGE).map(trip => {
+          {trips.map(trip => {
             const isSelected = selectedTripId === trip.trip_id;
             return (
               <TouchableOpacity
@@ -1406,22 +1316,23 @@ const posTix = (posHook?.tickets ?? []).filter(
                   setSelectedTripId(isSelected ? null : trip.trip_id)
                 }
                 activeOpacity={0.75}
-                className={`flex-1 rounded-2xl px-2 py-3 border ${
+                className={`rounded-2xl px-4 py-3 border ${
                   isSelected
                     ? 'bg-sky-500 border-sky-400'
                     : 'bg-zinc-900 border-zinc-800'
                 }`}
+                style={{ minWidth: 110 }}
               >
                 {trip.isActive && (
                   <View className="absolute top-2 right-2 w-2.5 h-2.5 rounded-full bg-emerald-400" />
                 )}
-                {/* <Text
+                <Text
                   className={`text-[10px] font-bold tracking-wider ${
                     isSelected ? 'text-sky-100' : 'text-zinc-400'
                   }`}
                 >
                   Trip
-                </Text> */}
+                </Text>
                 <Text
                   className={`text-center text-2xl font-black leading-tight ${
                     isSelected ? 'text-white' : 'text-zinc-100'
@@ -1429,7 +1340,7 @@ const posTix = (posHook?.tickets ?? []).filter(
                 >
                   {trip.trip_number ? `#${trip.trip_number}` : '#—'}
                 </Text>
-                {/* <Text
+                <Text
                   className={`text-[10px] mt-1 ${
                     isSelected ? 'text-sky-100' : 'text-zinc-500'
                   }`}
@@ -1437,27 +1348,19 @@ const posTix = (posHook?.tickets ?? []).filter(
                 >
                   {routeLabel(trip.route_name, trip.direction)?.split(' ')[0] ??
                     '—'}
-                </Text> */}
-                {/* <Text
+                </Text>
+                <Text
                   className={`text-[10px] mt-0.5 ${
                     isSelected ? 'text-sky-100' : 'text-zinc-600'
                   }`}
                 >
                   {formatTime(trip.start_time)}
-                </Text> */}
+                </Text>
               </TouchableOpacity>
             );
           })}
         </View>
-        {(tripPage + 1) * TRIPS_PER_PAGE < trips.length && (
-          <TouchableOpacity
-            onPress={() => setTripPage(p => p + 1)}
-            className="justify-center items-center px-2 py-3 rounded-2xl bg-zinc-900 border border-zinc-800"
-          >
-            <ChevronRight size={20} color="#d4d4d8" />
-          </TouchableOpacity>
-        )}
-      </View>
+      </ScrollView>
 
       {/* Empty state */}
       {!selectedTripId && (
@@ -1489,16 +1392,41 @@ const posTix = (posHook?.tickets ?? []).filter(
           <View className="bg-sky-500/10 border-b border-sky-500/20 px-5 py-4">
             <View className="flex-row items-start justify-between">
               <View className="flex-1 mr-3">
-                <RouteWithArrow name={report?.route_name} dir={report?.direction} textClass="text-white text-xl font-black leading-tight" iconSize={18} iconColor="#ffffff" />
+                <Text className="text-zinc-500 text-[9px] font-black tracking-widest mb-1">
+                  TRIP SHEET
+                </Text>
+                <Text className="text-white text-xl font-black leading-tight">
+                  {routeLabel(report.route_name, report.direction)}
+                </Text>
               </View>
-              <View className="flex-row items-center gap-3">
-                <View className="flex-row items-center gap-1">
-                  <Clock size={11} color="#71717a" />
-                  <Text className="text-zinc-400 text-xs">
-                    {formatTime(report.start_time)}
-                  </Text>
-                </View>
-                <StatusPill status={report.status ?? 'completed'} />
+              <StatusPill status={report.status ?? 'completed'} />
+            </View>
+
+            {/* Meta row */}
+            <View className="flex-row flex-wrap gap-x-4 gap-y-1 mt-3">
+              <View className="flex-row items-center gap-1">
+                <Bus size={11} color="#71717a" />
+                <Text className="text-zinc-400 text-xs">
+                  {report.bus_number ?? dashboard?.bus?.vehicle_number ?? 'N/A'}
+                </Text>
+              </View>
+              <View className="flex-row items-center gap-1">
+                <Clock size={11} color="#71717a" />
+                <Text className="text-zinc-400 text-xs">
+                  {formatTime(report.start_time)}
+                </Text>
+              </View>
+              <View className="flex-row items-center gap-1">
+                <Layers size={11} color="#71717a" />
+                <Text className="text-zinc-400 text-xs">
+                  {(report.trip_number ?? trips.find(t => t.trip_id === selectedTripId)?.trip_number) ? `#${report.trip_number ?? trips.find(t => t.trip_id === selectedTripId)?.trip_number}` : '—'}
+                </Text>
+              </View>
+              <View className="flex-row items-center gap-1">
+                <FileText size={11} color="#71717a" />
+                <Text className="text-zinc-400 text-xs">
+                  WB: {report.way_bill_number ?? report.waybill ?? trips.find(t => t.trip_id === selectedTripId)?.way_bill_number ?? '—'}
+                </Text>
               </View>
             </View>
           </View>
@@ -1508,9 +1436,6 @@ const posTix = (posHook?.tickets ?? []).filter(
             <StatChip label="FULL" value={grandFull} color="text-white" />
             {grandHalf > 0 && (
               <StatChip label="HALF" value={grandHalf} color="text-amber-400" />
-            )}
-            {grandLugg > 0 && (
-              <StatChip label="LUGG" value={grandLugg} color="text-orange-400" />
             )}
             <StatChip
               label="APP"
@@ -1576,31 +1501,20 @@ const posTix = (posHook?.tickets ?? []).filter(
               <>
                 <View className="flex-row justify-end mb-3">
                   <TouchableOpacity
-                    className="flex-row items-center justify-center gap-1.5 rounded-xl px-4 py-3"
-                    style={{ backgroundColor: '#89F336' }}
+                    className="flex-row items-center justify-center gap-1.5 bg-sky-500 rounded-xl px-4 py-3"
                     activeOpacity={0.8}
                     onPress={handlePrintTripSheet}
                   >
-                    <Download size={14} color="#000" />
-                    <Text className="text-black text-xs font-bold">Print</Text>
+                    <Download size={14} color="#fff" />
+                    <Text className="text-white text-xs font-bold">Print</Text>
                   </TouchableOpacity>
                 </View>
                 <StageTable rows={stageRows} />
-                <View className="bg-sky-500/10 border border-sky-500/20 rounded-xl px-4 py-3 mt-3">
-                  <View className="flex-row justify-between items-center mb-2">
-                    <Text className="text-zinc-400 text-xs font-bold">003-011</Text>
-                    <Text className="text-zinc-300 text-base font-bold">₹{amount003to011.toFixed(2)}</Text>
-                  </View>
-                  <View className="flex-row justify-between items-center mb-2">
-                    <Text className="text-zinc-400 text-xs font-bold">011-018</Text>
-                    <Text className="text-zinc-300 text-base font-bold">₹{amount011to018.toFixed(2)}</Text>
-                  </View>
-                  <View className="border-t border-sky-500/30 pt-2 mt-1">
-                    <View className="flex-row justify-between items-center">
-                      <Text className="text-zinc-300 text-sm font-bold">TRP TOTAL</Text>
-                      <Text className="text-sky-400 text-xl font-black">₹{grandCollection.toFixed(2)}</Text>
-                    </View>
-                  </View>
+                <View className="flex-row justify-between items-center bg-sky-500/10 border border-sky-500/20 rounded-xl px-4 py-3 mt-3">
+                  <Text className="text-zinc-300 text-sm font-bold">TRP TOTAL</Text>
+                  <Text className="text-sky-400 text-xl font-black">
+                    ₹{grandCollection.toFixed(2)}
+                  </Text>
                 </View>
               </>
             ) : (
@@ -1645,113 +1559,100 @@ const posTix = (posHook?.tickets ?? []).filter(
               </View>
 
               <View className="mt-1">
-                {/* ── Stop Selector ── */}
-                <View className="flex-row items-stretch bg-black rounded-xl border border-white/20 mb-3 overflow-hidden">
+                {/* Stage range selector */}
+                <View className="flex-row items-stretch bg-zinc-900 rounded-xl border border-zinc-700 overflow-hidden mb-3">
                   {/* FROM */}
                   <TouchableOpacity
-                    className={`flex-1 px-3 py-3 ${showFilterStartDrop ? 'bg-black' : ''}`}
+                    className={`flex-1 px-3 py-3 ${showFilterStartDrop ? 'bg-zinc-800/60' : ''}`}
                     onPress={() => {
-                      if (showFilterStartDrop) {
-                        setShowFilterStartDrop(false);
-                      } else {
-                        setShowFilterStartDrop(true);
-                        setShowFilterEndDrop(false);
-                      }
-                    }}>
-                    <Text className="text-white text-xs font-bold tracking-widest mb-1">FROM</Text>
+                      setShowFilterStartDrop(v => !v);
+                      setShowFilterEndDrop(false);
+                    }}
+                    activeOpacity={0.8}
+                  >
+                    <Text className="text-zinc-500 text-[10px] font-black tracking-widest mb-1">
+                      FROM
+                    </Text>
                     {filterStart ? (
                       <View className="flex-row items-baseline gap-1">
                         <Text className="text-sky-400 text-2xl font-black leading-7">
                           {String(stageNumFromPlace(filterStart)).padStart(3, '0')}
                         </Text>
-                        <Text className="text-white text-sm font-medium flex-shrink" numberOfLines={1}>
+                        <Text
+                          className="text-white text-sm font-medium flex-shrink"
+                          numberOfLines={1}
+                        >
                           {getFilterDisplayName(filterStart)}
                         </Text>
                       </View>
                     ) : (
-                      <Text className="text-white text-sm">Select start</Text>
+                      <Text className="text-zinc-500 text-sm">Select start stage</Text>
                     )}
                   </TouchableOpacity>
 
-                  {/* Swap */}
-                  <TouchableOpacity
-                    className={`w-10 items-center justify-center border-x border-white/20 ${(!filterStart || !filterEnd) ? 'opacity-30' : ''}`}
-                    onPress={() => {
-                      if (filterStart && filterEnd) {
-                        const temp = filterStart;
-                        setFilterStart(filterEnd);
-                        setFilterEnd(temp);
-                      }
-                    }}
-                    disabled={!filterStart || !filterEnd}>
-                    <ArrowUpDown size={15} color="#ffffff" />
-                  </TouchableOpacity>
+                  <View className="w-10 items-center justify-center border-x border-zinc-700">
+                    <ArrowRight size={14} color="#71717a" />
+                  </View>
 
                   {/* TO */}
                   <TouchableOpacity
-                    className={`flex-1 px-3 py-3 ${showFilterEndDrop ? 'bg-black' : ''}`}
+                    className={`flex-1 px-3 py-3 ${showFilterEndDrop ? 'bg-zinc-800/60' : ''}`}
                     onPress={() => {
-                      if (showFilterEndDrop) {
-                        setShowFilterEndDrop(false);
-                      } else {
-                        setShowFilterEndDrop(true);
-                        setShowFilterStartDrop(false);
-                      }
-                    }}>
-                    <Text className="text-white text-xs font-bold tracking-widest mb-1">TO</Text>
+                      setShowFilterEndDrop(v => !v);
+                      setShowFilterStartDrop(false);
+                    }}
+                    activeOpacity={0.8}
+                  >
+                    <Text className="text-zinc-500 text-[10px] font-black tracking-widest mb-1">
+                      TO
+                    </Text>
                     {filterEnd ? (
                       <View className="flex-row items-baseline gap-1">
-                        <Text className="text-orange-400 text-2xl font-black leading-7">
+                        <Text className="text-violet-400 text-2xl font-black leading-7">
                           {String(stageNumFromPlace(filterEnd)).padStart(3, '0')}
                         </Text>
-                        <Text className="text-white text-sm font-medium flex-shrink" numberOfLines={1}>
+                        <Text
+                          className="text-white text-sm font-medium flex-shrink"
+                          numberOfLines={1}
+                        >
                           {getFilterDisplayName(filterEnd)}
                         </Text>
                       </View>
                     ) : (
-                      <Text className="text-white text-sm">Select end</Text>
+                      <Text className="text-zinc-500 text-sm">Select end stage</Text>
                     )}
                   </TouchableOpacity>
                 </View>
 
-                {/* ── Stop Grid (Start) ── */}
+                {/* Start grid */}
                 {showFilterStartDrop && (
-                  <View className="bg-black rounded-xl mb-3 overflow-hidden" style={{ borderWidth: 2, borderColor: '#38bdf8' }}>
+                  <View className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden mb-3">
                     <View className="flex-row flex-wrap">
                       {filterPlaces.map((p, idx) => {
                         const isSel = filterStart?.key === p.key;
-                        const isOtherSel = filterEnd?.key === p.key;
+                        const isDis = filterEnd?.key === p.key;
                         const isNotLastInRow = (idx + 1) % 3 !== 0;
-                        const borderColor = '#38bdf8';
                         return (
                           <TouchableOpacity
                             key={`fs-${p.key}`}
-                            onPress={() => {
-                              if (isOtherSel) {
-                                setFilterEnd(null);
-                              }
-                              setFilterStart(p);
-                              setShowFilterStartDrop(false);
-                              setShowFilterEndDrop(true);
-                            }}
-                            style={{
-                              borderBottomWidth: 2,
-                              borderBottomColor: borderColor,
-                              borderRightWidth: isNotLastInRow ? 2 : 0,
-                              borderRightColor: borderColor,
-                            }}
+                            disabled={isDis}
+                            onPress={() => { setFilterStart(p); setShowFilterStartDrop(false); setShowFilterEndDrop(true); }}
                             className={[
                               'w-1/3 px-1 py-3 flex-col items-center justify-center gap-0.5',
-                              isSel ? 'bg-sky-950' : '',
-                              isOtherSel ? 'opacity-60' : '',
-                            ].join(' ')}>
+                              'border-b border-zinc-800',
+                              isNotLastInRow ? 'border-r border-zinc-800' : '',
+                              isSel ? 'bg-sky-500/20' : '',
+                              isDis ? 'opacity-40' : '',
+                            ].join(' ')}
+                            activeOpacity={0.8}
+                          >
                             <Text
                               numberOfLines={1}
                               adjustsFontSizeToFit
-                              className={`text-2xl font-black text-center ${isSel ? 'text-sky-400' : isOtherSel ? 'text-orange-400' : 'text-white'}`}>
+                              className={`text-2xl font-black text-center ${isSel ? 'text-sky-400' : 'text-white'}`}>
                               {p.label.split('-')[1]}
                             </Text>
-                            <Text className={`text-[11px] font-medium text-center w-full px-1 ${isSel ? 'text-white' : 'text-white'}`} numberOfLines={1}>
+                            <Text className="text-[11px] font-medium text-center text-zinc-300 w-full px-1" numberOfLines={1}>
                               {p.label.split('-')[2]}
                             </Text>
                           </TouchableOpacity>
@@ -1761,43 +1662,35 @@ const posTix = (posHook?.tickets ?? []).filter(
                   </View>
                 )}
 
-                {/* ── Stop Grid (End) ── */}
+                {/* End grid */}
                 {showFilterEndDrop && (
-                  <View className="bg-black rounded-xl mb-3 overflow-hidden" style={{ borderWidth: 2, borderColor: '#fb923c' }}>
+                  <View className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden mb-3">
                     <View className="flex-row flex-wrap">
                       {filterPlaces.map((p, idx) => {
                         const isSel = filterEnd?.key === p.key;
-                        const isOtherSel = filterStart?.key === p.key;
+                        const isDis = filterStart?.key === p.key;
                         const isNotLastInRow = (idx + 1) % 3 !== 0;
-                        const borderColor = '#fb923c';
                         return (
                           <TouchableOpacity
                             key={`fe-${p.key}`}
-                            onPress={() => {
-                              if (isOtherSel) {
-                                setFilterStart(null);
-                              }
-                              setFilterEnd(p);
-                              setShowFilterEndDrop(false);
-                            }}
-                            style={{
-                              borderBottomWidth: 2,
-                              borderBottomColor: borderColor,
-                              borderRightWidth: isNotLastInRow ? 2 : 0,
-                              borderRightColor: borderColor,
-                            }}
+                            disabled={isDis}
+                            onPress={() => { setFilterEnd(p); setShowFilterEndDrop(false); }}
                             className={[
                               'w-1/3 px-1 py-3 flex-col items-center justify-center gap-0.5',
-                              isSel ? 'bg-orange-950' : '',
-                              isOtherSel ? 'opacity-60' : '',
-                            ].join(' ')}>
+                              'border-b border-zinc-800',
+                              isNotLastInRow ? 'border-r border-zinc-800' : '',
+                              isSel ? 'bg-violet-500/20' : '',
+                              isDis ? 'opacity-40' : '',
+                            ].join(' ')}
+                            activeOpacity={0.8}
+                          >
                             <Text
                               numberOfLines={1}
                               adjustsFontSizeToFit
-                              className={`text-2xl font-black text-center ${isSel ? 'text-orange-400' : isOtherSel ? 'text-sky-400' : 'text-white'}`}>
+                              className={`text-2xl font-black text-center ${isSel ? 'text-violet-400' : 'text-white'}`}>
                               {p.label.split('-')[1]}
                             </Text>
-                            <Text className={`text-[11px] font-medium text-center w-full px-1 ${isSel ? 'text-white' : 'text-white'}`} numberOfLines={1}>
+                            <Text className="text-[11px] font-medium text-center text-zinc-300 w-full px-1" numberOfLines={1}>
                               {p.label.split('-')[2]}
                             </Text>
                           </TouchableOpacity>
@@ -1831,13 +1724,12 @@ const posTix = (posHook?.tickets ?? []).filter(
                         </Text>
                       </View>
                       <TouchableOpacity
-                        className="flex-1 flex-row items-center justify-center gap-1.5 rounded-xl px-4 py-3"
-                        style={{ backgroundColor: '#89F336' }}
+                        className="flex-1 flex-row items-center justify-center gap-1.5 bg-sky-500 rounded-xl px-4 py-3"
                         activeOpacity={0.8}
                         onPress={handlePrintTripSheet}
                       >
-                        <Download size={14} color="#000" />
-                        <Text className="text-black text-xs font-bold">Print</Text>
+                        <Download size={14} color="#fff" />
+                        <Text className="text-white text-xs font-bold">Print</Text>
                       </TouchableOpacity>
                     </View>
                     <StageTable rows={filteredStageRows} />
@@ -1908,11 +1800,8 @@ const posTix = (posHook?.tickets ?? []).filter(
                   </View>
                 ))}
                 <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginTop: 4, marginBottom: 4 }}>{'- - - - - - - - - - - - - - - -'}</Text>
-                <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 13, marginBottom: 2 }}>FULL : {printModalData.grandFull}{printModalData.grandHalf > 0 ? `  HALF : ${printModalData.grandHalf}` : ''}{printModalData.grandLugg > 0 ? `  LUGG : ${printModalData.grandLugg}` : ''}</Text>
+                <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 13, marginBottom: 2 }}>FULL : {printModalData.grandFull}</Text>
                 <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginBottom: 4 }}>{'--------------------------------'}</Text>
-                <Text style={{ color: '#000', fontWeight: '800', fontSize: 14, marginBottom: 1 }}>003-011:    ₹{Number(printModalData.amount003to011 ?? 0).toFixed(2)}</Text>
-                <Text style={{ color: '#000', fontWeight: '800', fontSize: 14, marginBottom: 1 }}>011-018:    ₹{Number(printModalData.amount011to018 ?? 0).toFixed(2)}</Text>
-                <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginTop: 4, marginBottom: 4 }}>{'- - - - - - - - - - - - - - - -'}</Text>
                 <Text style={{ color: '#000', fontWeight: '800', fontSize: 14, marginBottom: 1 }}>TRIP.COLL:  ₹{Number(printModalData.grandCollection).toFixed(2)}</Text>
                 <Text style={{ color: '#000', fontWeight: '800', fontSize: 14 }}>TOT.COLL:   ₹{Number(printModalData.combinedTotal).toFixed(2)}</Text>
               </View>
@@ -1932,7 +1821,7 @@ const posTix = (posHook?.tickets ?? []).filter(
 };
 
 // ─── Status Report Tab Content ────────────────────────────────────────────────
-const StatusReportTabContent = ({ dashboard, posHook, onRefresh }) => {
+const StatusReportTabContent = ({ dashboard, posHook }) => {
   const [selDest, setSelDest] = useState(null);
   const [overrideStart, setOverrideStart] = useState(null);
   const [showStartDrop, setShowStartDrop] = useState(false);
@@ -1952,11 +1841,11 @@ const StatusReportTabContent = ({ dashboard, posHook, onRefresh }) => {
 const STORAGE_KEY_DEST = 'report_dest_place';
   const STORAGE_KEY_OVERRIDE_START = 'report_override_start_place';
 
-  // Derive auto start from trip direction (fixed order 001→018)
+  // Derive auto start from trip direction
   const tripDir = dashboard?.active_trip?.direction ?? '';
-  const autoStart = isDownDirection(tripDir)
-    ? places.find(p => !p.disabled) || places[0]  // dn = Sathy→CBE, FROM = Sathy (003, first enabled)
-    : places[places.length - 1];                   // up = CBE→Sathy, FROM = CBE (018, last)
+const autoStart = isDownDirection(tripDir)
+    ? places[places.length - 1]  // dn = Sathy→CBE, start from highest stage (018)
+    : places[0];                  // up = CBE→Sathy, start from lowest stage (003)
 
   const selStart = overrideStart ?? autoStart;
 
@@ -1979,21 +1868,6 @@ const STORAGE_KEY_DEST = 'report_dest_place';
   useEffect(() => {
     if (overrideStart) AsyncStorage.setItem(STORAGE_KEY_OVERRIDE_START, JSON.stringify(overrideStart));
   }, [overrideStart]);
-
-  // Clear override when trip direction changes so autoStart takes effect
-  useEffect(() => {
-    setOverrideStart(null);
-    AsyncStorage.removeItem(STORAGE_KEY_OVERRIDE_START);
-    setSelDest(null);
-    AsyncStorage.removeItem(STORAGE_KEY_DEST);
-  }, [tripDir]);
-
-  // Auto-open destination grid when no TO place selected
-  useEffect(() => {
-    if (!selDest && !showStartDrop) {
-      setShowDestDrop(true);
-    }
-  }, [selDest, showStartDrop]);
 
 useEffect(() => {
     if (selDest) {
@@ -2156,31 +2030,29 @@ useEffect(() => {
       const pIn = grandFull + grandHalf;
       
       // TOT — total passengers for the whole trip (all tickets, not filtered)
-      const totalAppPassengers = allAppRows.reduce((s, r) => {
-        const tt = (r.ticket_type ?? 'full').toLowerCase();
-        return tt === 'luggage' ? s : s + Number(r.ticket_count ?? 1);
-      }, 0);
+      const totalAppPassengers = allAppRows.reduce((s, r) => s + Number(r.ticket_count ?? 1), 0);
       const totalPosPassengers = allPosTix.reduce((s, t) => {
-        if ((t.ticket_type ?? 'full').toLowerCase() === 'luggage') return s;
-        return s + Number(t.ticket_count ?? 0);
+        const cnt = Number(t.ticket_count ?? 0);
+        const lugg = Number(t.luggage_amount ?? 0) > 0 ? 1 : 0;
+        return s + Math.max(0, cnt - lugg);
       }, 0);
       const tot = totalAppPassengers + totalPosPassengers;
 
       // P. OUT — passengers already exited (toCode before selected stage)
       const exitedAppCount = allAppRows.reduce((s, r) => {
-        if ((r.ticket_type ?? 'full').toLowerCase() === 'luggage') return s;
         const toCode = parseInt(stageCodeFromName(r.to_name), 10);
         if (isNaN(toCode)) return s;
         const exited = goingDown ? toCode > destNum : toCode < destNum;
         return exited ? s + Number(r.ticket_count ?? 1) : s;
       }, 0);
       const exitedPosCount = allPosTix.reduce((s, t) => {
-        if ((t.ticket_type ?? 'full').toLowerCase() === 'luggage') return s;
         const toCode = parseInt(stageCode(t.to_stop), 10);
         if (isNaN(toCode)) return s;
         const exited = goingDown ? toCode > destNum : toCode < destNum;
         if (!exited) return s;
-        return s + Number(t.ticket_count ?? 0);
+        const cnt = Number(t.ticket_count ?? 0);
+        const lugg = Number(t.luggage_amount ?? 0) > 0 ? 1 : 0;
+        return s + Math.max(0, cnt - lugg);
       }, 0);
       const pOut = exitedAppCount + exitedPosCount;
 
@@ -2197,10 +2069,11 @@ useEffect(() => {
         return toCode === nextStageNum ? s + Number(r.ticket_count ?? 1) : s;
       }, 0);
       const nextPosCount = allPosTix.reduce((s, t) => {
-        if ((t.ticket_type ?? 'full').toLowerCase() === 'luggage') return s;
         const toCode = parseInt(stageCode(t.to_stop), 10);
         if (toCode !== nextStageNum) return s;
-        return s + Number(t.ticket_count ?? 0);
+        const cnt = Number(t.ticket_count ?? 0);
+        const lugg = Number(t.luggage_amount ?? 0) > 0 ? 1 : 0;
+        return s + Math.max(0, cnt - lugg);
       }, 0);
       const pOutNext = nextAppCount + nextPosCount;
 
@@ -2209,7 +2082,7 @@ useEffect(() => {
       const firstTktNum = allTripTicketNums.length > 0 ? Math.min(...allTripTicketNums) : null;
       const lastTktNum = allTripTicketNums.length > 0 ? Math.max(...allTripTicketNums) : null;
       const tktRangeStr = firstTktNum && lastTktNum
-        ? `${firstTktNum} - ${lastTktNum} = ${lastTktNum - firstTktNum + 1}`
+        ? `${firstTktNum} - ${lastTktNum}`
         : (firstTktNum || lastTktNum || null);
 
       setFilteredData({
@@ -2233,7 +2106,8 @@ useEffect(() => {
     }
 }, [selStart, selDest, dashboard, posHook, autoStart,overrideStart]);
 
-  const getPlaces = () => places; // Fixed 001→018 order
+  const getPlaces = () =>
+    isDownDirection(tripDir) ? [...places].reverse() : places;
 
   const getDisplayName = place => {
     if (!place) return '';
@@ -2251,23 +2125,11 @@ useEffect(() => {
     const isTestingMode = testingMode === 'true';
 
     if (isTestingMode) {
-      const destNum = selDest?.label ? parseInt(selDest.label.split('-')[1], 10) : null;
-      const destName = selDest?.label ? selDest.label.split('-').slice(2).join(' ') : '';
-      const modalGrandHalf = filteredData.stageRows.reduce((s, r) => s + (r.h ?? 0), 0);
-      const modalGrandLugg = filteredData.stageRows.reduce((s, r) => s + (r.l ?? 0), 0);
       setStatusModalData({
         stageRows: filteredData.stageRows,
         grandFull: filteredData.grandFull,
-        grandHalf: modalGrandHalf,
-        grandLugg: modalGrandLugg,
         grandCollection: filteredData.grandCollection,
         ticketRange: filteredData.ticketRange ?? null,
-        pIn: filteredData.pIn,
-        pOut: filteredData.pOut,
-        pOutNext: filteredData.pOutNext,
-        nextStageLabel: filteredData.nextStageLabel,
-        tot: filteredData.tot,
-        stageName: !isNaN(destNum) && destName ? `${destName} (${String(destNum).padStart(2, '0')})` : null,
       });
       setShowStatusModal(true);
       return;
@@ -2284,50 +2146,48 @@ useEffect(() => {
         return;
       }
 
-      const opts = { textSize: 27 };
-      const boldOpts = { textSize: 27, bold: true };
+      const padL = (s, w) => String(s).padEnd(w, ' ');
+      const padR = (s, w) => String(s).padStart(w, ' ');
+      const padC = (s, w) => { const str = String(s); const tot = w - str.length; const l = Math.floor(tot / 2); return ' '.repeat(l) + str + ' '.repeat(tot - l); };
       const fmtAmt = n => Number(n).toFixed(2);
 
-      const center22 = { textSize: 22, align: PrintAlign.CENTER };
-      await NyxPrinter.printText('SPS TRANSPORT', center22);
+      const DASH32 = '--------------------------------';
+      const DASH_LIGHT = '- - - - - - - - - - - - - - - -';
+
+      await NyxPrinter.printText('SPS TRANSPORT', { textSize: 22, align: PrintAlign.CENTER });
       await NyxPrinter.printText('STATUS REPORT', { textSize: 26, align: PrintAlign.CENTER, bold: true });
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
+      if (filteredData.ticketRange) {
+        await NyxPrinter.printText(`TKT: ${filteredData.ticketRange}`, { textSize: 22, align: PrintAlign.CENTER });
+      }
 
-      // Get stage info for header
-      const destNum = selDest?.label ? parseInt(selDest.label.split('-')[1], 10) : null;
-      const destName = selDest?.label ? selDest.label.split('-').slice(2).join(' ') : '';
-      const stageLine = !isNaN(destNum) && destName ? `STAGE: ${destName} (${String(destNum).padStart(2, '0')})` : null;
+      const COL = { ss:6, es:6, f:5, h:5, l:5, p:5, amt:8 };
+      const hdr =
+        padL('SS', COL.ss) + padL('ES', COL.es) +
+        padC('F', COL.f)   + padC('H', COL.h) +
+        padC('L', COL.l)   + padC('P', COL.p) +
+        padR('AMT', COL.amt);
+      await NyxPrinter.printText(hdr, { textSize: 26 });
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
 
-      const headerBlock = [
-        PRINT_DASH,
-        stageLine,
-        filteredData.ticketRange ? `TKT: ${filteredData.ticketRange}` : null,
-        PRINT_DASH,
-        buildPrintRow(PRINT_HEADER_VALUES),
-      ].filter(Boolean).join('\n');
-      await NyxPrinter.printText(headerBlock, { textSize: 27 });
+      for (const r of filteredData.stageRows) {
+        const row =
+          padL(r.ss,          COL.ss) + padL(r.es,      COL.es) +
+          padC(r.f,           COL.f)  + padC(r.h,       COL.h)  +
+          padC(r.l,           COL.l)  + padC(r.p ?? 0,  COL.p)  +
+          padR(fmtAmt(r.amt), COL.amt);
+        await NyxPrinter.printText(row, { textSize: 26 });
+      }
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
 
-      const tableBody = filteredData.stageRows
-        .map(r => buildPrintRow({ ss: r.ss, es: r.es, f: r.f, h: r.h, l: r.l, p: r.p ?? 0, amt: r.amt }, true))
-        .join('\n');
-      await NyxPrinter.printText(tableBody, opts);
+      await NyxPrinter.printText(`FULL : ${filteredData.grandFull}`, { textSize: 26, align: PrintAlign.CENTER });
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
-      const statusGrandHalf = filteredData.stageRows.reduce((s, r) => s + (r.h ?? 0), 0);
-      const statusGrandLugg = filteredData.stageRows.reduce((s, r) => s + (r.l ?? 0), 0);
-      const footerBlock = [
-        PRINT_DASH_LIGHT,
-        `FULL : ${filteredData.grandFull}`,
-        statusGrandHalf > 0 ? `HALF : ${statusGrandHalf}` : null,
-        statusGrandLugg > 0 ? `LUGG : ${statusGrandLugg}` : null,
-        PRINT_DASH,
-        `P.IN: ${filteredData.pIn}`,
-        `P.OUT: ${filteredData.pOut}`,
-        `P.OUT ${filteredData.nextStageLabel}:${filteredData.pOutNext}`,
-        `TOT: ${filteredData.tot}`,
-        PRINT_DASH_LIGHT,
-        `TOT.COLL:   ${fmtAmt(filteredData.grandCollection)}`,
-        PRINT_DASH,
-      ].filter(Boolean).join('\n');
-      await NyxPrinter.printText(footerBlock, boldOpts);
+      await NyxPrinter.printText(
+        `${padL('TOT.COLL:', 12)}${padR(fmtAmt(filteredData.grandCollection), 8)}`,
+        { textSize: 32 },
+      );
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
       await NyxPrinter.printEndAutoOut();
       showToast('Status report printed!');
@@ -2339,7 +2199,7 @@ useEffect(() => {
   return (
     <>
     <View className="px-4 pb-4">
-      <Text className="text-zinc-500 text-[10px] font-bold tracking-widest mb-3">SELECT END PLACE</Text>
+     <Text className="text-zinc-500 text-[10px] font-bold tracking-widest mb-3">SELECT END PLACE</Text>
 
       {/* Route bar — FROM 30% / TO 70% */}
       <View className="flex-row gap-2 mb-4">
@@ -2501,26 +2361,29 @@ useEffect(() => {
                 />
               </View>
               
-              <View className="flex-row items-center justify-between px-4 pb-2">
+              <View className="px-4 pb-2">
                 <StatChip
                   label="TOTAL"
                   value={`₹${filteredData.grandCollection.toFixed(0)}`}
                   color="text-emerald-400"
                 />
-                <TouchableOpacity
-                  className="flex-row items-center gap-1.5 rounded-xl px-4 py-2.5"
-                  style={{ backgroundColor: '#89F336' }}
-                  activeOpacity={0.8}
-                  onPress={handlePrintStatusReport}
-                >
-                  <Download size={14} color="#000" />
-                  <Text className="text-black text-xs font-bold">Print Status Report</Text>
-                </TouchableOpacity>
               </View>
 
               <View className="px-4 pb-4">
                 <StageTable rows={filteredData.stageRows} />
               </View>
+
+              {/* Print button */}
+              <TouchableOpacity
+                className="mx-4 mb-4 flex-row items-center justify-center gap-2 bg-sky-500 rounded-xl py-3.5"
+                activeOpacity={0.8}
+                onPress={handlePrintStatusReport}
+              >
+                <Download size={16} color="#fff" />
+                <Text className="text-white text-sm font-bold">
+                  Print Status Report
+                </Text>
+              </TouchableOpacity>
             </View>
           )}
 
@@ -2575,11 +2438,7 @@ useEffect(() => {
                 <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 15, marginBottom: 4 }}>SPS TRANSPORT</Text>
                 <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 17, marginBottom: 6 }}>STATUS REPORT</Text>
                 <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginBottom: 6 }}>{'--------------------------------'}</Text>
-                {statusModalData.stageName && (
-                  <Text style={{ color: '#000', textAlign: 'center', fontSize: 13, marginBottom: 2, fontWeight: '700' }}>STAGE: {statusModalData.stageName}</Text>
-                )}
                 <Text style={{ color: '#000', textAlign: 'center', fontSize: 12, marginBottom: 2 }}>TKT: {statusModalData.ticketRange ?? '—'}</Text>
-                <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginBottom: 4 }}>{'--------------------------------'}</Text>
                 <View style={{ flexDirection: 'row', marginBottom: 2 }}>
                   {['SS','ES','F','H','L','P','AMT'].map((h, i) => (
                     <Text key={i} style={{ flex: i === 6 ? 2 : 1, textAlign: i === 6 ? 'right' : 'center', fontSize: 10, fontWeight: '800', color: '#333' }}>{h}</Text>
@@ -2598,13 +2457,8 @@ useEffect(() => {
                   </View>
                 ))}
                 <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginTop: 4, marginBottom: 4 }}>{'- - - - - - - - - - - - - - - -'}</Text>
-                <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 13, marginBottom: 2 }}>FULL : {statusModalData.grandFull}{statusModalData.grandHalf > 0 ? `  HALF : ${statusModalData.grandHalf}` : ''}{statusModalData.grandLugg > 0 ? `  LUGG : ${statusModalData.grandLugg}` : ''}</Text>
+                <Text style={{ color: '#000', textAlign: 'center', fontWeight: '800', fontSize: 13, marginBottom: 2 }}>FULL : {statusModalData.grandFull}</Text>
                 <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginBottom: 4 }}>{'--------------------------------'}</Text>
-                <Text style={{ color: '#000', fontWeight: '800', fontSize: 14, marginBottom: 1 }}>P.IN: {statusModalData.pIn}</Text>
-                <Text style={{ color: '#000', fontWeight: '800', fontSize: 14, marginBottom: 1 }}>P.OUT: {statusModalData.pOut}</Text>
-                <Text style={{ color: '#000', fontWeight: '800', fontSize: 14, marginBottom: 1 }}>P.OUT {statusModalData.nextStageLabel}:{statusModalData.pOutNext}</Text>
-                <Text style={{ color: '#000', fontWeight: '800', fontSize: 14, marginBottom: 1 }}>TOT: {statusModalData.tot}</Text>
-                <Text style={{ color: '#555', textAlign: 'center', fontSize: 11, marginTop: 4, marginBottom: 4 }}>{'- - - - - - - - - - - - - - - -'}</Text>
                 <Text style={{ color: '#000', fontWeight: '800', fontSize: 14 }}>TOT.COLL:   ₹{Number(statusModalData.grandCollection).toFixed(2)}</Text>
               </View>
             )}
@@ -2636,15 +2490,12 @@ const EXPENSE_PRESETS = [
 
 const FIXED_EXPENSES = ['Diesel', 'Driver', 'Conductor', 'Tollgate', 'Pooja', 'Others'];
 
-const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
+const CollectionReportTabContent = ({ dashboard, posHook }) => {
   const [expenses, setExpenses] = useState(
     FIXED_EXPENSES.map((label, i) => ({ id: String(i + 1), label, amount: '0', fixed: true }))
   );
   const [showAddModal, setShowAddModal] = useState(false);
   const [customExpense, setCustomExpense] = useState('');
-  const [showTestModal, setShowTestModal] = useState(false);
-  const [testModalData, setTestModalData] = useState(null);
-  const [expensesCollapsed, setExpensesCollapsed] = useState(true);
 
   const recentTrips = dashboard?.recent_trips ?? [];
   const posByTrip = (posHook?.tickets ?? []).reduce((acc, t) => {
@@ -2723,16 +2574,6 @@ const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
     const posAmt = posTix.reduce((s, t) => s + Number(t.fare || 0), 0);
     const appAmt = Number(bt?.collection ?? 0);
     const total = appAmt + posAmt;
-    // Per-trip stage split from POS tickets
-    let pos003to011 = 0, pos011to018 = 0;
-    for (const t of posTix) {
-      const ssNum = parseInt(stageCode(t.from_stop), 10);
-      const fare = Number(t.fare || 0);
-      if (!isNaN(ssNum)) {
-        if (ssNum >= 3 && ssNum <= 11) pos003to011 += fare;
-        if (ssNum >= 12 && ssNum <= 18) pos011to018 += fare;
-      }
-    }
     return {
       tripId,
       trip: bt?.trip_number ?? idx + 1,
@@ -2740,8 +2581,6 @@ const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
       appAmt,
       posAmt,
       amount: total,
-      amt003to011: pos003to011,
-      amt011to018: pos011to018,
     };
   }).sort((a, b) => {
     const an = Number(a.trip), bn = Number(b.trip);
@@ -2751,8 +2590,6 @@ const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
 
   const totalCollection = tripRows.reduce((s, r) => s + r.amount, 0);
   const netTotal = totalCollection - totalExpenses;
-  const collSplit003to011 = tripRows.reduce((s, r) => s + r.amt003to011, 0);
-  const collSplit011to018 = tripRows.reduce((s, r) => s + r.amt011to018, 0);
 
   const addExpense = label => {
     setExpenses([...expenses, { id: Date.now().toString(), label, amount: '0' }]);
@@ -2776,10 +2613,7 @@ const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
   };
 
   const handlePrintCollectionReport = async () => {
-    const testingMode = await AsyncStorage.getItem('testing_mode');
-    const isTestingMode = testingMode === 'true';
-
-    if (!isTestingMode && (Platform.OS !== 'android' || !NyxPrinter)) {
+    if (Platform.OS !== 'android' || !NyxPrinter) {
       Alert.alert('Not supported', 'Printing is only available on Android.');
       return;
     }
@@ -2787,34 +2621,6 @@ const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
       Alert.alert('No data', 'No collection data to print.');
       return;
     }
-
-    // Prepare data for print/test
-    const now = new Date();
-    const dateStr = now.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: '2-digit' }).replace(/\//g, '/');
-    const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
-    const busNo = dashboard?.recent_trips?.[0]?.bus_number ?? dashboard?.bus?.vehicle_number ?? 'N/A';
-
-    if (isTestingMode) {
-      setTestModalData({
-        dateStr,
-        timeStr,
-        busNo,
-        tripRows,
-        totalCollection,
-        totalExpenses,
-        netTotal,
-        expenses: expenses.map(e => ({ ...e, parsedAmount: parseAmount(e.amount) })),
-        ticketRangeStr,
-        totalTickets,
-        collSplit003to011,
-        collSplit011to018,
-      });
-      setShowTestModal(true);
-      await AsyncStorage.setItem(COLLECTION_REPORT_PRINTED_AT_KEY, new Date().toISOString());
-      showToast('Testing mode: collection report modal shown');
-      return;
-    }
-
     try {
       const statusRet = await NyxPrinter.getPrinterStatus();
       if (statusRet !== PrinterStatus.SDK_OK) {
@@ -2822,81 +2628,89 @@ const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
         return;
       }
 
-      const opts = { textSize: 26 };
-      const boldOpts = { textSize: 26, bold: true };
-      const fmtAmt = n => Number(n).toFixed(2);
       const padL = (s, w) => String(s).padEnd(w, ' ');
       const padR = (s, w) => String(s).padStart(w, ' ');
       const padC = (s, w) => { const str = String(s); const tot = Math.max(0, w - str.length); const l = Math.floor(tot / 2); return ' '.repeat(l) + str + ' '.repeat(tot - l); };
+      const fmtAmt = n => Number(n).toFixed(2);
+
+      const DASH32 = '--------------------------------';
+      const DASH_LIGHT = '- - - - - - - - - - - - - - - -';
+
+      const now = new Date();
+      const dateStr = now.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: '2-digit' }).replace(/\//g, '/');
+      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+      const busNo = dashboard?.recent_trips?.[0]?.bus_number ?? dashboard?.bus?.vehicle_number ?? 'N/A';
 
       // ── Header ──────────────────────────────────────────────────────────
-      await NyxPrinter.printText('COLLECTION REPORT', { textSize: 26, align: PrintAlign.CENTER, bold: true });
-
-      const headerBlock = [
-        `${dateStr}  ${timeStr}`,
-        PRINT_DASH,
-        `BUS NUMBER:${busNo}`,
-        PRINT_DASH,
-      ].join('\n');
-      await NyxPrinter.printText(headerBlock, { textSize: 22, align: PrintAlign.CENTER });
+      await NyxPrinter.printText('விண்ணப்பம் அலுவலகம்', { textSize: 20, align: PrintAlign.CENTER });
+      await NyxPrinter.printText('COLLECTION REPORT', { textSize: 24, align: PrintAlign.CENTER, bold: true });
+      await NyxPrinter.printText(`${dateStr}  ${timeStr}`, { textSize: 22, align: PrintAlign.CENTER });
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(`BUS NUMBER:${busNo}`, { textSize: 22, align: PrintAlign.CENTER });
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
       // ── Trips table ─────────────────────────────────────────────────────
-      // Tr.(4) + Rt.(4) + 3-11(9) + 11-18(9) + Tot(10) = 36 chars — fits at textSize 26
-      const C = { trip: 4, route: 4, col1: 9, col2: 9, tot: 10 };
-      const hdr = padL('Tr.', C.trip) + padL('Rt.', C.route) + padR('3-11', C.col1) + padR('11-18', C.col2) + padR('Tot', C.tot);
-      await NyxPrinter.printText(hdr, boldOpts);
-      await NyxPrinter.printText(' ', { textSize: 8 });
+      // TripSheet uses textSize 26 with COL total = 40 (6+6+5+5+5+5+8).
+      // So textSize 26 on 55mm = 40 chars full width.
+      // TRIP(5) + ROUTE(7) + AMOUNT(28) = 40
+      const LINE = 40;
+      const C = { trip: 5, route: 7, amt: LINE - 5 - 7 }; // amt = 28
+      const hdr = padL('TRIP', C.trip) + padC('ROUTE', C.route) + padR('AMOUNT', C.amt);
+      await NyxPrinter.printText(hdr, { textSize: 26, bold: true });
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
 
-      const tripTableBody = tripRows
-        .map(r =>
+      for (const r of tripRows) {
+        const row =
           padL(String(r.trip), C.trip) +
-          padL('01', C.route) +
-          padR(fmtAmt(r.amt003to011 ?? 0), C.col1) +
-          padR(fmtAmt(r.amt011to018 ?? 0), C.col2) +
-          padR(fmtAmt(r.amount), C.tot)
-        )
-        .join('\n');
-      await NyxPrinter.printText(tripTableBody, opts);
+          padC('01', C.route) +
+          padR(fmtAmt(r.amount), C.amt);
+        await NyxPrinter.printText(row, { textSize: 26 });
+      }
 
-      const totRow =
-        padL('', C.trip + C.route) +
-        padR(fmtAmt(collSplit003to011), C.col1) +
-        padR(fmtAmt(collSplit011to018), C.col2) +
-        padR(fmtAmt(totalCollection), C.tot);
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
+      // "TOTAL Rs.:" left + amount right = 40
+      await NyxPrinter.printText(
+        `${padL('TOTAL Rs.:', 16)}${padR(fmtAmt(totalCollection), 24)}`,
+        { textSize: 26, bold: true },
+      );
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
-      // expL(10) + expSep(3) + expA(23) = 36 chars — fits at textSize 26
-      const expL = 10;
+      // ── Expenses ────────────────────────────────────────────────────────
+      await NyxPrinter.printText('EXPENSES', { textSize: 26, align: PrintAlign.CENTER, bold: true });
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
+
+      // label(12) + " : "(3) + amount right-aligned in 25 = 40
+      const expL = 12;
       const expSep = ' : ';
-      const expA = 23;
+      const expA = LINE - expL - expSep.length; // 40 - 12 - 3 = 25
+      const fixedLabels = FIXED_EXPENSES;
+      for (const label of fixedLabels) {
+        const exp = expenses.find(e => e.label.toUpperCase() === label.toUpperCase());
+        const amt = exp ? parseAmount(exp.amount) : 0;
+        const lbl = label.toUpperCase().substring(0, expL);
+        await NyxPrinter.printText(
+          `${padL(lbl, expL)}${expSep}${padR(fmtAmt(amt), expA)}`,
+          { textSize: 26 },
+        );
+      }
+      // Any extra (non-fixed) expenses
+      for (const extraExp of expenses.filter(exp => !exp.fixed)) {
+        const amt = parseAmount(extraExp.amount);
+        const lbl = extraExp.label.toUpperCase().substring(0, expL);
+        await NyxPrinter.printText(
+          `${padL(lbl, expL)}${expSep}${padR(fmtAmt(amt), expA)}`,
+          { textSize: 26 },
+        );
+      }
 
-      const expenseLabels = [
-        ...FIXED_EXPENSES.map(label => {
-          const exp = expenses.find(e => e.label.toUpperCase() === label.toUpperCase());
-          return `${padL(label.toUpperCase().substring(0, expL), expL)}${expSep}${padR(fmtAmt(exp ? parseAmount(exp.amount) : 0), expA)}`;
-        }),
-        ...expenses.filter(exp => !exp.fixed).map(extraExp =>
-          `${padL(extraExp.label.toUpperCase().substring(0, expL), expL)}${expSep}${padR(fmtAmt(parseAmount(extraExp.amount)), expA)}`
-        ),
-      ];
-
-      const expenseBlock = expenseLabels.join('\n');
-
-      const footerBlock = [
-        PRINT_DASH_LIGHT,
-        totRow,
-        PRINT_DASH,
-        'EXPENSES',
-        expenseBlock,
-        PRINT_DASH_LIGHT,
-        `TOTAL Rs.:  ${fmtAmt(totalExpenses)}`,
-        PRINT_DASH,
-      ].join('\n');
-      await NyxPrinter.printText(footerBlock, boldOpts);
-
-      // Expenses batched in footerBlock above
+      await NyxPrinter.printText(DASH_LIGHT, { align: PrintAlign.CENTER });
+      await NyxPrinter.printText(
+        `${padL('TOTAL Rs.:', 16)}${padR(fmtAmt(totalExpenses), 24)}`,
+        { textSize: 26, bold: true },
+      );
+      await NyxPrinter.printText(DASH32, { align: PrintAlign.CENTER });
 
       await NyxPrinter.printEndAutoOut();
-      await AsyncStorage.setItem(COLLECTION_REPORT_PRINTED_AT_KEY, new Date().toISOString());
       showToast('Collection report printed!');
     } catch (e) {
       Alert.alert('Print Error', e.message || 'Unknown');
@@ -2906,72 +2720,42 @@ const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
   return (
     <>
     <View className="px-4 pb-4">
-      {/* ── Collection Report Card (matches Trip Sheet style) ── */}
+      {/* ── Receipt-style card ── */}
       <View className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden mb-4">
 
-        {/* Header band (matching Trip Sheet style) */}
-        <View className="bg-sky-500/10 border-b border-sky-500/20 px-5 py-4">
-          <View className="flex-row items-start justify-between">
-            <View className="flex-1 mr-3">
-              <Text className="text-zinc-500 text-[9px] font-black tracking-widest mb-1">
-               Today's 
-              </Text>
-              <Text className="text-white text-xl font-black leading-tight">
-                 COLLECTION REPORT
-              </Text>
+        {/* Receipt header */}
+        <View className="bg-zinc-800/60 px-4 py-4 items-center border-b border-zinc-700">
+          <Text className="text-zinc-300 text-base font-bold tracking-wide">
+            COLLECTION REPORT
+          </Text>
+          <Text className="text-zinc-500 text-xs mt-1">
+            {new Date().toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: '2-digit' }).replace(/\//g, '/')}{'  '}
+            {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}
+          </Text>
+          <Text className="text-zinc-400 text-xs font-bold mt-1">
+            BUS: {dashboard?.recent_trips?.[0]?.bus_number ?? dashboard?.bus?.vehicle_number ?? 'N/A'}
+          </Text>
+
+          {/* Ticket range and total tickets */}
+          <View className="flex-row justify-center gap-4 mt-2">
+            <View className="bg-zinc-800/60 rounded-lg px-3 py-1.5">
+              <Text className="text-zinc-500 text-[9px] font-bold uppercase tracking-wider">Ticket Nos</Text>
+              <Text className="text-sky-400 text-sm font-black text-center">{ticketRangeStr}</Text>
+            </View>
+            <View className="bg-zinc-800/60 rounded-lg px-3 py-1.5">
+              <Text className="text-zinc-500 text-[9px] font-bold uppercase tracking-wider">Total Tickets</Text>
+              <Text className="text-emerald-400 text-sm font-black text-center">{totalTickets}</Text>
             </View>
           </View>
-
-          {/* Meta row */}
-          <View className="flex-row flex-wrap gap-x-4 gap-y-1 mt-3">
-            <View className="flex-row items-center gap-1">
-              <Clock size={11} color="#71717a" />
-              <Text className="text-zinc-400 text-xs">
-                {new Date().toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: '2-digit' }).replace(/\//g, '/')}{' '}
-                {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}
-              </Text>
-            </View>
-            <View className="flex-row items-center gap-1">
-              <Bus size={11} color="#71717a" />
-              <Text className="text-zinc-400 text-xs">
-                {dashboard?.recent_trips?.[0]?.bus_number ?? dashboard?.bus?.vehicle_number ?? 'N/A'}
-              </Text>
-            </View>
-            <View className="flex-row items-center gap-1">
-              <Ticket size={11} color="#71717a" />
-              <Text className="text-zinc-400 text-xs">
-                {ticketRangeStr}
-              </Text>
-            </View>
-            <View className="flex-row items-center gap-1">
-              <BarChart3 size={11} color="#71717a" />
-              <Text className="text-zinc-400 text-xs">
-                {totalTickets} TIX
-              </Text>
-            </View>
-          </View>
-        </View>
-
-        {/* Stats row */}
-        <View className="flex-row gap-2 p-4">
-          <StatChip label="COLLECTION" value={`₹${totalCollection.toFixed(0)}`} color="text-sky-400" />
-          <StatChip label="EXPENSES" value={`₹${totalExpenses.toFixed(0)}`} color="text-amber-400" />
-          <StatChip
-            label="NET"
-            value={`₹${netTotal.toFixed(0)}`}
-            color={netTotal >= 0 ? 'text-emerald-400' : 'text-red-400'}
-          />
         </View>
 
         {/* Trips table */}
-        <View className="px-4 pt-2 pb-2">
-          {/* Table header: TRIP | RTE | 3-11 | 11-18 | TOTAL */}
+        <View className="px-4 pt-3 pb-2">
+          {/* Table header */}
           <View className="flex-row border-b border-zinc-700 pb-2 mb-1">
-            <Text className="text-zinc-500 text-[10px] font-black" style={{ flex: 0.8 }}>TRIP</Text>
-            <Text className="text-zinc-500 text-[10px] font-black text-center" style={{ flex: 0.6 }}>RTE</Text>
-            <Text className="text-zinc-500 text-[10px] font-black text-right" style={{ flex: 1.2 }}>3-11</Text>
-            <Text className="text-zinc-500 text-[10px] font-black text-right" style={{ flex: 1.2 }}>11-18</Text>
-            <Text className="text-zinc-500 text-[10px] font-black text-right" style={{ flex: 1.2 }}>TOTAL</Text>
+            <Text className="text-zinc-500 text-[11px] font-black tracking-widest" style={{ flex: 1.2 }}>TRIP</Text>
+            <Text className="text-zinc-500 text-[11px] font-black tracking-widest text-center" style={{ flex: 1 }}>ROUTE</Text>
+            <Text className="text-zinc-500 text-[11px] font-black tracking-widest text-right" style={{ flex: 2 }}>AMOUNT</Text>
           </View>
 
           {tripRows.length === 0 ? (
@@ -2980,237 +2764,123 @@ const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
             </View>
           ) : (
             tripRows.map((row, i) => (
-              <View key={i} className={`flex-row items-center py-2 ${i < tripRows.length - 1 ? 'border-b border-zinc-800/60' : ''}`}>
-                <Text className="text-zinc-200 text-sm font-bold" style={{ flex: 0.8 }}>{row.trip}</Text>
-                <Text className="text-zinc-400 text-xs font-bold text-center" style={{ flex: 0.6 }}>01</Text>
-                <Text className="text-zinc-100 text-sm font-black text-right" style={{ flex: 1.2 }}>
-                  {row.amt003to011.toFixed(2)}
-                </Text>
-                <Text className="text-zinc-100 text-sm font-black text-right" style={{ flex: 1.2 }}>
-                  {row.amt011to018.toFixed(2)}
-                </Text>
-                <Text className="text-zinc-100 text-sm font-black text-right" style={{ flex: 1.2 }}>
+              <View key={i} className={`flex-row items-center py-2.5 ${i < tripRows.length - 1 ? 'border-b border-zinc-800/60' : ''}`}>
+                <View style={{ flex: 1.2 }}>
+                  <Text className="text-zinc-200 text-sm font-bold">{row.trip}</Text>
+                  {(row.appAmt > 0 || row.posAmt > 0) && (
+                    <View className="flex-row gap-2 mt-0.5">
+                      {row.appAmt > 0 && (
+                        <Text className="text-violet-400 text-[9px] font-bold">APP ₹{row.appAmt.toFixed(0)}</Text>
+                      )}
+                      {row.posAmt > 0 && (
+                        <Text className="text-amber-400 text-[9px] font-bold">POS ₹{row.posAmt.toFixed(0)}</Text>
+                      )}
+                    </View>
+                  )}
+                </View>
+                <Text className="text-zinc-400 text-sm font-bold text-center" style={{ flex: 1 }}>01</Text>
+                <Text className="text-zinc-100 text-sm font-black text-right" style={{ flex: 2 }}>
                   {row.amount.toFixed(2)}
                 </Text>
               </View>
             ))
           )}
 
-          {/* Totals row */}
-          <View className="flex-row items-center border-t border-zinc-700 pt-3 mt-2">
-            <Text className="text-zinc-400 text-xs font-black" style={{ flex: 0.8 }} />
-            <Text style={{ flex: 0.6 }} />
-            <Text className="text-sky-400 text-sm font-black text-right" style={{ flex: 1.2 }}>
-              {collSplit003to011.toFixed(2)}
-            </Text>
-            <Text className="text-sky-400 text-sm font-black text-right" style={{ flex: 1.2 }}>
-              {collSplit011to018.toFixed(2)}
-            </Text>
-            <Text className="text-sky-400 text-base font-black text-right" style={{ flex: 1.2 }}>
-              ₹{totalCollection.toFixed(2)}
-            </Text>
+          {/* Total collection */}
+          <View className="flex-row items-center justify-between border-t border-zinc-700 pt-3 mt-2">
+            <Text className="text-zinc-400 text-sm font-black tracking-wide">TOTAL Rs.:</Text>
+            <Text className="text-sky-400 text-xl font-black">₹{totalCollection.toFixed(2)}</Text>
           </View>
         </View>
 
         {/* Divider */}
         <View className="mx-4 border-t border-dashed border-zinc-700 my-2" />
 
-        {/* Expenses section - Collapsible */}
+        {/* Expenses section */}
         <View className="px-4 pb-3">
-          <TouchableOpacity
-            onPress={() => setExpensesCollapsed(!expensesCollapsed)}
-            activeOpacity={0.8}
-            className="flex-row items-center justify-between py-3 border-t border-zinc-700"
-          >
-            <View className="flex-row items-center gap-2">
-              <Text className="text-zinc-400 text-sm font-black tracking-widest">EXPENSES</Text>
-              <View className="bg-amber-500/10 border border-amber-500/20 rounded-full px-2 py-0.5">
-                <Text className="text-amber-400 text-[10px] font-bold">₹{totalExpenses.toFixed(0)}</Text>
-              </View>
+          <View className="flex-row items-center justify-between mb-3">
+            <Text className="text-zinc-400 text-sm font-black tracking-widest">EXPENSES</Text>
+            <TouchableOpacity
+              onPress={() => setShowAddModal(true)}
+              className="bg-zinc-800 border border-zinc-700 px-3 py-1 rounded-lg"
+              activeOpacity={0.8}
+            >
+              <Text className="text-zinc-400 text-xs font-bold">+ Add</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Fixed expenses — always shown */}
+          {expenses.filter(e => e.fixed).map(expense => (
+            <View key={expense.id} className="flex-row items-center py-2 border-b border-zinc-800/50">
+              <Text className="text-zinc-400 text-sm font-bold flex-1">
+                {expense.label.toUpperCase()}
+              </Text>
+              <Text className="text-zinc-500 text-sm mr-3">:</Text>
+              <TextInput
+                className="text-zinc-100 text-sm font-bold text-right w-24"
+                keyboardType="numeric"
+                value={expense.amount}
+                onChangeText={v => updateExpense(expense.id, v)}
+                placeholder="0.00"
+                placeholderTextColor="#52525b"
+              />
             </View>
-            <View className="flex-row items-center gap-2">
-              {!expensesCollapsed && (
-                <TouchableOpacity
-                  onPress={(e) => { e.stopPropagation(); setShowAddModal(true); }}
-                  className="bg-zinc-800 border border-zinc-700 px-3 py-1 rounded-lg"
-                  activeOpacity={0.8}
-                >
-                  <Text className="text-zinc-400 text-xs font-bold">+ Add</Text>
-                </TouchableOpacity>
-              )}
-              <View className="w-6 h-6 rounded-full bg-zinc-800 items-center justify-center">
-                {expensesCollapsed ? (
-                  <ChevronDown size={16} color="#a1a1aa" />
-                ) : (
-                  <ChevronUp size={16} color="#a1a1aa" />
-                )}
-              </View>
-            </View>
-          </TouchableOpacity>
+          ))}
 
-          {/* Expenses content - shown when not collapsed */}
-          {!expensesCollapsed && (
-            <>
-              {/* Fixed expenses — always shown */}
-              {expenses.filter(e => e.fixed).map(expense => (
-                <View key={expense.id} className="flex-row items-center py-2 border-b border-zinc-800/50">
-                  <Text className="text-zinc-400 text-sm font-bold flex-1">
-                    {expense.label.toUpperCase()}
-                  </Text>
-                  <Text className="text-zinc-500 text-sm mr-3">:</Text>
-                  <TextInput
-                    className="text-zinc-100 text-sm font-bold text-right w-24"
-                    keyboardType="numeric"
-                    value={expense.amount}
-                    onChangeText={v => updateExpense(expense.id, v)}
-                    placeholder="0.00"
-                    placeholderTextColor="#52525b"
-                  />
-                </View>
-              ))}
+          {/* Extra (non-fixed) expenses */}
+          {expenses.filter(e => !e.fixed).map(expense => (
+            <TouchableOpacity
+              key={expense.id}
+              onLongPress={() => deleteExpense(expense.id)}
+              delayLongPress={500}
+              activeOpacity={1}
+              className="flex-row items-center py-2 border-b border-zinc-800/50"
+            >
+              <Text className="text-amber-400 text-sm font-bold flex-1">
+                {expense.label.toUpperCase()}
+              </Text>
+              <Text className="text-zinc-500 text-sm mr-3">:</Text>
+              <TextInput
+                className="text-zinc-100 text-sm font-bold text-right w-24"
+                keyboardType="numeric"
+                value={expense.amount}
+                onChangeText={v => updateExpense(expense.id, v)}
+                placeholder="0.00"
+                placeholderTextColor="#52525b"
+              />
+            </TouchableOpacity>
+          ))}
 
-              {/* Extra (non-fixed) expenses */}
-              {expenses.filter(e => !e.fixed).map(expense => (
-                <TouchableOpacity
-                  key={expense.id}
-                  onLongPress={() => deleteExpense(expense.id)}
-                  delayLongPress={500}
-                  activeOpacity={1}
-                  className="flex-row items-center py-2 border-b border-zinc-800/50"
-                >
-                  <Text className="text-amber-400 text-sm font-bold flex-1">
-                    {expense.label.toUpperCase()}
-                  </Text>
-                  <Text className="text-zinc-500 text-sm mr-3">:</Text>
-                  <TextInput
-                    className="text-zinc-100 text-sm font-bold text-right w-24"
-                    keyboardType="numeric"
-                    value={expense.amount}
-                    onChangeText={v => updateExpense(expense.id, v)}
-                    placeholder="0.00"
-                    placeholderTextColor="#52525b"
-                  />
-                </TouchableOpacity>
-              ))}
+          {/* Total expenses */}
+          <View className="flex-row items-center justify-between pt-3 mt-1">
+            <Text className="text-zinc-400 text-sm font-black tracking-wide">TOTAL Rs.:</Text>
+            <Text className="text-amber-400 text-xl font-black">₹{totalExpenses.toFixed(2)}</Text>
+          </View>
+        </View>
 
-              {/* Total expenses */}
-              <View className="flex-row items-center justify-between pt-3 mt-1">
-                <Text className="text-zinc-400 text-sm font-black tracking-wide">TOTAL Rs.:</Text>
-                <Text className="text-amber-400 text-xl font-black">₹{totalExpenses.toFixed(2)}</Text>
-              </View>
-            </>
-          )}
+        {/* Net total band */}
+        <View className={`mx-4 mb-4 rounded-xl p-3 items-center ${
+          netTotal >= 0 ? 'bg-emerald-500/10 border border-emerald-500/20' : 'bg-red-500/10 border border-red-500/20'
+        }`}>
+          <Text className="text-zinc-500 text-[10px] font-black tracking-widest mb-0.5">NET TOTAL</Text>
+          <Text className={`text-2xl font-black ${
+            netTotal >= 0 ? 'text-emerald-400' : 'text-red-400'
+          }`}>₹{netTotal.toFixed(2)}</Text>
         </View>
       </View>
 
       {/* Print button */}
       <TouchableOpacity
-        className="flex-row items-center justify-center gap-2 rounded-xl py-3.5"
-        style={{ backgroundColor: '#89F336' }}
+        className="flex-row items-center justify-center gap-2 bg-emerald-600 rounded-xl py-3.5"
         activeOpacity={0.8}
         onPress={handlePrintCollectionReport}
       >
-        <Download size={16} color="#000" />
-        <Text className="text-black text-sm font-bold">
+        <Download size={16} color="#fff" />
+        <Text className="text-white text-sm font-bold">
           Print Collection Report
         </Text>
       </TouchableOpacity>
     </View>
-
-    {/* ── Test Mode Modal ── */}
-    <Modal
-      visible={showTestModal}
-      transparent
-      animationType="fade"
-      onRequestClose={() => setShowTestModal(false)}
-    >
-      <View className="flex-1 bg-black/70 justify-center items-center p-4">
-        <View className="bg-zinc-900 rounded-2xl p-5 w-full max-w-md border border-zinc-700">
-          <View className="flex-row justify-between items-center mb-4">
-            <Text className="text-white text-lg font-black">Collection Report Preview</Text>
-            <TouchableOpacity onPress={() => setShowTestModal(false)}>
-              <Text className="text-zinc-500 text-lg">✕</Text>
-            </TouchableOpacity>
-          </View>
-          <ScrollView className="max-h-96">
-            {testModalData && (
-              <View className="bg-white rounded-xl p-4">
-                {/* Header */}
-                <Text className="text-black text-center font-bold text-lg">COLLECTION REPORT</Text>
-                <Text className="text-gray-600 text-center text-sm">{testModalData.dateStr}  {testModalData.timeStr}</Text>
-                <View className="border-t border-gray-400 my-2" />
-                <Text className="text-black text-center text-sm font-bold">BUS NUMBER: {testModalData.busNo}</Text>
-                <View className="border-t border-gray-400 my-2" />
-
-                {/* Ticket Info */}
-                <View className="flex-row justify-between mb-2">
-                  <Text className="text-gray-600 text-xs">Ticket Nos: {testModalData.ticketRangeStr}</Text>
-                  <Text className="text-gray-600 text-xs">Total: {testModalData.totalTickets}</Text>
-                </View>
-                <View className="border-t border-gray-300 my-1" />
-
-                {/* Trips */}
-                <View className="flex-row mb-1">
-                  <Text style={{ flex: 0.8, fontSize: 9, fontWeight: '800', color: '#333' }}>TRIP</Text>
-                  <Text style={{ flex: 0.6, fontSize: 9, fontWeight: '800', color: '#333', textAlign: 'center' }}>RTE</Text>
-                  <Text style={{ flex: 1.2, fontSize: 9, fontWeight: '800', color: '#333', textAlign: 'right' }}>3-11</Text>
-                  <Text style={{ flex: 1.2, fontSize: 9, fontWeight: '800', color: '#333', textAlign: 'right' }}>11-18</Text>
-                  <Text style={{ flex: 1.2, fontSize: 9, fontWeight: '800', color: '#333', textAlign: 'right' }}>TOTAL</Text>
-                </View>
-                {testModalData.tripRows.map((row, i) => (
-                  <View key={i} className="flex-row py-0.5">
-                    <Text style={{ flex: 0.8, fontSize: 11, fontWeight: '700', color: '#000' }}>{row.trip}</Text>
-                    <Text style={{ flex: 0.6, fontSize: 11, color: '#555', textAlign: 'center' }}>01</Text>
-                    <Text style={{ flex: 1.2, fontSize: 11, fontWeight: '700', color: '#000', textAlign: 'right' }}>{(row.amt003to011 ?? 0).toFixed(2)}</Text>
-                    <Text style={{ flex: 1.2, fontSize: 11, fontWeight: '700', color: '#000', textAlign: 'right' }}>{(row.amt011to018 ?? 0).toFixed(2)}</Text>
-                    <Text style={{ flex: 1.2, fontSize: 11, fontWeight: '700', color: '#000', textAlign: 'right' }}>{row.amount.toFixed(2)}</Text>
-                  </View>
-                ))}
-                <View className="border-t border-gray-300 my-1" />
-                <View className="flex-row py-1">
-                  <Text style={{ flex: 0.8 }} />
-                  <Text style={{ flex: 0.6 }} />
-                  <Text style={{ flex: 1.2, fontSize: 11, fontWeight: '800', color: '#0369a1', textAlign: 'right' }}>{Number(testModalData.collSplit003to011 ?? 0).toFixed(2)}</Text>
-                  <Text style={{ flex: 1.2, fontSize: 11, fontWeight: '800', color: '#0369a1', textAlign: 'right' }}>{Number(testModalData.collSplit011to018 ?? 0).toFixed(2)}</Text>
-                  <Text style={{ flex: 1.2, fontSize: 12, fontWeight: '800', color: '#0369a1', textAlign: 'right' }}>{testModalData.totalCollection.toFixed(2)}</Text>
-                </View>
-                <View className="border-t border-gray-400 my-2" />
-
-                {/* Expenses */}
-                <Text className="text-black text-center font-bold text-sm mb-2">EXPENSES</Text>
-                <View className="border-t border-gray-300 my-1" />
-                {testModalData.expenses.filter(e => e.parsedAmount > 0 || e.fixed).map((exp, i) => (
-                  <View key={i} className="flex-row justify-between py-0.5">
-                    <Text className="text-gray-700 text-sm">{exp.label.toUpperCase()}</Text>
-                    <Text className="text-black text-sm">: {exp.parsedAmount.toFixed(2)}</Text>
-                  </View>
-                ))}
-                <View className="border-t border-gray-300 my-1" />
-                <View className="flex-row justify-between py-1">
-                  <Text className="text-black text-sm font-bold">TOTAL Rs.:</Text>
-                  <Text className="text-amber-600 text-sm font-bold">{testModalData.totalExpenses.toFixed(2)}</Text>
-                </View>
-                <View className="border-t border-gray-400 my-2" />
-
-                {/* Net Total */}
-                <View className="flex-row justify-between py-1">
-                  <Text className="text-black text-sm font-bold">NET TOTAL:</Text>
-                  <Text className={`text-sm font-bold ${testModalData.netTotal >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                    {testModalData.netTotal.toFixed(2)}
-                  </Text>
-                </View>
-              </View>
-            )}
-          </ScrollView>
-          <TouchableOpacity
-            className="bg-emerald-600 rounded-xl py-3 mt-4"
-            onPress={() => setShowTestModal(false)}
-          >
-            <Text className="text-white text-center font-bold">Close</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    </Modal>
 
     {/* Add expense modal */}
       <Modal
@@ -3281,18 +2951,16 @@ const ReportScreen = () => {
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [showTripTabGroup, setShowTripTabGroup] = useState(false);
-  const [refreshKey, setRefreshKey] = useState(0);
   const [reportCutoffIso, setReportCutoffIso] = useState(null);
   const { posHook } = useTripContext();
   const indicatorAnim = useRef(new Animated.Value(0)).current;
   const fetchingDashboardRef = useRef(false);
 
   const TABS = [
-    { key: 'trip', label: 'Active Trip', Icon: Bus },
+    { key: 'trip', label: 'Trip', Icon: Bus },
     { key: 'tripsheet', label: 'Trip Sheet', Icon: Receipt },
     { key: 'status', label: 'Status Rep.', Icon: BarChart3 },
-    { key: 'collection', label: 'Collection Rep.', Icon: DollarSign },
+    { key: 'collection', label: 'Coll. Rep.', Icon: DollarSign },
   ];
 
   const fetchDashboard = useCallback(async ({ showLoader = false } = {}) => {
@@ -3309,32 +2977,10 @@ const ReportScreen = () => {
       const filteredActiveTrip = isOnOrAfterCutoff(raw.active_trip?.start_time, cutoffIso)
         ? raw.active_trip
         : null;
-
-      // Recompute today_stats from the cutoff-filtered trips so that
-      // TODAY'S COLLECTION clears out properly after End Trip.
-      const filteredTripIds = new Set([
-        ...(filteredActiveTrip?.trip_id ? [filteredActiveTrip.trip_id] : []),
-        ...filteredRecentTrips.map(t => t.trip_id).filter(Boolean),
-      ]);
-      const filteredTodayStats = {
-        trips_completed: filteredTripIds.size,
-        tickets_sold: [...filteredTripIds].reduce(
-          (s, id) => s + ((filteredRecentTrips.find(t => t.trip_id === id) ?? filteredActiveTrip)?.tickets_sold ?? 0),
-          0,
-        ),
-        total_collection: [...filteredTripIds].reduce(
-          (s, id) => s + Number((filteredRecentTrips.find(t => t.trip_id === id) ?? filteredActiveTrip)?.collection ?? 0),
-          0,
-        ),
-        passengers: 0,
-      };
-      filteredTodayStats.passengers = filteredTodayStats.tickets_sold;
-
       setDashboard({
         ...raw,
         active_trip: filteredActiveTrip,
         recent_trips: filteredRecentTrips,
-        today_stats: filteredTodayStats,
       });
     } catch (e) {
       console.error('[ReportScreen] dashboard fetch failed', e);
@@ -3352,7 +2998,6 @@ const ReportScreen = () => {
         fetchDashboard(),
         posHook.reload?.(),
       ]);
-      setRefreshKey(k => k + 1);
     } catch (e) {
       console.error('[ReportScreen] Refresh failed:', e);
     } finally {
@@ -3436,51 +3081,6 @@ const ReportScreen = () => {
 
   return (
     <SafeAreaView className="flex-1 bg-zinc-950">
-      {/* ── Top header: title + active trip info + refresh ── */}
-      <View className="flex-row items-center justify-between px-4 pt-2 pb-1">
-        <View>
-          <View className="flex-row items-center">
-            {at?.route_name ? (
-              <RouteWithArrow name={at.route_name} dir={at.direction} textClass="text-white text-lg font-black tracking-wide" iconSize={16} iconColor="#ffffff" />
-            ) : (
-              <Text className="text-white text-lg font-black tracking-wide">REPORTS</Text>
-            )}
-          </View>
-          <Text className="text-zinc-500 text-[10px] font-bold">
-            {new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}
-          </Text>
-        </View>
-        <View className="flex-row items-center gap-2">
-          {at ? (
-            <View className="flex-row items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/30 px-2.5 py-1 rounded-full">
-              <View className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-              <Text className="text-emerald-400 text-[10px] font-bold">
-                #{at.trip_number > 0 ? at.trip_number : '—'}
-              </Text>
-              <Text className="text-emerald-500/80 text-[10px] font-semibold">
-                {formatTime(at.start_time)}
-              </Text>
-            </View>
-          ) : (
-            <View className="flex-row items-center gap-1.5 bg-zinc-800 border border-zinc-700 px-2.5 py-1 rounded-full">
-              <View className="w-1.5 h-1.5 rounded-full bg-zinc-500" />
-              <Text className="text-zinc-500 text-[10px] font-bold">NO ACTIVE TRIP</Text>
-            </View>
-          )}
-          <TouchableOpacity
-            onPress={onRefresh}
-            activeOpacity={0.7}
-            disabled={refreshing}
-            className={`flex-row items-center gap-1.5 bg-red-600 border border-red-500 px-3 py-1.5 rounded-lg ${refreshing ? 'opacity-50' : ''}`}
-          >
-            {refreshing
-              ? <ActivityIndicator size="small" color="#ffffff" />
-              : <RotateCcw size={14} color="#ffffff" />}
-            <Text className="text-white text-xs font-semibold">Refresh</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-
       <ScrollView
         className="flex-1"
         contentContainerStyle={{ paddingBottom: 40 }}
@@ -3494,78 +3094,114 @@ const ReportScreen = () => {
           />
         }
       >
-        <View className="mx-4 mb-2 mt-2 bg-zinc-900/95 gap-2 rounded-2xl p-1.5 flex-row border border-zinc-700">
-          {!showTripTabGroup ? (
-            <>
-              <View className="flex-1 flex-row gap-2">
-                {TABS.filter(t => t.key === 'tripsheet' || t.key === 'status').map((tab) => {
-                  const isActive = activeTab === tab.key;
-                  return (
-                    <TouchableOpacity
-                      key={tab.key}
-                      onPress={() => setActiveTab(tab.key)}
-                      activeOpacity={0.8}
-                      className={`flex-1 flex-row items-center justify-center gap-2 py-3 rounded-xl border ${
-                        isActive ? 'bg-sky-500 border-sky-300' : 'bg-zinc-800/80 border-zinc-700'
-                      }`}
-                    >
-                      <Text
-                        className={`text-[13px] font-black tracking-wide ${
-                          isActive ? 'text-white' : 'text-zinc-200'
-                        }`}
-                      >
-                        {tab.label}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </View>
-              <TouchableOpacity
-                onPress={() => {
-                  setShowTripTabGroup(true);
-                  setActiveTab('trip');
-                }}
-                className="justify-center items-center px-3 py-3 rounded-xl bg-zinc-800/80 border border-zinc-700"
+        {/* ── Top bar ── */}
+        <View className="px-5 pt-2 pb-3 flex-row items-center justify-between border-b border-zinc-900">
+          <View>
+            <Text className="text-white text-xl font-black tracking-tight">
+              Reports
+            </Text>
+            <Text className="text-zinc-500 text-xs mt-0.5">
+              {at?.trip_number ? `Active Trip #${at.trip_number} · ` : ''}
+              {new Date().toLocaleDateString([], {
+                weekday: 'short',
+                day: 'numeric',
+                month: 'short',
+              })}
+            </Text>
+          </View>
+          {refreshing && <ActivityIndicator size="small" color="#0ea5e9" />}
+        </View>
+
+        {/* ── Summary chips ── */}
+        <View className="flex-row gap-2 px-4 py-3">
+          {[
+            {
+              label: 'Trips',
+              val: dashboard?.recent_trips?.length ?? 0,
+              icon: Bus,
+              iconColor: '#38bdf8',
+            },
+            {
+              label: 'App Tickets',
+              val: todayAppCount ?? 0,
+              icon: Ticket,
+              iconColor: '#a78bfa',
+            },
+            {
+              label: 'POS',
+              val: posSummary.count,
+              icon: CreditCard,
+              iconColor: '#f59e0b',
+            },
+          ].map(c => {
+            const Icon = c.icon;
+            return (
+              <View
+                key={c.label}
+                className="flex-1 items-center rounded-xl py-2.5 border bg-zinc-800/60 border-zinc-700"
               >
-                <ChevronRight size={20} color="#d4d4d8" />
-              </TouchableOpacity>
-            </>
-          ) : (
-            <>
-              <TouchableOpacity
-                onPress={() => {
-                  setShowTripTabGroup(false);
-                  if (activeTab === 'trip' || activeTab === 'collection') setActiveTab('tripsheet');
-                }}
-                className="justify-center items-center px-3 py-3 rounded-xl bg-zinc-800/80 border border-zinc-700"
-              >
-                <ChevronLeft size={20} color="#d4d4d8" />
-              </TouchableOpacity>
-              <View className="flex-1 flex-row gap-2">
-                {TABS.filter(t => t.key === 'trip' || t.key === 'collection').map((tab) => {
-                  const isActive = activeTab === tab.key;
-                  return (
-                    <TouchableOpacity
-                      key={tab.key}
-                      onPress={() => setActiveTab(tab.key)}
-                      activeOpacity={0.8}
-                      className={`flex-1 flex-row items-center justify-center gap-2 py-3 rounded-xl border ${
-                        isActive ? 'bg-sky-500 border-sky-300' : 'bg-zinc-800/80 border-zinc-700'
-                      }`}
-                    >
-                      <Text
-                        className={`text-[13px] font-black tracking-wide ${
-                          isActive ? 'text-white' : 'text-zinc-200'
-                        }`}
-                      >
-                        {tab.label}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
+                <Text className="text-sm font-black text-white">{c.val}</Text>
+                <View className="flex-row items-center gap-1 mt-0.5">
+                  <Icon size={10} color={c.iconColor} />
+                  <Text className="text-zinc-500 text-[9px] font-bold tracking-wider">
+                    {c.label.toUpperCase()}
+                  </Text>
+                </View>
               </View>
-            </>
-          )}
+            );
+          })}
+        </View>
+
+        {/* ── Collection summary ── */}
+        <View className="mx-4 mb-4 bg-zinc-900/60 rounded-2xl border border-zinc-800 p-4">
+          <View className="flex-row justify-between items-center">
+            <View className="flex-1">
+              <Text className="text-zinc-400 text-xs font-bold tracking-wider mb-1">TODAY'S COLLECTION</Text>
+              <Text className="text-white text-2xl font-bold">
+                ₹{((dashboard?.today_stats?.total_collection ?? 0) + posSummary.total).toFixed(0)}
+              </Text>
+            </View>
+            <View className="flex-row gap-4">
+              <View className="items-end">
+                <Text className="text-zinc-500 text-[10px] font-medium">APP</Text>
+                <Text className="text-violet-400 text-lg font-bold">
+                  ₹{(dashboard?.today_stats?.total_collection ?? 0).toFixed(0)}
+                </Text>
+              </View>
+              <View className="items-end">
+                <Text className="text-zinc-500 text-[10px] font-medium">POS</Text>
+                <Text className="text-amber-400 text-lg font-bold">
+                  ₹{posSummary.total.toFixed(0)}
+                </Text>
+              </View>
+            </View>
+          </View>
+        </View>
+
+        {/* ── Tab bar ── */}
+        <View className="mx-4 mb-2 bg-zinc-900/95 gap-2 rounded-2xl p-1.5 flex-row border border-zinc-700">
+          {TABS.map((tab, i) => {
+            const isActive = activeTab === tab.key;
+            return (
+              <TouchableOpacity
+                key={tab.key}
+                onPress={() => setActiveTab(tab.key)}
+                activeOpacity={0.8}
+                className={`flex-1 flex-row items-center justify-center gap-2 py-3 rounded-xl border ${
+                  isActive ? 'bg-sky-500 border-sky-300' : 'bg-zinc-800/80 border-zinc-700'
+                }`}
+              >
+                {/* <tab.Icon size={16} color={isActive ? '#ffffff' : '#d4d4d8'} /> */}
+                <Text
+                  className={`text-[12px] font-black tracking-wide ${
+                    isActive ? 'text-white' : 'text-zinc-200'
+                  }`}
+                >
+                  {tab.label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
         </View>
 
         {/* ── Content ── */}
@@ -3575,75 +3211,25 @@ const ReportScreen = () => {
               dashboard={dashboard}
               onRefreshDashboard={fetchDashboard}
               posHook={posHook}
-              onNavigateToCollection={() => {
-                setShowTripTabGroup(true);
-                setActiveTab('collection');
-              }}
             />
           )}
           {activeTab === 'tripsheet' && (
             <TripSheetTabContent
               dashboard={dashboard}
               posHook={posHook}
-              onRefresh={fetchDashboard}
-              refreshKey={refreshKey}
             />
           )}
           {activeTab === 'status' && (
             <StatusReportTabContent
               dashboard={dashboard}
               posHook={posHook}
-              onRefresh={fetchDashboard}
             />
           )}
           {activeTab === 'collection' && (
-            <>
-              {/* ── Summary & Collection single row ── */}
-              <View className="mb-2">
-                <ScrollView 
-                  horizontal 
-                  showsHorizontalScrollIndicator={false} 
-                  contentContainerStyle={{ paddingHorizontal: 16, paddingVertical: 12, gap: 8 }}
-                >
-                  <View className="flex-row items-center gap-1.5 px-3 py-1.5 rounded-full bg-sky-500/10 border border-sky-500/20">
-                    <Bus size={12} color="#38bdf8" />
-                    <Text className="text-sky-400 text-xs font-black">{dashboard?.recent_trips?.length ?? 0}</Text>
-                    <Text className="text-sky-500/70 text-[10px] font-bold">TRIPS</Text>
-                  </View>
-                  <View className="flex-row items-center gap-1.5 px-3 py-1.5 rounded-full bg-violet-500/10 border border-violet-500/20">
-                    <Text className="text-violet-400 text-xs font-black">₹{(dashboard?.today_stats?.total_collection ?? 0).toFixed(0)}</Text>
-                    <Text className="text-violet-500/70 text-[10px] font-bold">APP</Text>
-                  </View>
-
-                  <View className="flex-row items-center gap-1.5 px-3 py-1.5 rounded-full bg-amber-500/10 border border-amber-500/20">
-                    <Text className="text-amber-400 text-xs font-black">₹{posSummary.total.toFixed(0)}</Text>
-                    <Text className="text-amber-500/70 text-[10px] font-bold">POS</Text>
-                  </View>
-                  <View className="flex-row items-center gap-1.5 px-3 py-1.5 rounded-full bg-violet-500/10 border border-violet-500/20">
-                    <Ticket size={12} color="#a78bfa" />
-                    <Text className="text-violet-400 text-xs font-black">{todayAppCount ?? 0}</Text>
-                    <Text className="text-violet-500/70 text-[10px] font-bold">APP TIX</Text>
-                  </View>
-
-                  <View className="flex-row items-center gap-1.5 px-3 py-1.5 rounded-full bg-amber-500/10 border border-amber-500/20">
-                    <CreditCard size={12} color="#f59e0b" />
-                    <Text className="text-amber-400 text-xs font-black">{posSummary.count}</Text>
-                    <Text className="text-amber-500/70 text-[10px] font-bold">POS TIX</Text>
-                  </View>
-
-                  <View className="flex-row items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/20">
-                    <DollarSign size={12} color="#34d399" />
-                    <Text className="text-emerald-400 text-xs font-black">₹{((dashboard?.today_stats?.total_collection ?? 0) + posSummary.total).toFixed(0)}</Text>
-                    <Text className="text-emerald-500/70 text-[10px] font-bold">TOTAL</Text>
-                  </View>
-                </ScrollView>
-              </View>
-              <CollectionReportTabContent
-                dashboard={dashboard}
-                posHook={posHook}
-                onRefresh={onRefresh}
-              />
-            </>
+            <CollectionReportTabContent
+              dashboard={dashboard}
+              posHook={posHook}
+            />
           )}
         </View>
       </ScrollView>

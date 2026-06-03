@@ -271,10 +271,7 @@ const getNextTicketNumber = async (busId) => {
 const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}) => {
   const tripDirection = activeTrip?.direction ?? 'up';
   const effectiveTripNumber = Number(activeTrip?.trip_number ?? tripNumber ?? 0);
-  const getPlaces = useCallback(
-    () => isDownDirection(tripDirection) ? [...places].reverse() : places,
-    [tripDirection],
-  );
+  const getPlaces = useCallback(() => places, []);
 
   const [selStart, setSelStart] = useState<any>(null);
   const [selDest, setSelDest] = useState<any>(null);
@@ -397,6 +394,32 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
       Alert.alert('No Internet', 'Please check your internet connection to issue tickets.');
       return;
     }
+
+    // Confirmation for luggage and half fare tickets
+    if (ticketType === 'luggage' || ticketType === 'half') {
+      const isLuggage = ticketType === 'luggage';
+      const confirmTitle = isLuggage ? 'Luggage Ticket' : 'Half Fare Ticket';
+      const confirmMessage = isLuggage
+        ? 'You are about to print a LUGGAGE ticket.\n\nConfirm to proceed?'
+        : 'You are about to print a HALF FARE (Child) ticket.\n\nConfirm to proceed?';
+
+      const shouldProceed = await new Promise<boolean>((resolve) => {
+        Alert.alert(
+          confirmTitle,
+          confirmMessage,
+          [
+            { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+            { text: 'Print', style: 'default', onPress: () => resolve(true) },
+          ],
+          { cancelable: false }
+        );
+      });
+
+      if (!shouldProceed) {
+        return;
+      }
+    }
+
     setIssuing(true);
     try {
       // Check testing mode
@@ -543,12 +566,6 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
 
         // showToast(`Ticket issued · ₹${cGrandTotal}`);
 
-        // Auto-reset to full mode after half/luggage tickets
-        if (ticketType === 'half' || ticketType === 'luggage') {
-          setTicketType('full');
-          showToast('Switched to full fare mode');
-        }
-
         // Show modal instead of printing
         setTicketData(ticketInfo);
         setShowTicketModal(true);
@@ -646,12 +663,6 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
       }
 
       showToast(`Ticket issued · ₹${cGrandTotal}`);
-
-      // Auto-reset to full mode after half/luggage tickets
-      if (ticketType === 'half' || ticketType === 'luggage') {
-        setTicketType('full');
-        showToast('Switched to full fare mode');
-      }
 
       // Ticket issued - keep current selection for next passenger
     } catch (e) {
@@ -788,12 +799,14 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
                     const fromIndex = selStart ? placesList.findIndex(pl => pl.key === selStart.key) : -1;
                     const currentIndex = placesList.findIndex(pl => pl.key === p.key);
                     const isWrongDirection = activeDrop === 'destination' && selStart && currentIndex <= fromIndex;
-                    const isDis = isOtherSel || isWrongDirection;
+                    const isDisabled = p.disabled === true;
+                    const isDis = isOtherSel || isWrongDirection || isDisabled;
                     const isNotLastInRow = (idx + 1) % 3 !== 0;
                     const borderColor = activeDrop === 'start' ? '#38bdf8' : '#fb923c';
                     return (
                       <TouchableOpacity
                         key={p.key}
+                        disabled={isDisabled}
                         onPress={() => {
                           if (isOtherSel) {
                             // Conflicting selection: clear the other field and select in current field
@@ -831,15 +844,16 @@ const TicketTab = ({activeTrip, busNumber, _onTicketIssued, tripNumber, posHook}
                           'w-1/3 px-1 py-3 flex-col items-center justify-center gap-0.5',
                           isSel && activeDrop === 'start' ? 'bg-sky-950' : '',
                           isSel && activeDrop === 'destination' ? 'bg-orange-950' : '',
-                          isDis ? 'opacity-60' : '',
+                          isDis ? 'opacity-40' : '',
+                          isDisabled ? 'bg-zinc-900' : '',
                         ].join(' ')}>
                         <Text
                           numberOfLines={1}
                           adjustsFontSizeToFit
-                          className={`text-2xl font-black text-center ${isSel && activeDrop === 'start' ? 'text-sky-400' : isSel && activeDrop === 'destination' ? 'text-orange-400' : isOtherSel ? 'text-orange-400' : isWrongDirection ? 'text-zinc-300' : 'text-white'}`}>
+                          className={`text-2xl font-black text-center ${isSel && activeDrop === 'start' ? 'text-sky-400' : isSel && activeDrop === 'destination' ? 'text-orange-400' : isOtherSel ? 'text-orange-400' : isWrongDirection ? 'text-zinc-300' : isDisabled ? 'text-zinc-600' : 'text-white'}`}>
                           {stopNum(p)}
                         </Text>
-                        <Text className={`text-[11px] font-medium text-center w-full px-1 ${isSel ? 'text-white' : isWrongDirection ? 'text-zinc-400' : 'text-white'}`} numberOfLines={1}>
+                        <Text className={`text-[11px] font-medium text-center w-full px-1 ${isSel ? 'text-white' : isWrongDirection ? 'text-zinc-400' : isDisabled ? 'text-zinc-600' : 'text-white'}`} numberOfLines={1}>
                           {p.label.split('-')[2]}
                         </Text>
                       </TouchableOpacity>
