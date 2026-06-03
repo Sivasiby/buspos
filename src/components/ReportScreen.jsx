@@ -2818,7 +2818,7 @@ const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
 
       const opts = { textSize: 26 };
       const boldOpts = { textSize: 26, bold: true };
-      const fmtAmt = n => Number(n).toFixed(2);
+      const fmtAmt = n => String(Math.round(Number(n)));
       const padL = (s, w) => String(s).padEnd(w, ' ');
       const padR = (s, w) => String(s).padStart(w, ' ');
       const padC = (s, w) => { const str = String(s); const tot = Math.max(0, w - str.length); const l = Math.floor(tot / 2); return ' '.repeat(l) + str + ' '.repeat(tot - l); };
@@ -2826,12 +2826,19 @@ const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
       // ── Header ──────────────────────────────────────────────────────────
       await NyxPrinter.printText('COLLECTION REPORT', { textSize: 26, align: PrintAlign.CENTER, bold: true });
 
+      const tktLine = firstTicketNum && lastTicketNum
+        ? `TKT:${firstTicketNum} - ${lastTicketNum} = ${lastTicketNum - firstTicketNum + 1}`
+        : firstTicketNum
+          ? `TKT:${firstTicketNum}`
+          : null;
+
       const headerBlock = [
         `${dateStr}  ${timeStr}`,
         PRINT_DASH,
         `BUS NUMBER:${busNo}`,
+        tktLine,
         PRINT_DASH,
-      ].join('\n');
+      ].filter(Boolean).join('\n');
       await NyxPrinter.printText(headerBlock, { textSize: 22, align: PrintAlign.CENTER });
 
       // ── Trips table ─────────────────────────────────────────────────────
@@ -2955,6 +2962,13 @@ const CollectionReportTabContent = ({ dashboard, posHook, onRefresh }) => {
             value={`₹${netTotal.toFixed(0)}`}
             color={netTotal >= 0 ? 'text-emerald-400' : 'text-red-400'}
           />
+        </View>
+
+        {/* TKT range row */}
+        <View className="flex-row gap-2 px-4 pb-4">
+          <StatChip label="TKT FIRST" value={firstTicketNum ?? '—'} color="text-violet-400" />
+          <StatChip label="TKT LAST" value={lastTicketNum ?? '—'} color="text-violet-400" />
+          <StatChip label="TOTAL TKTS" value={totalTickets} color="text-emerald-400" />
         </View>
 
         {/* Trips table */}
