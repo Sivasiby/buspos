@@ -13,7 +13,7 @@ import {
   Modal,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Printer, RotateCcw, QrCode, Bus, ChevronRight, Check, LogOut } from 'lucide-react-native';
+import { Printer, RotateCcw, QrCode, Bus, ChevronRight, Check, LogOut, ChevronDown } from 'lucide-react-native';
 import ImageResizer from '@bam.tech/react-native-image-resizer';
 import RNFS from 'react-native-fs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -134,6 +134,7 @@ export default function SettingsScreen({ onLogout }: { onLogout?: () => void }) 
   const [loadingBuses, setLoadingBuses] = useState(false);
   const [showBusModal, setShowBusModal] = useState(false);
   const [updatingBus, setUpdatingBus] = useState(false);
+  const [promoCollapsed, setPromoCollapsed] = useState(true);
 
   useEffect(() => {
     const loadSettings = async () => {
@@ -316,68 +317,86 @@ await NyxPrinter.printText(content.footer, { textSize: 30, align: PrintAlign.CEN
         contentContainerStyle={{ padding: 16, paddingBottom: 120 }}
         showsVerticalScrollIndicator={false}>
 
-        {/* ── Page header ── */}
-        <View className="flex-row items-center justify-between mb-6">
-          <View>
-            <Text className="text-white text-xl font-bold">Promotional Print</Text>
-            <Text className="text-zinc-500 text-xs mt-0.5">55 mm receipt · ZYRAP flyer</Text>
-          </View>
+        {/* ── Promotional Print Section (Collapsible) ── */}
+        <View className="bg-zinc-900/50 border border-white/10 rounded-2xl mb-4 overflow-hidden">
           <TouchableOpacity
-            onPress={resetToDefaults}
-            className="flex-row items-center gap-1.5 bg-zinc-900 border border-white/15 px-3 py-2 rounded-xl">
-            <RotateCcw size={13} color="#a1a1aa" />
-            <Text className="text-zinc-400 text-xs font-semibold">Reset</Text>
+            onPress={() => setPromoCollapsed(!promoCollapsed)}
+            className="flex-row items-center justify-between p-4">
+            <View>
+              <Text className="text-white text-sm font-bold tracking-wide">Promotional Print</Text>
+              <Text className="text-zinc-500 text-xs mt-0.5">55 mm receipt · ZYRAP flyer</Text>
+            </View>
+            <ChevronDown
+              size={20}
+              color="#71717a"
+              style={{ transform: [{ rotate: promoCollapsed ? '-90deg' : '0deg' }] }}
+            />
           </TouchableOpacity>
-        </View>
 
-        {/* ── QR Code preview ── */}
-        <View className="items-center mb-6">
-          <View className="bg-zinc-900 border border-white/15 rounded-2xl p-3 items-center">
-            <View className="flex-row items-center gap-2 mb-3 self-start">
-              <QrCode size={14} color="#71717a" />
-              <Text className="text-zinc-500 text-xs font-bold tracking-widest uppercase">
-                QR Code
-              </Text>
+          {!promoCollapsed && (
+            <View className="px-4 pb-4">
+              {/* ── Page header with reset ── */}
+              <View className="flex-row items-center justify-between mb-6">
+                <View className="flex-1" />
+                <TouchableOpacity
+                  onPress={resetToDefaults}
+                  className="flex-row items-center gap-1.5 bg-zinc-900 border border-white/15 px-3 py-2 rounded-xl">
+                  <RotateCcw size={13} color="#a1a1aa" />
+                  <Text className="text-zinc-400 text-xs font-semibold">Reset</Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* ── QR Code preview ── */}
+              <View className="items-center mb-6">
+                <View className="bg-zinc-900 border border-white/15 rounded-2xl p-3 items-center">
+                  <View className="flex-row items-center gap-2 mb-3 self-start">
+                    <QrCode size={14} color="#71717a" />
+                    <Text className="text-zinc-500 text-xs font-bold tracking-widest uppercase">
+                      QR Code
+                    </Text>
+                  </View>
+                  {/* White bg simulates print surface; square and dominant */}
+                  <View
+                    className="bg-white rounded-xl overflow-hidden"
+                    style={{ width: 200, height: 200 }}>
+                    <Image
+                      source={require('../qr2.png')}
+                      style={{ width: 200, height: 200 }}
+                      resizeMode="cover"
+                    />
+                  </View>
+                  <Text className="text-zinc-600 text-[11px] mt-2">
+                    Printed centered on 55 mm roll
+                  </Text>
+                </View>
+              </View>
+
+              {/* ── Content fields ── */}
+              <View className="bg-zinc-900/50 border border-white/10 rounded-2xl p-4 mb-4">
+                <Text className="text-white text-sm font-bold mb-4 tracking-wide">
+                  Edit Content
+                </Text>
+
+                <Field label="Title" value={content.title} onChange={update('title')} />
+                <Field
+                  label="Subtitle"
+                  value={content.subtitle}
+                  onChange={update('subtitle')}
+                  multiline
+                />
+                <Field label="Step 1" value={content.step1} onChange={update('step1')} multiline />
+                <Field label="Step 2" value={content.step2} onChange={update('step2')} multiline />
+                <Field label="Step 3" value={content.step3} onChange={update('step3')} multiline />
+                <Field
+                  label="QR Caption"
+                  value={content.footer}
+                  onChange={update('footer')}
+                  multiline
+                />
+                <Field label="Tagline / Footer" value={content.tagline} onChange={update('tagline')} />
+              </View>
             </View>
-            {/* White bg simulates print surface; square and dominant */}
-            <View
-              className="bg-white rounded-xl overflow-hidden"
-              style={{ width: 200, height: 200 }}>
-              <Image
-                source={require('../qr2.png')}
-                style={{ width: 200, height: 200 }}
-                resizeMode="cover"
-              />
-            </View>
-            <Text className="text-zinc-600 text-[11px] mt-2">
-              Printed centered on 55 mm roll
-            </Text>
-          </View>
-        </View>
-
-        {/* ── Content fields ── */}
-        <View className="bg-zinc-900/50 border border-white/10 rounded-2xl p-4 mb-4">
-          <Text className="text-white text-sm font-bold mb-4 tracking-wide">
-            Edit Content
-          </Text>
-
-          <Field label="Title" value={content.title} onChange={update('title')} />
-          <Field
-            label="Subtitle"
-            value={content.subtitle}
-            onChange={update('subtitle')}
-            multiline
-          />
-          <Field label="Step 1" value={content.step1} onChange={update('step1')} multiline />
-          <Field label="Step 2" value={content.step2} onChange={update('step2')} multiline />
-          <Field label="Step 3" value={content.step3} onChange={update('step3')} multiline />
-          <Field
-            label="QR Caption"
-            value={content.footer}
-            onChange={update('footer')}
-            multiline
-          />
-          <Field label="Tagline / Footer" value={content.tagline} onChange={update('tagline')} />
+          )}
         </View>
 
         {/* ── Bus Selection ── */}

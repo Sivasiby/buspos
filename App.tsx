@@ -145,7 +145,7 @@ function TabNavigator({ onLogout }: { onLogout: () => void }) {
       <SwipeTabs.Screen name="Home"     component={HomeScreen}
         options={{ tabBarLabel: 'Home',     tabBarIcon: ({color, size}: any) => <Home     color={color} size={size} /> }} />
       <SwipeTabs.Screen name="Report"   component={ReportScreen}
-        options={{ tabBarLabel: 'Trips',   tabBarIcon: ({color, size}: any) => <Ticket   color={color} size={size} /> }} />
+        options={{ tabBarLabel: 'Reports',   tabBarIcon: ({color, size}: any) => <Ticket   color={color} size={size} /> }} />
       <SwipeTabs.Screen name="Trip"     component={TripScreen}
         options={{ tabBarLabel: 'App',     tabBarIcon: ({color, size}: any) => <Smartphone      color={color} size={size} /> }} />
       <SwipeTabs.Screen name="Settings"
